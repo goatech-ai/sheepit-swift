@@ -1,0 +1,5 @@
+.build/
+
+# Per-user Xcode state. xcuserdata carries a real macOS username and must
+# never reach the public SPM mirror repo.
+.swiftpm/

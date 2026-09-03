@@ -1,0 +1,8 @@
+# Our flag names must never ship in the published SDK. The SDK must not
+# vend a concrete `Flag` enum: it would leak dogfood flag names AND collide
+# with the customer's own `sheepit codegen` output.
+#
+# `pnpm codegen:flags` currently emits ONLY TypeScript
+# (packages/shared/src/generated/flags.ts) — no Swift target exists today.
+# When apps/ios wires one up it generates into its own tree, never here.
+Flags.swift

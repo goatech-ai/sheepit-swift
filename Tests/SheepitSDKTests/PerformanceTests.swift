@@ -66,9 +66,21 @@ final class PerformanceTests: XCTestCase {
         XCTAssertEqual(receivedMetrics.count, 1)
         XCTAssertEqual(receivedMetrics[0].metricType, "startup")
         XCTAssertEqual(receivedMetrics[0].metricName, "cold_start")
-        XCTAssertGreaterThan(receivedMetrics[0].valueMs, 0)
+        // `>= 0`, NOT `> 0`. StartupTracker samples `systemUptime` in `init` and
+        // again in `markFirstFrame()`; in this test those are adjacent statements,
+        // so the elapsed time is legitimately ~0 and whether it rounds above zero
+        // is a property of the CLOCK, not of the code. Asserting `> 0` blocked the
+        // swift-v1.0.1 release twice (run 33896279530) while passing 14/14 locally
+        // on the same commit and the same machine.
+        //
+        // Testing the duration for real needs an injectable clock in
+        // StartupTracker — queued in PENDING_WORK. Until then, assert what this
+        // test can actually establish: a cold_start metric is emitted exactly
+        // once, non-negative, not an error, and mirrored onto `coldStartMs`.
+        XCTAssertGreaterThanOrEqual(receivedMetrics[0].valueMs, 0)
         XCTAssertFalse(receivedMetrics[0].isError)
         XCTAssertNotNil(tracker.coldStartMs)
+        XCTAssertEqual(tracker.coldStartMs, receivedMetrics[0].valueMs)
     }
 
     func testColdStartOnlyRecordedOnce() {

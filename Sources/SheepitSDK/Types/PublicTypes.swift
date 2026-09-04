@@ -5,7 +5,7 @@ import Foundation
 /// Configuration for the Sheepit SDK.
 public struct SheepitConfig: Sendable {
     /// Default API URL. Update this when migrating to a custom domain.
-    public static let defaultAPIUrl = "https://api.goatech.ai"
+    public static let defaultAPIUrl = "https://api.sheepit.ai"
 
     public let apiKey: String
     public var environment: String
@@ -276,7 +276,7 @@ enum SDKDefaults {
     /// pre-migration build from a post-migration one in ingested data.
     /// Bumped for the `lp_*` → `gt_*` storage rename. `1.0.0` is reserved
     /// for the first published tag.
-    static let sdkVersion = "1.0.0"
+    static let sdkVersion = "1.0.1"
     static let apiUrl = SheepitConfig.defaultAPIUrl
     static let environment = "production"
     static let flushInterval: TimeInterval = 5.0

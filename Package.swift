@@ -3,7 +3,7 @@
 import PackageDescription
 
 let package = Package(
-    name: "SheepitSDK",
+    name: "SheepitKit",
     platforms: [
         .iOS(.v16),
         .macOS(.v13),
@@ -12,8 +12,8 @@ let package = Package(
     ],
     products: [
         .library(
-            name: "SheepitSDK",
-            targets: ["SheepitSDK"]
+            name: "SheepitKit",
+            targets: ["SheepitKit"]
         ),
     ],
     targets: [
@@ -29,18 +29,18 @@ let package = Package(
             ]
         ),
         .target(
-            name: "SheepitSDK",
+            name: "SheepitKit",
             dependencies: ["SheepitCrashHandler"],
-            path: "Sources/SheepitSDK",
+            path: "Sources/SheepitKit",
             // Apple requires the privacy manifest to be declared as a
             // resource for SwiftPM to place it in the bundle Xcode reads
             // when it assembles the host app's privacy report.
             resources: [.copy("PrivacyInfo.xcprivacy")]
         ),
         .testTarget(
-            name: "SheepitSDKTests",
-            dependencies: ["SheepitSDK", "SheepitCrashHandler"],
-            path: "Tests/SheepitSDKTests"
+            name: "SheepitKitTests",
+            dependencies: ["SheepitKit", "SheepitCrashHandler"],
+            path: "Tests/SheepitKitTests"
         ),
     ]
 )

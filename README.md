@@ -1,6 +1,6 @@
 <div align="center">
 
-# SheepitSDK
+# SheepitKit
 
 _Feature flags, experiments, and event tracking for iOS, macOS, tvOS, and watchOS._
 
@@ -13,28 +13,35 @@ Native Swift SDK for the [Sheepit](https://www.sheepit.ai) platform. Evaluate fe
 
 ## Why it exists
 
-Web and backend get flags and experiments from the Sheepit SDKs, and native apps need the same surface without a JavaScript bridge. SheepitSDK is a Swift-native client built for SwiftUI: a `Sendable` reference type you inject through the environment, with crash and performance capture built in.
+Web and backend get flags and experiments from the Sheepit SDKs, and native apps need the same surface without a JavaScript bridge. SheepitKit is a Swift-native client built for SwiftUI: a `Sendable` reference type you inject through the environment, with crash and performance capture built in.
 
 ## Install
 
-SheepitSDK is developed in the Sheepit monorepo (`packages/sdk-swift`) and published to the public mirror repository [`goatech-ai/sheepit-swift`](https://github.com/goatech-ai/sheepit-swift), which is what Swift Package Manager resolves against. Every release tag on the mirror is a bare semver version (`1.0.0`), mirrored from the monorepo by CI.
+Sheepit is developed in the Sheepit monorepo (`packages/sdk-swift`) and published to the public mirror repository [`goatech-ai/sheepit-swift`](https://github.com/goatech-ai/sheepit-swift), which is what Swift Package Manager resolves against. Every release tag on the mirror is a bare semver version (`0.3.0`), mirrored from the monorepo by CI.
 
 ### Xcode
 
-**File → Add Package Dependencies…** → enter `https://github.com/goatech-ai/sheepit-swift.git` → choose **Up to Next Major Version**.
+**File → Add Package Dependencies…** → enter `https://github.com/goatech-ai/sheepit-swift.git` → choose **Exact Version** and enter `0.3.0`.
+
+> 🔴 **Pin exactly while this package is on `0.x`.** SPM's "Up to Next Major"
+> does not special-case `0.x` the way npm and Cargo do — `from: "0.3.0"`
+> resolves `>=0.3.0 <1.0.0`, which would pull in every future `0.x` release,
+> and `0.x` is precisely where breaking changes are allowed. Pin exactly and
+> upgrade deliberately until `2.0.0`, the first stable release. See the
+> CHANGELOG's "Version policy" for why `1.0.x` is abandoned.
 
 ### Package.swift
 
 ```swift
 dependencies: [
-  .package(url: "https://github.com/goatech-ai/sheepit-swift.git", from: "1.0.0"),
+  .package(url: "https://github.com/goatech-ai/sheepit-swift.git", exact: "0.3.0"),
 ]
 ```
 
 ```swift
 .target(
   name: "MyApp",
-  dependencies: [.product(name: "SheepitSDK", package: "sheepit-swift")]
+  dependencies: [.product(name: "SheepitKit", package: "sheepit-swift")]
 )
 ```
 
@@ -43,20 +50,44 @@ Supported platforms (from `Package.swift`): iOS 16+, macOS 13+, tvOS 16+, watchO
 ## Usage
 
 ```swift
-import SheepitSDK
+import SheepitKit
+import SwiftUI
+
+// SheepitClient is a plain reference type, not `Observable`, so it travels
+// through a custom EnvironmentKey rather than SwiftUI's `.environment(_:)`
+// single-argument form — that overload requires `Observable` and iOS 17,
+// and this package supports iOS 16.
+private struct SheepitClientKey: EnvironmentKey {
+  static let defaultValue: SheepitClient? = nil
+}
+
+extension EnvironmentValues {
+  var sheepit: SheepitClient? {
+    get { self[SheepitClientKey.self] }
+    set { self[SheepitClientKey.self] = newValue }
+  }
+}
 
 @main
 struct MyApp: App {
-  @State private var sheepit: Sheepit?
+  @State private var sheepit: SheepitClient?
 
   var body: some Scene {
     WindowGroup {
       ContentView()
-        .environment(sheepit)
+        .environment(\.sheepit, sheepit)
         .task {
-          sheepit = Sheepit.create(config: .init(apiKey: "lp_pub_..."))
+          sheepit = SheepitClient.create(config: .init(apiKey: "lp_pub_..."))
         }
     }
+  }
+}
+
+struct ContentView: View {
+  @Environment(\.sheepit) private var sheepit
+
+  var body: some View {
+    Button("Start trial") { sheepit?.track("cta_clicked") }
   }
 }
 ```
@@ -81,8 +112,8 @@ sheepit?.reset()
 
 | Symbol                                                              | Purpose                                                            |
 | ------------------------------------------------------------------- | ------------------------------------------------------------------ |
-| `Sheepit.create(config:)`                                           | Create an instance (preferred for SwiftUI)                         |
-| `Sheepit.initialize(config:)` / `Sheepit.shared`                    | Singleton create and accessor                                      |
+| `SheepitClient.create(config:)`                                     | Create an instance (preferred for SwiftUI)                         |
+| `SheepitClient.initialize(config:)` / `SheepitClient.shared`        | Singleton create and accessor                                      |
 | `track(_:properties:)`                                              | Send an event                                                      |
 | `flag(_:default:)`                                                  | Evaluate a flag; returns a `FlagValue`                             |
 | `experiment(_:)`                                                    | Get a `SheepitExperimentResult` (with `.variant`)                  |
@@ -99,7 +130,7 @@ sheepit?.reset()
 
 **Crash capture is ON by default**; performance monitoring is OFF by default. Both are configured through `SheepitConfig` (`crashes:` / `performance:`).
 
-Because crash capture is on by default, the package ships a privacy manifest (`Sources/SheepitSDK/PrivacyInfo.xcprivacy`) declaring the data it collects and the required-reason APIs it calls. Xcode aggregates it into your app's privacy report automatically — you do not need to copy anything into your target.
+Because crash capture is on by default, the package ships a privacy manifest (`Sources/SheepitKit/PrivacyInfo.xcprivacy`) declaring the data it collects and the required-reason APIs it calls. Xcode aggregates it into your app's privacy report automatically — you do not need to copy anything into your target.
 
 ### Flags with JSON values
 
@@ -141,7 +172,7 @@ SDK has no way to keep a screen you build out of a release binary:
 ```swift
 #if DEBUG
 import SwiftUI
-import SheepitSDK
+import SheepitKit
 
 /// The full key list is the UNION of two sources, deduped:
 /// - `Flag.allCases` (from `sheepit codegen --swift`) — works on a fresh
@@ -151,7 +182,7 @@ import SheepitSDK
 ///   the difference between a menu that shows every flag and one that
 ///   silently hides any flag added after your last `sheepit codegen` run.
 struct FlagOverrideMenu: View {
-    let sheepit: Sheepit
+    let sheepit: SheepitClient
     @State private var inspections: [SheepitFlagInspection] = []
 
     var body: some View {
@@ -211,7 +242,7 @@ On UIKit platforms the SDK observes `UIApplication.didEnterBackgroundNotificatio
 
 **How does experiment bucketing work?** The server assigns the variant and the SDK caches it per device, so a device keeps its assignment across launches.
 
-**Is the SDK concurrency-safe?** Yes. `Sheepit` is `Sendable` and its internals are actor-isolated, so its public methods are safe to call from any thread.
+**Is the SDK concurrency-safe?** Yes. `SheepitClient` is `Sendable` and its internals are actor-isolated, so its public methods are safe to call from any thread.
 
 ## License
 

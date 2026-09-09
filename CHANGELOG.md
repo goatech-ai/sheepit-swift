@@ -1,6 +1,6 @@
 # Changelog
 
-All notable changes to `SheepitSDK` (the Sheepit Swift SDK).
+All notable changes to `SheepitKit` (the Sheepit Swift SDK).
 
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); the
 package uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
@@ -15,7 +15,70 @@ package uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 > a version that does not exist. The mirror workflow enforces this before it
 > tags.
 
-## [Unreleased]
+> **🔴 Version policy: this package stays on `0.x` until the API is stable.**
+> `1.0.0` and `1.0.1` were cut too early — they claimed stability the surface
+> did not have, and breaking changes kept coming. Those two tags stay on the
+> mirror (deleting a published tag breaks whoever pinned it) but the `1.x`
+> line is **abandoned; it will receive no further releases**. Development
+> continues on `0.x`, where SemVer permits breaking changes in a minor bump,
+> and **`2.0.0` is reserved for the first genuinely stable release.**
+>
+> Consequence to state plainly when anyone integrates: SPM's `from: "1.0.0"`
+> resolves `>=1.0.0 <2.0.0`, so **a consumer pinned to `1.0.x` will never
+> receive a `0.x` release.** They are frozen until they re-pin to `0.x`.
+
+## [0.3.0]
+
+### Changed — BREAKING
+
+- **Module renamed `SheepitSDK` → `SheepitKit`, entry type `Sheepit` → `SheepitClient`.**
+  `import SheepitSDK` becomes `import SheepitKit`, and `Sheepit.create(config:)` /
+  `Sheepit.initialize(config:)` / `Sheepit.shared` become `SheepitClient.*`.
+  As with the `0.x` → `1.0.0` module rename there is no shim: Swift has no
+  module-alias mechanism, so the old import cannot be kept compiling.
+
+  **Why not `SheepitSDK`.** Modern Swift SDKs do not put `SDK` in the module
+  name (Firebase, Sentry, PostHog, Amplitude), and it reads dated.
+
+  **Why not plain `Sheepit`.** It was tried and it does not build. The Mission
+  Control app target in `apps/ios` is itself named `Sheepit`, so a library
+  product of the same name makes Xcode emit `Multiple commands produce
+Sheepit.swiftmodule` — and since that app is meant to dogfood this SDK, it
+  would have been an app importing itself. `*Kit` is Apple's own idiom
+  (`WidgetKit`, `StoreKit`, `ActivityKit`).
+
+  **Why the type is not `SheepitKit` either.** A type named after its module
+  collides: the first pass of this rename produced `cannot call value of
+non-function type 'module<Sheepit>'`. Sentry has `SentrySDK` and Firebase has
+  `FirebaseApp` for the same reason. `SheepitClient` keeps the module name free
+  as a namespace.
+
+  This leaves room for a later product split — `SheepitAnalytics`,
+  `SheepitCrash`, `SheepitPerformance` as peers, with `SheepitKit` as the core
+  holding the connection, the same shape as `FirebaseCore` + `FirebaseApp`.
+  Not done here and not scheduled: the trigger is a customer who cannot accept
+  a subsystem's side effects (a second crash reporter contending for the same
+  signal handlers is the likeliest), not a size target. Note `SheepitCore` is
+  **not** available as a name — `apps/ios/Packages/SheepitCore` already exists
+  and the app links both.
+
+  **Unlike the `0.x` → `1.0.0` rename, this one happens after a published
+  tag** — `1.0.1` is on the SPM mirror, so anyone already pinned there keeps a
+  working build but receives nothing further (see "Version policy" above).
+  It rides a **minor** bump because the package is back on `0.x`, where SemVer
+  allows exactly that; it is not a free pre-tag correction either.
+
+## [1.0.1]
+
+Published to the mirror but never recorded here — backfilled 2026-09-09 from
+`git diff 1.0.0 1.0.1` on `goatech-ai/sheepit-swift`.
+
+### Changed
+
+- Default API host `https://api.goatech.ai` → `https://api.sheepit.ai`.
+  Both remain live and co-equal on the same service, so this changed nothing
+  for existing installs; `api.goatech.ai` is never retired.
+- `SDKDefaults.sdkVersion` `1.0.0` → `1.0.1`.
 
 ## [1.0.0]
 
@@ -129,8 +192,8 @@ Pre-release development. Notable changes shipped without a changelog:
 
 ## Known issues
 
-Tracked here because they are SDK-scoped and no tag or release process
-exists yet to carry them:
+Tracked here because they are SDK-scoped and this file ships to the public
+mirror, so it is where a consumer looks:
 
 - Two ThreadSanitizer data races in the C crash handler
   (`sheepit_crash_handler.c`, `sheepit_nsexception_handler.m`) on the global

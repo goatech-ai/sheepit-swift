@@ -63,6 +63,51 @@ actor Transport {
             return
         }
 
+        // One request PER SESSION. `buildPayload` stamps a single batch-level
+        // `context.session.id` taken from `events[0]`, and the wire format has
+        // no per-event session field — so a batch spanning two sessions files
+        // its whole tail under the first event's session id, unrecoverably.
+        //
+        // A drained batch really can span sessions, by three routes that have
+        // nothing to do with each other:
+        //   1. the offline queue draining events a PREVIOUS PROCESS persisted
+        //      behind events from this one (`SheepitClient.start()`'s
+        //      `connectivity.onOnline` handler),
+        //   2. a 429 `requeue()` landing behind newer events,
+        //   3. a session rollover between two `track()` calls.
+        // Grouping here fixes all three at once, and is what lets the session
+        // boundary fall wherever it naturally falls instead of only at a flush.
+        for group in Transport.groupedBySession(events) {
+            // A 429 inside the loop back-dates the whole flush: send nothing
+            // further, and hand the untried groups back to the queue so the
+            // next cycle retries them after `Retry-After`.
+            if rateLimitedUntil != nil {
+                requeue(group)
+                continue
+            }
+            await send(group)
+        }
+    }
+
+    /// Split into runs of consecutive events sharing one session id, preserving
+    /// order. Consecutive rather than fully grouped-by-key: FIFO order is the
+    /// contract the queue and the server's dedup both assume, and re-ordering
+    /// across sessions to merge two non-adjacent runs of the same session would
+    /// break it for no benefit.
+    static func groupedBySession(_ events: [EnrichedEvent]) -> [[EnrichedEvent]] {
+        var groups: [[EnrichedEvent]] = []
+        for event in events {
+            if var last = groups.last, last.first?.sessionId == event.sessionId {
+                last.append(event)
+                groups[groups.count - 1] = last
+            } else {
+                groups.append([event])
+            }
+        }
+        return groups
+    }
+
+    private func send(_ events: [EnrichedEvent]) async {
         do {
             let payload = buildPayload(events)
             _ = try await http.postRaw(path: SDKEndpoints.ingest, body: payload)
@@ -208,8 +253,13 @@ actor Transport {
                     version: appVersion
                         ?? (Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String),
                     build: Bundle.main.infoDictionary?["CFBundleVersion"] as? String,
-                    namespace: Bundle.main.bundleIdentifier
+                    namespace: Bundle.main.bundleIdentifier,
+                    buildChannel: DeviceProfile.buildChannel()
                 ),
+                // Bounded to 32/64 chars by ingestContextSchema.sdk.{name,version} — both
+                // SDKDefaults.sdkName and first.sdkVersion are well under that (see their
+                // own doc comments), so no truncation is needed here.
+                sdk: IngestSDK(name: SDKDefaults.sdkName, version: first.sdkVersion),
                 user: IngestUser(
                     id: first.userId,
                     anonymousId: first.anonymousId
@@ -217,10 +267,38 @@ actor Transport {
                 device: IngestDevice(
                     id: first.deviceId,
                     platform: first.platform,
-                    model: nil,
-                    osVersion: nil,
-                    locale: first.locale,
-                    country: Locale.current.region?.identifier
+                    model: DeviceProfile.deviceModel(),
+                    osVersion: DeviceProfile.osVersion(),
+                    osName: DeviceProfile.osName,
+                    // Reuses the per-event snapshot (`ContextManager.eventContext()`,
+                    // itself sourced from `DeviceProfile.timezone()`) rather than calling
+                    // `DeviceProfile.timezone()` again here — matches `first.locale`
+                    // immediately below, which does the same for the locale field.
+                    timezone: first.timezone,
+                    // 🔴 Both of these predate the device-context work and BOTH can 400
+                    // the entire batch today, in already-published versions.
+                    //
+                    // `locale` is the raw `Locale.current.identifier`, which carries
+                    // Unicode extensions when the user picks a non-Gregorian calendar in
+                    // Settings → Language & Region: "en_US@calendar=japanese" is 23 chars
+                    // against `ingestContextSchema.device.locale`'s max(16). Measured
+                    // against the real schema: rejected.
+                    //
+                    // `country` comes from `Locale.region`, which is not always a 2-letter
+                    // country — UN M.49 area codes are legal and real ("419" = Latin
+                    // America, common on es-419 devices) against a `.length(2)` rule.
+                    // Measured: rejected.
+                    //
+                    // Either one 400s all 100 events in the batch, and sdk-js drops a 400
+                    // without retry — total silent data loss for that user, permanently.
+                    // Truncate the first; omit the second rather than send something the
+                    // schema will refuse. An absent country is a missing dimension; a
+                    // rejected batch is missing everything.
+                    locale: DeviceProfile.bounded(first.locale, 16),
+                    country: Locale.current.region?.identifier.count == 2
+                        ? Locale.current.region?.identifier
+                        : nil,
+                    type: DeviceProfile.deviceType()
                 ),
                 session: IngestSession(id: first.sessionId),
                 flags: nil,

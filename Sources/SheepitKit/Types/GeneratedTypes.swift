@@ -140,6 +140,10 @@ struct IngestEvent: Encodable, Sendable {
 
 struct IngestContext: Encodable, Sendable {
     let app: IngestApp?
+    // Which SDK sent this batch — matches ingestContextSchema's top-level `sdk` group
+    // (packages/shared/src/schemas/platform.ts). Purely descriptive (dashboard
+    // filtering / support triage).
+    let sdk: IngestSDK?
     let user: IngestUser?
     let device: IngestDevice?
     let session: IngestSession?
@@ -150,7 +154,7 @@ struct IngestContext: Encodable, Sendable {
     let releaseId: String?
 
     enum CodingKeys: String, CodingKey {
-        case app, user, device, session, flags, experiments, account, revenue
+        case app, sdk, user, device, session, flags, experiments, account, revenue
         case releaseId = "release_id"
     }
 }
@@ -159,6 +163,20 @@ struct IngestApp: Encodable, Sendable {
     let version: String?
     let build: String?
     let namespace: String?
+    // Bounded string, matching ingestContextSchema.app.build_channel (max 32) — not a
+    // Swift enum, since a schema mismatch on a future value would 400 the whole batch.
+    // Canonical set (informational): "appstore" | "testflight" | "simulator" | "debug".
+    let buildChannel: String?
+
+    enum CodingKeys: String, CodingKey {
+        case version, build, namespace
+        case buildChannel = "build_channel"
+    }
+}
+
+struct IngestSDK: Encodable, Sendable {
+    let name: String?
+    let version: String?
 }
 
 struct IngestUser: Encodable, Sendable {
@@ -176,12 +194,23 @@ struct IngestDevice: Encodable, Sendable {
     let platform: String?
     let model: String?
     let osVersion: String?
+    // Bounded string, matching ingestContextSchema.device.os_name (max 128).
+    let osName: String?
+    // IANA identifier (e.g. "America/Argentina/Buenos_Aires"), matching
+    // ingestContextSchema.device.timezone (max 64).
+    let timezone: String?
     let locale: String?
     let country: String?
+    // Bounded string, matching ingestContextSchema.device.type (max 32) — not a Swift
+    // enum, for the same batch-wide-rejection reason as IngestApp.buildChannel.
+    // Canonical set (informational): "phone" | "tablet" | "desktop" | "tv" | "watch".
+    let type: String?
 
     enum CodingKeys: String, CodingKey {
-        case id, platform, model, locale, country
+        case id, platform, model, locale, country, type
         case osVersion = "os_version"
+        case osName = "os_name"
+        case timezone
     }
 }
 

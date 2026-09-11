@@ -226,18 +226,100 @@ final class FlagInspectionPublicAPITests: XCTestCase {
         XCTAssertEqual(sdk.knownFlagKeys(), [])
     }
 
-    func testClearOverrideAfterDestroyIsInert() {
+    /// Regression, corrected 2026-09: this test used to assert the OPPOSITE — that
+    /// `clearOverride` was a no-op after `destroy()`. That directly contradicted
+    /// `clearOverrides()`'s own doc comment ("gating deletes would buy nothing and could
+    /// leave a build ... unable to purge an override it wrote to disk"): a debug build that
+    /// calls `destroy()` as part of its own teardown/reset flow, then wants to clean up an
+    /// override it wrote earlier in the session, could no longer do so. Deletes are never
+    /// gated — not by `allowFlagOverrides`, and not by `destroy()` either; only WRITES
+    /// (`overrideFlag`) are.
+    func testClearOverrideAfterDestroyStillPurgesTheOnDiskOverride() {
         let sdk = SheepitClient.create(config: Self.makeConfig(debug: true))
         sdk.overrideFlag("a", value: .bool(true))
         sdk.destroy()
 
         sdk.clearOverride("a")
 
-        XCTAssertEqual(
+        XCTAssertNil(
             sdk.getOverrides()["a"],
-            .bool(true),
-            "post-destroy clearOverride must be inert, same as the rest of the public surface"
+            "clearOverride must still purge an on-disk override even after destroy()"
         )
+    }
+
+    /// Same rationale, `clearOverrides()` (plural).
+    func testClearOverridesAfterDestroyStillPurgesTheOnDiskOverrides() {
+        let sdk = SheepitClient.create(config: Self.makeConfig(debug: true))
+        sdk.overrideFlag("a", value: .bool(true))
+        sdk.destroy()
+
+        sdk.clearOverrides()
+
+        XCTAssertTrue(
+            sdk.getOverrides().isEmpty,
+            "clearOverrides must still purge on-disk overrides even after destroy()"
+        )
+    }
+
+    // MARK: - Fix S1 (2026-09 security follow-up, round 2): an INERT client — a rejected
+    // key/apiUrl, documented to make zero writes to persistent storage — must not purge an
+    // override a DIFFERENT, live client in the same process wrote to the shared, global
+    // `lp_debug_overrides` blob. `clearOverrides()`/`clearOverride(_:)` carried no guard at
+    // all before this fix, not even on `inertReason` (the destroy()-after-purge tests above
+    // prove only that `destroyedFlag` must not gate deletes — a separate property).
+
+    private static let rejectedKey = "lp_sec_xxx_" + String(repeating: "a", count: 64)
+
+    private static func makeInertConfig() -> SheepitConfig {
+        SheepitConfig(
+            apiKey: Self.rejectedKey,
+            crashes: CrashConfig(enabled: false),
+            allowFlagOverrides: true
+        )
+    }
+
+    func testInertClientClearOverridesDoesNotPurgeAnotherClientsOnDiskOverride() {
+        let live = SheepitClient.create(config: Self.makeConfig(debug: true))
+        live.overrideFlag("a", value: .bool(true))
+        XCTAssertNotNil(
+            UserDefaults.standard.data(forKey: Self.overridesKey),
+            "harness check: the override must actually be on disk before this test proves anything"
+        )
+        live.destroy()
+
+        let inert = SheepitClient.create(config: Self.makeInertConfig())
+        XCTAssertFalse(inert.status().initialized)
+        inert.clearOverrides()
+
+        XCTAssertNotNil(
+            UserDefaults.standard.data(forKey: Self.overridesKey),
+            "An inert client must not purge an override a different, live client wrote."
+        )
+        let after = SheepitClient.create(config: Self.makeConfig(debug: true))
+        XCTAssertEqual(
+            after.getOverrides()["a"], .bool(true),
+            "The override must survive an inert client's clearOverrides() call."
+        )
+        after.clearOverrides()
+        after.destroy()
+    }
+
+    func testInertClientClearOverrideDoesNotPurgeAnotherClientsOnDiskOverride() {
+        let live = SheepitClient.create(config: Self.makeConfig(debug: true))
+        live.overrideFlag("a", value: .bool(true))
+        live.destroy()
+
+        let inert = SheepitClient.create(config: Self.makeInertConfig())
+        XCTAssertFalse(inert.status().initialized)
+        inert.clearOverride("a")
+
+        let after = SheepitClient.create(config: Self.makeConfig(debug: true))
+        XCTAssertEqual(
+            after.getOverrides()["a"], .bool(true),
+            "clearOverride(_:) on an inert client must not purge an override a live client wrote."
+        )
+        after.clearOverrides()
+        after.destroy()
     }
 }
 

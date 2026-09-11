@@ -59,15 +59,43 @@ struct ANRWatchdogState: Equatable {
 /// from a background thread and measuring response time.
 final class ANRWatchdog: @unchecked Sendable {
     private let onMetric: @Sendable (PerformanceMetric) -> Void
-    private let thresholdMs: Double
+    /// Internal, not private, so a test can prove out-of-range input was clamped WITHOUT
+    /// running `watchdogLoop()` for real — see `minThresholdMs`'s doc for why that would be
+    /// unsafe. Not part of the public surface.
+    internal let thresholdMs: Double
     private var watchdogThread: Thread?
     private var isRunning = false
     private var state = ANRWatchdogState(freezeStartedAt: nil)
 
     private(set) var anrCount = 0
 
+    /// Floor for `thresholdMs`, clamped HERE — the actual consumer — mirroring the
+    /// `EventQueue.init` pattern (`max(1, maxSize)`) rather than trusting a clamp on
+    /// `PerformanceConfig.anrThresholdMs`'s initializer, which would be bypassable the exact
+    /// way `flushInterval`/`configRefreshInterval`/`maxQueueSize` were: `anrThresholdMs` is a
+    /// mutable public `var`, so `var cfg = ...; cfg.performance.anrThresholdMs = 0` reaches
+    /// this initializer already unclamped (2026-09 security follow-up round 3, finding MF-1,
+    /// pattern repeated here as round 4, finding MF3-3 — the MF-1 sweep covered every
+    /// `Task.sleep` site but missed this `Thread.sleep` one). `watchdogLoop()` divides this by
+    /// 1000 to get `checkInterval`, which drives BOTH the `Thread.sleep` at the bottom of the
+    /// loop AND the `DispatchSemaphore.wait` timeout inside `pingMainThread`. At `<= 0`,
+    /// `Thread.sleep(forTimeInterval:)` returns immediately and the loop spins, enqueuing an
+    /// unbounded `DispatchQueue.main.async` per iteration with no backpressure — measured RSS
+    /// 21.5 -> 70.8 MB in 0.5s, SIGKILL (exit 137) at ~0.7s. `.nan` was already benign (Swift's
+    /// `max` returns the non-NaN operand when one side is NaN, so `max(minThresholdMs, .nan)`
+    /// evaluates to `minThresholdMs`), so this floor incidentally also covers it. Unlike
+    /// `TimeInterval.sanitizedForSleep()` (seconds, floor `1.0`), this constant is
+    /// MILLISECONDS — the unit `PerformanceConfig.anrThresholdMs` is documented in — so the
+    /// two floors are not interchangeable.
+    private static let minThresholdMs: Double = 100
+    /// Ceiling for `thresholdMs`, same rationale and same bypass as the floor above. Generous
+    /// (10 minutes) for any real ANR-detection cadence, but bounded so a host that mutates
+    /// `anrThresholdMs` to an astronomical value doesn't leave the watchdog checking main-
+    /// thread responsiveness once an hour.
+    private static let maxThresholdMs: Double = 600_000
+
     init(thresholdMs: Double, onMetric: @escaping @Sendable (PerformanceMetric) -> Void) {
-        self.thresholdMs = thresholdMs
+        self.thresholdMs = min(Self.maxThresholdMs, max(Self.minThresholdMs, thresholdMs))
         self.onMetric = onMetric
     }
 

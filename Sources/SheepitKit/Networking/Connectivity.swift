@@ -17,6 +17,16 @@ final class ConnectivityMonitor: @unchecked Sendable {
     private let monitor = NWPathMonitor()
     private let queue = DispatchQueue(label: "ai.goatech.sdk.connectivity")
     private var onOnlineCallbacks: [@Sendable () -> Void] = []
+    private var _isMonitoring = false
+
+    /// Whether the underlying `NWPathMonitor` is still running. `NWPathMonitor`
+    /// is not released by dealloc alone — it needs an explicit `cancel()` — so
+    /// this is the signal a test uses to prove a client actually let it go.
+    var isMonitoring: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return _isMonitoring
+    }
 
     var isOnline: Bool {
         lock.lock()
@@ -40,6 +50,20 @@ final class ConnectivityMonitor: @unchecked Sendable {
                 for callback in callbacks { callback() }
             }
         }
+    }
+
+    /// Begin watching the network path.
+    ///
+    /// Deliberately NOT done in `init`. A component that starts work in its own initializer
+    /// runs before its owner has decided whether it should exist at all — that is how a
+    /// client built with a rejected API key ended up holding a live `NWPathMonitor` it could
+    /// never release, and it made every short-lived client pay for a real monitor. Idempotent.
+    func start() {
+        lock.lock()
+        let alreadyRunning = _isMonitoring
+        _isMonitoring = true
+        lock.unlock()
+        guard !alreadyRunning else { return }
         monitor.start(queue: queue)
     }
 
@@ -50,9 +74,14 @@ final class ConnectivityMonitor: @unchecked Sendable {
     }
 
     func destroy() {
-        monitor.cancel()
+        lock.lock()
+        let wasRunning = _isMonitoring
+        _isMonitoring = false
+        lock.unlock()
+        if wasRunning { monitor.cancel() }
         lock.lock()
         onOnlineCallbacks.removeAll()
         lock.unlock()
     }
+
 }

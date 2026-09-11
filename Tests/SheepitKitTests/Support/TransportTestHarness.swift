@@ -76,6 +76,9 @@ final class StubURLProtocol: URLProtocol, @unchecked Sendable {
     private static let lock = NSLock()
     nonisolated(unsafe) private static var _stub: Stub = .status(200, body: "{}")
     nonisolated(unsafe) private static var _requestCount = 0
+    /// The most recently seen request's headers — lets a test assert what `HTTPClient`
+    /// actually sent (e.g. that `Authorization` was trimmed) without a real network hop.
+    nonisolated(unsafe) private static var _lastRequestHeaders: [String: String]?
 
     static var stub: Stub {
         get { lock.lock(); defer { lock.unlock() }; return _stub }
@@ -86,10 +89,15 @@ final class StubURLProtocol: URLProtocol, @unchecked Sendable {
         lock.lock(); defer { lock.unlock() }; return _requestCount
     }
 
+    static var lastRequestHeaders: [String: String]? {
+        lock.lock(); defer { lock.unlock() }; return _lastRequestHeaders
+    }
+
     static func reset() {
         lock.lock()
         _stub = .status(200, body: "{}")
         _requestCount = 0
+        _lastRequestHeaders = nil
         lock.unlock()
     }
 
@@ -102,6 +110,7 @@ final class StubURLProtocol: URLProtocol, @unchecked Sendable {
     override func startLoading() {
         StubURLProtocol.lock.lock()
         StubURLProtocol._requestCount += 1
+        StubURLProtocol._lastRequestHeaders = request.allHTTPHeaderFields
         let stub = StubURLProtocol._stub
         StubURLProtocol.lock.unlock()
 

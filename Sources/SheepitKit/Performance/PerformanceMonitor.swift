@@ -109,7 +109,11 @@ actor PerformanceMonitor {
         // Start periodic flush
         flushTask = Task {
             while !Task.isCancelled {
-                try? await Task.sleep(for: .seconds(config.flushInterval))
+                // `config.flushInterval` came from the mutable public
+                // `PerformanceConfig.flushInterval` — sanitize right before use rather than
+                // trusting the initializer clamp already applied to it (2026-09 security
+                // follow-up round 3, finding MF-1).
+                try? await Task.sleep(for: .seconds(config.flushInterval.sanitizedForSleep()))
                 guard !Task.isCancelled else { break }
                 await flush()
             }
@@ -160,10 +164,10 @@ actor PerformanceMonitor {
             batch: metrics,
             context: PerfBatchContext(
                 platform: "ios",
-                appVersion: Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String,
-                buildNumber: Bundle.main.infoDictionary?["CFBundleVersion"] as? String,
-                osVersion: osVersion(),
-                deviceModel: deviceModel(),
+                appVersion: DeviceProfile.appVersion(),
+                buildNumber: DeviceProfile.buildNumber(),
+                osVersion: DeviceProfile.osVersion(),
+                deviceModel: DeviceProfile.deviceModel(),
                 userId: ctx.userId,
                 sessionId: ctx.sessionId,
                 deviceId: ctx.deviceId,
@@ -245,23 +249,5 @@ actor PerformanceMonitor {
     /// Mark the first frame rendered (for startup tracking).
     func markFirstFrame() {
         startupTracker?.markFirstFrame()
-    }
-
-    // MARK: - Private
-
-    private func deviceModel() -> String {
-        #if canImport(UIKit)
-        return UIDevice.current.model
-        #else
-        return "Mac"
-        #endif
-    }
-
-    private func osVersion() -> String {
-        #if canImport(UIKit)
-        return UIDevice.current.systemVersion
-        #else
-        return ProcessInfo.processInfo.operatingSystemVersionString
-        #endif
     }
 }

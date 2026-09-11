@@ -4,12 +4,20 @@ import Foundation
 import UIKit
 #endif
 
-/// Flushes queued events when the app is backgrounded.
+/// Flushes queued events when the app is backgrounded, and closes / opens
+/// analytics sessions when it returns to the foreground.
 ///
 /// Counterpart to `packages/sdk-js/src/lifecycle.ts`, which flushes on
 /// `pagehide` / `visibilitychange`. Without this the periodic flush task
 /// simply stops being scheduled once the app suspends, so everything
 /// queued since the last tick is lost when the process is later killed.
+///
+/// 🔴 `applicationWillTerminate` / `UIApplication.willTerminateNotification`
+/// is deliberately NOT observed and must not be added. iOS routinely kills
+/// a suspended, background-capable app without ever calling it, so nothing
+/// load-bearing may hang off it — not a flush, and not a session-end event.
+/// `didEnterBackgroundNotification` is the last reliably-delivered signal,
+/// which is why the flush lives there.
 ///
 /// The background flush runs inside `beginBackgroundTask(withName:)` so
 /// the system grants the request time to finish instead of suspending
@@ -29,6 +37,16 @@ final class AppLifecycleObserver: @unchecked Sendable {
     private let diagnostics: DiagnosticBus?
     private let backgroundTaskHost: @Sendable () -> BackgroundTaskHost
     private var observers: [NSObjectProtocol] = []
+
+    /// Runs when the app returns to the foreground: flush whatever the
+    /// previous session left queued, then roll the session over and announce
+    /// it if the idle window elapsed while suspended.
+    ///
+    /// Assigned by `SheepitClient.start()` rather than passed to `init`,
+    /// because the closure needs a `self` that does not exist until the
+    /// client is fully initialized. It is written exactly once, before
+    /// `register()` installs the observer that reads it.
+    var onForeground: (@Sendable () async -> Void)?
 
     init(
         log: Logger,
@@ -58,8 +76,34 @@ final class AppLifecycleObserver: @unchecked Sendable {
             self?.handleDidEnterBackground()
         }
         observers.append(token)
-        log.debug("Lifecycle observer registered (background flush)")
+
+        let foregroundToken = NotificationCenter.default.addObserver(
+            forName: UIApplication.willEnterForegroundNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            // No background-execution window needed: the app is coming back
+            // to life, not suspending, so the ordinary flush loop is about to
+            // resume on its own.
+            Task { [weak self] in await self?.performForegroundCheck() }
+        }
+        observers.append(foregroundToken)
+
+        log.debug("Lifecycle observer registered (background flush, foreground session check)")
         #endif
+    }
+
+    /// The work the foreground notification triggers, factored out for the
+    /// same reason as `performBackgroundFlush()`: the package's tests run on
+    /// macOS, where the UIKit registration above is compiled out entirely.
+    func performForegroundCheck() async {
+        diagnostics?.emit(
+            .info,
+            .lifecycle,
+            code: "lifecycle.will_enter_foreground",
+            message: "App returning to foreground — checking session freshness"
+        )
+        await onForeground?()
     }
 
     /// The work the background notification triggers, factored out so it

@@ -108,6 +108,18 @@ final class FlagManager: @unchecked Sendable {
         return debugOverrides
     }
 
+    /// Whether `overrideFlag` writes currently take effect. Test-only introspection (like
+    /// `ConnectivityMonitor.isMonitoring`) so a test can prove `SheepitClient` never calls
+    /// `setOverridesAllowed(true)` for a rejected-key/apiUrl client, independent of
+    /// `overrideFlag()`'s own `guard !destroyedFlag.value` at the `SheepitClient` layer —
+    /// see `SecretKeyGuardTests.testInertClientDoesNotWriteFlagOverrides`. Not part of the
+    /// public surface.
+    var overridesAllowedForTests: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return overridesAllowed
+    }
+
     func count() -> Int {
         lock.lock()
         defer { lock.unlock() }

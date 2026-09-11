@@ -34,7 +34,11 @@ actor ConfigSync {
         refreshTask = Task {
             while !Task.isCancelled {
                 await fetchConfig(deviceId: deviceIdGetter())
-                try? await Task.sleep(for: .seconds(refreshInterval))
+                // `refreshInterval` came from the mutable public
+                // `SheepitConfig.configRefreshInterval` — sanitize right before use rather
+                // than trusting the initializer clamp already applied to it (2026-09 security
+                // follow-up round 3, finding MF-1).
+                try? await Task.sleep(for: .seconds(refreshInterval.sanitizedForSleep()))
             }
         }
     }

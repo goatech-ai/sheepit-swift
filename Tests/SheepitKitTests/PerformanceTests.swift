@@ -310,6 +310,54 @@ final class PerformanceTests: XCTestCase {
         XCTAssertEqual(watchdog.anrCount, 0)
     }
 
+    // Regression coverage for the 2026-09 security follow-up (round 4), finding MF3-3: the
+    // MF-1 sweep clamped every `Task.sleep` site but missed `ANRWatchdog`, which drives a real
+    // background `Thread` via `Thread.sleep`. At `thresholdMs <= 0`, `watchdogLoop()`'s
+    // `checkInterval = thresholdMs / 1000.0` stops sleeping and the loop spins, enqueuing an
+    // unbounded `DispatchQueue.main.async` per iteration with no backpressure — measured RSS
+    // 21.5 -> 70.8 MB in 0.5s, SIGKILL (exit 137) at ~0.7s. These tests read the CLAMPED value
+    // off the constructed instance rather than actually running `watchdogLoop()` with a bad
+    // threshold — running the real loop for long enough to observe a crash (or its absence)
+    // would risk taking down the whole XCTest process, not just failing one test.
+
+    func testANRWatchdogFloorsAZeroThreshold() {
+        let watchdog = ANRWatchdog(thresholdMs: 0) { _ in }
+        XCTAssertEqual(
+            watchdog.thresholdMs, 100,
+            "a threshold of 0 must be floored — unclamped, it stops the watchdog loop's " +
+            "Thread.sleep from sleeping at all, spinning a background thread until the host " +
+            "is SIGKILLed from unbounded memory growth."
+        )
+    }
+
+    func testANRWatchdogFloorsANegativeThreshold() {
+        let watchdog = ANRWatchdog(thresholdMs: -5000) { _ in }
+        XCTAssertEqual(watchdog.thresholdMs, 100)
+    }
+
+    func testANRWatchdogFloorsNaN() {
+        let watchdog = ANRWatchdog(thresholdMs: .nan) { _ in }
+        XCTAssertEqual(
+            watchdog.thresholdMs, 100,
+            "NaN was already benign at the Thread.sleep call site, but the floor must still " +
+            "apply — Swift's max(_:_:) returns the non-NaN operand, so this is a free side " +
+            "effect of clamping the ordinary out-of-range case, not a separate code path."
+        )
+    }
+
+    func testANRWatchdogCeilsAnAstronomicalThreshold() {
+        let watchdog = ANRWatchdog(thresholdMs: 1e30) { _ in }
+        XCTAssertEqual(watchdog.thresholdMs, 600_000)
+    }
+
+    func testANRWatchdogLeavesAnInRangeThresholdUnchanged() {
+        let watchdog = ANRWatchdog(thresholdMs: 5000) { _ in }
+        XCTAssertEqual(
+            watchdog.thresholdMs, 5000,
+            "the clamp must not perturb the documented default or any other in-range value."
+        )
+    }
+
     // Audit R-004: state machine for the watchdog. The bug-fix split
     // the tick logic into a pure transition function so we can prove
     // its correctness without freezing the main thread or calling

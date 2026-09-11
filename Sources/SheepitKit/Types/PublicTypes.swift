@@ -10,9 +10,30 @@ public struct SheepitConfig: Sendable {
     public let apiKey: String
     public var environment: String
     public var apiUrl: String
+    /// Clamped to `TimeInterval.sleepFloor...TimeInterval.sleepCeiling` IN THE INITIALIZER
+    /// only — this is a `var`, so `var cfg = ...; cfg.flushInterval = .infinity` bypasses
+    /// that clamp entirely. The property is public and mutable for good reason (a host may
+    /// want to change the flush cadence at runtime), so the REAL fix lives at the consumer —
+    /// every `Task.sleep(for: .seconds(flushInterval))` site sanitizes via
+    /// `TimeInterval.sanitizedForSleep()` right before use. `.infinity` (the idiomatic "never
+    /// auto-flush" value) and `.nan` both trap converting through `Duration`'s internal
+    /// `Int128` representation; `0`/negative don't trap but spin the flush loop at ~150% CPU
+    /// (2026-09 security follow-up round 3, finding MF-1). This initializer clamp is defense
+    /// in depth, not the fix.
     public var flushInterval: TimeInterval
     public var flushSize: Int
+    /// Same caveat as `flushInterval` — clamped here, bypassable via direct mutation,
+    /// actually enforced at `ConfigSync`'s `Task.sleep` site via
+    /// `TimeInterval.sanitizedForSleep()` (finding MF-1).
     public var configRefreshInterval: TimeInterval
+    /// Clamped to a floor of 1 here AND at the actual consumer, `EventQueue.init` — this is a
+    /// public `var`, so `var cfg = ...; cfg.maxQueueSize = 0` bypasses this initializer clamp
+    /// entirely and reaches `EventQueue` unclamped. `EventQueue.add` evicts the oldest event
+    /// once `count >= maxSize`, which traps on an empty array at `maxSize == 0` — and #973's
+    /// `start() -> emitSessionStartIfOwed() -> track("$session_start")` enqueues an event
+    /// during construction, so `maxQueueSize: 0` aborted the host process from inside
+    /// `create()` (2026-09 security follow-up, round 2, finding M2; the mutation bypass is
+    /// round 3, finding MF-1).
     public var maxQueueSize: Int
     public var retryAttempts: Int
     public var debug: Bool
@@ -81,10 +102,10 @@ public struct SheepitConfig: Sendable {
         self.apiKey = apiKey
         self.environment = environment
         self.apiUrl = apiUrl
-        self.flushInterval = flushInterval
+        self.flushInterval = flushInterval.sanitizedForSleep()
         self.flushSize = flushSize
-        self.configRefreshInterval = configRefreshInterval
-        self.maxQueueSize = maxQueueSize
+        self.configRefreshInterval = configRefreshInterval.sanitizedForSleep()
+        self.maxQueueSize = max(1, maxQueueSize)
         self.retryAttempts = retryAttempts
         self.debug = debug
         self.onEvent = onEvent
@@ -238,6 +259,10 @@ public struct SDKStatus: Sendable {
     public let flagCount: Int
     public let experimentCount: Int
     public let sdkVersion: String
+    /// Non-nil when the SDK refused this client's API key at construction. `initialized`
+    /// alone cannot tell you that: a refused client and a `destroy()`ed one both report
+    /// `false`. Assert this is nil at launch to catch a misconfigured key.
+    public let rejectionReason: String?
 
     /// Explicit because Swift synthesises only an INTERNAL memberwise
     /// initializer for a struct that declares none. Without it a customer
@@ -253,7 +278,8 @@ public struct SDKStatus: Sendable {
         userId: String?,
         flagCount: Int,
         experimentCount: Int,
-        sdkVersion: String
+        sdkVersion: String,
+        rejectionReason: String? = nil
     ) {
         self.initialized = initialized
         self.online = online
@@ -265,6 +291,36 @@ public struct SDKStatus: Sendable {
         self.flagCount = flagCount
         self.experimentCount = experimentCount
         self.sdkVersion = sdkVersion
+        self.rejectionReason = rejectionReason
+    }
+}
+
+// MARK: - Sleep-interval sanitization
+
+extension TimeInterval {
+    /// The smallest interval a sleep-driven loop (periodic flush, config refresh) is allowed
+    /// to run at. Below this — including `0` or negative — `Task.sleep` doesn't trap, it
+    /// spins the owning loop at near-100% CPU (measured ~150% at `flushInterval: 0`/`-1`,
+    /// 2026-09 security follow-up round 2, finding M2), which no "did it crash" test catches.
+    static let sleepFloor: TimeInterval = 1.0
+
+    /// The largest interval a sleep-driven loop may wait — generous (a day) for any real
+    /// flush/refresh cadence, but small enough to stay far inside what `Duration.seconds`
+    /// can represent without overflow.
+    static let sleepCeiling: TimeInterval = 86_400
+
+    /// Sanitizes a host-supplied interval before it reaches `Task.sleep(for: .seconds(_:))`
+    /// or any other `Duration` conversion. `.infinity` — the idiom a caller reaches for to
+    /// mean "never auto-flush" — and `.nan` both trap the process converting through
+    /// `Duration`'s internal `Int128` representation ("Double value cannot be converted to
+    /// _Int128 because it is outside the representable range"), and so does a finite but
+    /// astronomical value like `1e19` or `1e30`. Every `Task.sleep` site that takes a public
+    /// `SheepitConfig`/`PerformanceConfig` value must call this immediately before use — the
+    /// initializer clamp on the config struct is defense in depth only, since the property is
+    /// a mutable public `var` (2026-09 security follow-up round 3, finding MF-1).
+    func sanitizedForSleep() -> TimeInterval {
+        guard isFinite else { return .sleepFloor }
+        return min(.sleepCeiling, max(.sleepFloor, self))
     }
 }
 
@@ -278,7 +334,25 @@ enum SDKDefaults {
     /// `publish-sdk-swift.yml` refuses to release on a mismatch. The package
     /// is deliberately on `0.x` while the API settles, and `2.0.0` is reserved
     /// for the first stable release — see the CHANGELOG's "Version policy".
-    static let sdkVersion = "0.3.0"
+    static let sdkVersion = "0.4.0"
+    /// Stamped on every ingest batch (`context.sdk.name`) so the dashboard can filter /
+    /// triage by which SDK sent a given event. Follows the monorepo directory-name
+    /// convention (`sdk-js`, `sdk-server`, `sdk-swift`) and is pinned by
+    /// `apps/api/src/__tests__/v1/ingest.test.ts`'s "stamps the six device-context
+    /// columns" regression test, which asserts this exact string round-trips to
+    /// `events_raw.sdk_name`. Bounded to 32 chars by `ingestContextSchema.sdk.name`;
+    /// `"sdk-swift"` is 9.
+    ///
+    /// 🔴 This SDK is FIRST, not matching an existing practice. An earlier version of
+    /// this comment claimed the other SDKs "already use" this on the wire; they do not.
+    /// `sdk-js` builds `context.device` as `{ id, platform, locale }` and sends no
+    /// `context.sdk` at all (it has an `SDK_VERSION` constant that never reaches the
+    /// wire), and `sdk-server` sends only `{ platform: "server" }`. So until they catch
+    /// up, `sdk_name` / `os_name` / `device_model` / `timezone` / `device_type` /
+    /// `build_channel` populate for iOS traffic and stay EMPTY for web and server — a
+    /// real breakdown inconsistency a customer will see, not a cosmetic gap. Tracked in
+    /// PENDING_WORK.md; do not "reconcile" it by weakening this SDK.
+    static let sdkName = "sdk-swift"
     static let apiUrl = SheepitConfig.defaultAPIUrl
     static let environment = "production"
     static let flushInterval: TimeInterval = 5.0
@@ -294,6 +368,13 @@ enum SDKDefaults {
     static let configMaxAge: TimeInterval = 24 * 60 * 60
     static let offlineQueueMax = 500
     static let eventNameMaxLength = 200
+    /// How long `start()` withholds a RETRY after a terminal (401/403/422) registration
+    /// failure, before treating the device as eligible to try again. Matches
+    /// `configMaxAge`'s once-a-day cadence — long enough that a permanently revoked key
+    /// does not hammer the endpoint on every cold start, short enough that a fix shipped
+    /// in a later build (or capacity freed server-side) is picked up within a day rather
+    /// than never.
+    static let deviceRegistrationTerminalBackoff: TimeInterval = 24 * 60 * 60
 }
 
 /// Persistence keys. `gt_*` since the LaunchPad → GoaTech rename, matching
@@ -315,4 +396,22 @@ enum StorageKeys {
     static let sessionId = "gt_session_id"
     static let sessionLastSeen = "gt_session_last_seen"
     static let experimentAssignments = "gt_exp_assignments"
+    /// Set only after a SUCCESSFUL `POST /v1/devices/register` round trip — not merely
+    /// once a device id has been minted locally. See `SheepitClient.start()`'s guard.
+    static let deviceRegistered = "gt_device_registered"
+    /// Epoch-seconds string. Set only after a TERMINAL registration failure (401/403/422 —
+    /// see `RegistrationOutcome`), never after success or a transient failure. Deliberately
+    /// NOT the same key as `deviceRegistered`: a revoked key that gets fixed in a later
+    /// build must still be retried eventually, just not on every single cold start while
+    /// it's broken. See `SheepitClient.start()`'s guard.
+    static let deviceRegistrationBackoffUntil = "gt_device_registration_backoff_until"
+    /// The app version (`CFBundleShortVersionString`) recorded the last time
+    /// `SheepitClient.emitAppInstallOrUpdateIfOwed()` ran. Absent on every install that
+    /// predates 0.4.0 — its absence is what triggers the backfill-without-emitting path on
+    /// decision 7 (`AppLifecycleEventDecider`). Deliberately a SEPARATE key from
+    /// `deviceId`: an existing install's `deviceId` is always non-nil by the time this runs
+    /// (`persistOnBeginWork()` already wrote it), so this marker — not that one — is the
+    /// only way to tell "have we ever run this bookkeeping before" from "does a device id
+    /// exist."
+    static let installedAppVersion = "gt_installed_app_version"
 }

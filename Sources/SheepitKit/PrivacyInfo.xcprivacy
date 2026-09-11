@@ -99,7 +99,7 @@
 			</array>
 		</dict>
 
-		<!-- $sdk_error events reporting the SDK's own failures. -->
+		<!-- $error events reporting the SDK's own failures (renamed from $sdk_error). -->
 		<dict>
 			<key>NSPrivacyCollectedDataType</key>
 			<string>NSPrivacyCollectedDataTypeOtherDiagnosticData</string>

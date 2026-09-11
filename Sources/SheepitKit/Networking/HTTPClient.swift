@@ -22,14 +22,42 @@ actor HTTPClient {
         }
 
         self.session = URLSession(configuration: sessionConfig)
-        self.apiKey = config.apiKey
+        // Trimmed: a key copied from a terminal/`.env`/plist with a trailing newline or space
+        // is otherwise admitted by `SheepitClient`'s validation (which trims before judging)
+        // but would still ship untrimmed here — and Foundation silently drops the entire
+        // `Authorization` header rather than sending a malformed one, so every request would
+        // go out unauthenticated with no error anywhere (2026-09 follow-up, finding E-004).
+        self.apiKey = config.apiKey.trimmingCharacters(in: .whitespacesAndNewlines)
         self.environment = config.environment
-        // swiftlint:disable:next force_unwrapping
-        self.baseURL = URL(string: config.apiUrl)!
+        // `config.apiUrl` is validated by `SheepitClient.create`'s admission gate — a
+        // malformed/empty apiUrl routes to an inert client before this initializer ever runs
+        // on that path (finding E-003). The fallback below is defense in depth for a caller
+        // that constructs `HTTPClient` directly, bypassing that gate: it must never crash the
+        // host on attacker/config-controlled input the way `URL(string: config.apiUrl)!` did.
+        //
+        // Trimmed for the SAME reason the apiKey is trimmed above: the admission gate judges
+        // the TRIMMED apiUrl and admits e.g. a trailing newline from a copy-pasted `.env`
+        // value, but `URL(string:)` fails to parse a string with surrounding whitespace at
+        // all — it silently fell through to `unreachableFallbackURL` here, so an admitted,
+        // "initialized" client sent every request to a domain that doesn't exist (2026-09
+        // security follow-up round 3, finding MF-4). Gate and transport must agree on the
+        // SAME string.
+        self.baseURL = URL(string: config.apiUrl.trimmingCharacters(in: .whitespacesAndNewlines))
+            ?? HTTPClient.unreachableFallbackURL
         self.retryAttempts = config.retryAttempts
         self.retryBackoff = SDKDefaults.retryBackoff
         self.log = log
     }
+
+    /// A well-formed, compile-time-constant URL — never derived from config/attacker input,
+    /// so this force-unwrap can never fail. Only reached if a caller bypasses
+    /// `SheepitClient.create`'s apiUrl validation.
+    private static let unreachableFallbackURL = URL(string: "https://invalid.sheepit.local")!
+
+    /// Test-only: `@testable import` only, not part of the public surface. Lets a test assert
+    /// what `config.apiUrl` actually resolved to without a real network hop or DNS resolution
+    /// against a synthetic host (finding MF-4's regression coverage).
+    var baseURLForTesting: URL { baseURL }
 
     // MARK: - Public API
 

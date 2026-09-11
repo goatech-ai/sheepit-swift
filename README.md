@@ -161,6 +161,8 @@ let recent = sheepit?.getRecentDiagnostics()
 
 `SheepitConfig.onDiagnostic` wires a subscriber at init; `diagnosticBufferSize` sizes the buffer (default 100).
 
+**SDK-internal errors are tracked as an `$error` event** (renamed from `$sdk_error` in `0.4.0`, to converge on the one name the web and server SDKs already use for their own error events). If you have a saved dashboard chart or segment filtering `$sdk_error`, it goes flat at the `0.4.0` release — historical rows stay under the old name, but nothing new is written there. Point it at `$error` instead. This matters for BYOC customers pinning an image who may not read the CHANGELOG.
+
 ### Developer menu
 
 The SDK links **no SwiftUI/AppKit** — it ships the flag-override _store_
@@ -234,15 +236,45 @@ a build where overrides are disabled. The full precedence table is `override` > 
 
 On UIKit platforms the SDK observes `UIApplication.didEnterBackgroundNotification` and flushes queued events inside a `beginBackgroundTask` window, so events queued just before the app is backgrounded are not lost when the process is later killed. Nothing to configure.
 
+### Sessions
+
+The SDK maintains a session automatically. You do not need to call `track()` at launch to be counted — **an app that launches and does nothing still registers a session.**
+
+- A session ends after **30 minutes of inactivity**, where activity means an event. This matches the JS SDK.
+- `$session_start` is emitted automatically when a launch opens a new session, and again when the app returns to the foreground after the idle window elapsed while it was suspended. It carries one property, `is_first_session` — `true` only for the device's very first session ever, so the install cohort is queryable without joining back to `$app_install`. Everything else (session id, device context) already rides on every event.
+- The session id is persisted, so relaunching within the window continues the same session rather than starting a new one.
+- `reset()` rotates the session id (as on web) but does **not** emit `$session_start` — a logout is not a new session.
+
+Nothing to configure, and nothing to call.
+
+### Install and update
+
+`$app_install` fires exactly once, on a genuinely fresh install — never again, and never on an existing install merely upgrading to a version of this SDK that ships the feature. `$app_update` fires whenever the app's version changes since the last launch, carrying `previous_version` / `current_version`. Both are driven by one storage key, so an app that has been installed for months does not report a fake install the day it upgrades.
+
+Nothing to configure, and nothing to call.
+
 ## FAQ
 
-**Which key type should I use?** Use a publishable key (`lp_pub_*`). The initializer validates the key format and accepts `lp_pub_*` or `lp_sec_*`, but a secret key must never ship in an app binary, so always use a publishable key in production builds.
+**Which key type should I use?** A publishable key (`lp_pub_*`) — it is the only type this SDK accepts. Secret keys (`lp_sec_*`) grant full project write access and must never ship in an app binary, where anyone can extract them from the IPA; developer keys (`lp_dev_*`) are read-only for schemas and definitions and cannot post events. Both are refused.
+
+**Nothing is happening — no events, and every flag returns my default.** Most often the API key was refused. The SDK does not crash your app over a bad key; it returns an inert client and tells you three ways:
+
+```swift
+let sheepit = SheepitClient.create(config: .init(apiKey: key))
+if let reason = sheepit.status().rejectionReason {
+    assertionFailure("[Sheepit] \(reason)")   // debug builds only
+}
+```
+
+An error is also logged to `os_log`, and a `lifecycle.api_key_rejected` diagnostic is emitted — subscribe with `SheepitConfig.onDiagnostic` or read `getRecentDiagnostics()`. If the key is fine, check that the device has network and that events are being flushed (`status().queueDepth`).
+
+**Does the SDK hardcode the `lp_` key prefix?** No. It validates the shape of a key — `{prefix}_pub_{env}_{secret}` — but never the vendor prefix itself, so a key minted under a future prefix works on a version you have already pinned. A published Swift package version is immutable, so anything compiled in here is compiled in forever.
 
 **How do I get type-safe flags?** The `sheepit codegen` command in [@sheepit-ai/cli](https://www.npmjs.com/package/@sheepit-ai/cli) generates a Swift `Flag` enum for your project. Reference flags by `Flag.<name>.rawValue`.
 
 **How does experiment bucketing work?** The server assigns the variant and the SDK caches it per device, so a device keeps its assignment across launches.
 
-**Is the SDK concurrency-safe?** Yes. `SheepitClient` is `Sendable` and its internals are actor-isolated, so its public methods are safe to call from any thread.
+**Is the SDK concurrency-safe?** Yes, within one process. `SheepitClient` is `Sendable` and its internals are actor-isolated, so its public methods are safe to call from any thread. That guarantee does not extend across process boundaries: `create()`/`initialize()` persist device and session identity under a fixed `UserDefaults` suite that is not an App Group id, so **do not link SheepitKit into an app extension alongside a host app**, and do not run two independent processes against the same install — each process would compute its own fresh device id and independently report its own `$app_install` and `$session_start(is_first_session: true)`, double-counting a single real install.
 
 ## License
 

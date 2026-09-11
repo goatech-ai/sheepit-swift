@@ -141,12 +141,21 @@ actor CrashReporter {
 
     /// Update the mmap'd crash context with current SDK state.
     /// Called after identity changes, flag evaluations, screen changes.
+    ///
+    /// The device/app fields were reserved in the C struct since it was written but never
+    /// filled in — `CrashReportReader` already read them back, so a crash always shipped
+    /// `app_version: ""` and `build_number`/`os_version`/`device_model: nil`, with no signal
+    /// anywhere that the fields were silently empty.
     nonisolated func updateContext() {
         guard let ctx = sheepit_get_crash_context() else { return }
 
         writeString(context.userId ?? "", to: &ctx.pointee.user_id)
         writeString(context.deviceId, to: &ctx.pointee.device_id)
         writeString(context.sessionId, to: &ctx.pointee.session_id)
+        writeString(DeviceProfile.appVersion() ?? "", to: &ctx.pointee.app_version)
+        writeString(DeviceProfile.buildNumber() ?? "", to: &ctx.pointee.build_number)
+        writeString(DeviceProfile.osVersion(), to: &ctx.pointee.os_version)
+        writeString(DeviceProfile.deviceModel(), to: &ctx.pointee.device_model)
 
         ctx.pointee.magic = UInt32(SHEEPIT_CRASH_CONTEXT_MAGIC)
     }

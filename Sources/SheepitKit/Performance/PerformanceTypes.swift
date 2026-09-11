@@ -19,7 +19,14 @@ public struct PerformanceConfig: Sendable {
     /// Whether memory usage tracking is enabled.
     public var memoryTrackingEnabled: Bool
 
-    /// Threshold in milliseconds for detecting Application Not Responding.
+    /// Threshold in milliseconds for detecting Application Not Responding. Not clamped here —
+    /// this is a mutable public `var`, so a self-clamping initializer would be bypassable the
+    /// same way `flushInterval`/`configRefreshInterval`/`maxQueueSize` were (finding MF-1).
+    /// The real clamp lives at the actual consumer, `ANRWatchdog.init`'s
+    /// `minThresholdMs...maxThresholdMs` (2026-09 security follow-up round 4, finding MF3-3):
+    /// `<= 0` doesn't crash `ANRWatchdog`'s loop, it spins a background thread at near-100%
+    /// CPU enqueuing unbounded main-thread pings, which SIGKILLs the host from memory growth
+    /// within a second.
     public var anrThresholdMs: Double
 
     /// Threshold in milliseconds for a slow frame (default 16.67ms = 60fps).
@@ -28,7 +35,10 @@ public struct PerformanceConfig: Sendable {
     /// Threshold in milliseconds for a frozen frame.
     public var frozenFrameThresholdMs: Double
 
-    /// Interval in seconds between automatic flushes of performance data.
+    /// Interval in seconds between automatic flushes of performance data. Clamped here in the
+    /// initializer, but this is a mutable public `var` — the actual fix against `.infinity`/
+    /// `.nan` traps live at `PerformanceMonitor`'s `Task.sleep` site via
+    /// `TimeInterval.sanitizedForSleep()` (2026-09 security follow-up round 3, finding MF-1).
     public var flushInterval: TimeInterval
 
     /// Maximum number of metrics to batch before flushing.
@@ -54,7 +64,7 @@ public struct PerformanceConfig: Sendable {
         self.anrThresholdMs = anrThresholdMs
         self.slowFrameThresholdMs = slowFrameThresholdMs
         self.frozenFrameThresholdMs = frozenFrameThresholdMs
-        self.flushInterval = flushInterval
+        self.flushInterval = flushInterval.sanitizedForSleep()
         self.maxBatchSize = maxBatchSize
     }
 }

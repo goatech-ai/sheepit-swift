@@ -127,7 +127,7 @@ final class ConcurrencySafetyTests: XCTestCase {
         let manager = ExperimentManager(storage: InMemoryStorage())
         DispatchQueue.concurrentPerform(iterations: 200) { index in
             if index.isMultiple(of: 4) {
-                manager.setAssignments([:])
+                manager.setAssignments([:], appliedUnderUserId: nil)
             } else {
                 _ = manager.resolve(experimentKey: "exp") { _, _ in }
                 _ = manager.count()

@@ -43,7 +43,7 @@ final class DeviceContextIngestPayloadTests: XCTestCase {
         guard
             let body = BodyCapturingStubURLProtocol.lastBody,
             let json = try? JSONSerialization.jsonObject(with: body) as? [String: Any],
-            let context = json["context"] as? [String: Any]
+            let context = (json["batch"] as? [[String: Any]])?.first?["context"] as? [String: Any]
         else { return nil }
         return context
     }

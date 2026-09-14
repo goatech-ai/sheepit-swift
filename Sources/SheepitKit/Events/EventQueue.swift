@@ -14,10 +14,63 @@ struct EnrichedEvent: Codable, Sendable {
     let locale: String
     let timezone: String
     let timestamp: String
+    /// App and device dimensions frozen at TRACK time (PILOT_CORRECTNESS_DESIGN.md §2.2).
+    /// `Transport` used to read these from `Bundle`/`DeviceProfile`/`Locale` at FLUSH time,
+    /// so an event that waited in the offline queue across an app update was filed under
+    /// the new version.
+    ///
+    /// 🔴 Optional, and it must stay optional. `OfflineQueue.load()` decodes
+    /// `[EnrichedEvent]` under ONE `try?`, so a single element that fails to decode drops
+    /// the ENTIRE persisted queue. A queue written by an SDK that predates this field
+    /// decodes it as `nil`, and `Transport` then OMITS those dimensions — it never fills
+    /// them in from whatever app and OS happen to be running at flush.
+    let snapshot: TrackSnapshot?
+    /// Every experiment assignment active when this event was tracked, keyed by experiment key
+    /// (the ingest correctness design, §2.3). Frozen here for the same reason as `snapshot`: an
+    /// event flushed after a new `/v1/config`, an `identify()` or a relaunch must still name the
+    /// arm it was produced under. `nil` when none were active, and for every event queued by an
+    /// SDK that predates this field; `Transport` then sends no experiment context at all.
+    ///
+    /// 🔴 Optional for the decode-safety reason on `snapshot`.
+    let assignments: [String: EventAssignment]?
+
+    init(
+        eventId: String,
+        eventName: String,
+        eventProperties: [String: AnyCodable]?,
+        deviceId: String,
+        anonymousId: String,
+        sessionId: String,
+        userId: String?,
+        platform: String,
+        sdkVersion: String,
+        locale: String,
+        timezone: String,
+        timestamp: String,
+        snapshot: TrackSnapshot? = nil,
+        assignments: [String: EventAssignment]? = nil
+    ) {
+        self.eventId = eventId
+        self.eventName = eventName
+        self.eventProperties = eventProperties
+        self.deviceId = deviceId
+        self.anonymousId = anonymousId
+        self.sessionId = sessionId
+        self.userId = userId
+        self.platform = platform
+        self.sdkVersion = sdkVersion
+        self.locale = locale
+        self.timezone = timezone
+        self.timestamp = timestamp
+        self.snapshot = snapshot
+        self.assignments = assignments
+    }
 
     /// Every field copied except `deviceId`. Used ONLY by
     /// `EventQueue.restampDeviceId(from:to:)` — see its doc for why a queued event's
-    /// device id is ever rewritten after enqueue.
+    /// device id is ever rewritten after enqueue. That restamp is the ONLY identity repair
+    /// §2.2 allows: user, session, snapshot and assignments are copied verbatim, never
+    /// refreshed.
     func withDeviceId(_ newDeviceId: String) -> EnrichedEvent {
         EnrichedEvent(
             eventId: eventId,
@@ -31,9 +84,76 @@ struct EnrichedEvent: Codable, Sendable {
             sdkVersion: sdkVersion,
             locale: locale,
             timezone: timezone,
-            timestamp: timestamp
+            timestamp: timestamp,
+            snapshot: snapshot,
+            assignments: assignments
         )
     }
+}
+
+/// The app/device half of an event's track-time snapshot. The identity half (user,
+/// anonymous, device, session) plus locale and timezone are `EnrichedEvent`'s own fields.
+///
+/// Every field is optional for the decode-safety reason on `EnrichedEvent.snapshot`; a
+/// field added here later must be optional too, or one old queued event drops the queue.
+struct TrackSnapshot: Codable, Sendable, Equatable {
+    let appVersion: String?
+    let appBuild: String?
+    let appNamespace: String?
+    let buildChannel: String?
+    let deviceModel: String?
+    let osVersion: String?
+    let osName: String?
+    let deviceType: String?
+    /// ISO 3166-1 alpha-2 only — see `countryCode(_:)`.
+    let country: String?
+
+    /// Snapshot the running app and device for an event being tracked now.
+    ///
+    /// - Parameter appVersion: `SheepitConfig.appVersion`. Audit L-005: a release-binding
+    ///   host sets it to a commit SHA / build tag so events resolve to a `Release` row, so
+    ///   it wins over `CFBundleShortVersionString`.
+    static func capture(appVersion: String?) -> TrackSnapshot {
+        let invariant = processInvariant
+        // Bounded to `ingestContextSchema.app.version`/`build` (max 64): a host passing a
+        // long release tag would otherwise lose every event it tracks.
+        let bound = SDKDefaults.appVersionMaxLength
+        return TrackSnapshot(
+            appVersion: (appVersion ?? invariant.appVersion).map { DeviceProfile.bounded($0, bound) },
+            appBuild: invariant.appBuild.map { DeviceProfile.bounded($0, bound) },
+            appNamespace: invariant.appNamespace,
+            buildChannel: invariant.buildChannel,
+            deviceModel: invariant.deviceModel,
+            osVersion: invariant.osVersion,
+            osName: invariant.osName,
+            deviceType: invariant.deviceType,
+            // Per event, not cached: the user can change region while the app runs.
+            country: countryCode(Locale.current.region?.identifier)
+        )
+    }
+
+    /// `ingestContextSchema.device.country` is `.length(2)`, but `Locale.region` is not
+    /// always a country: UN M.49 area codes are legal and real ("419" = Latin America,
+    /// common on es-419 devices), and one would be rejected. An absent country is a
+    /// missing dimension; a rejected context loses the event.
+    static func countryCode(_ region: String?) -> String? {
+        guard let region, region.utf16.count == 2 else { return nil }
+        return region
+    }
+
+    /// Bundle, hardware and OS do not change under a running process, so they are
+    /// computed once instead of on every `track()` (`deviceModel()` is two sysctl calls).
+    private static let processInvariant = TrackSnapshot(
+        appVersion: DeviceProfile.appVersion(),
+        appBuild: DeviceProfile.buildNumber(),
+        appNamespace: Bundle.main.bundleIdentifier,
+        buildChannel: DeviceProfile.buildChannel(),
+        deviceModel: DeviceProfile.deviceModel(),
+        osVersion: DeviceProfile.osVersion(),
+        osName: DeviceProfile.osName,
+        deviceType: DeviceProfile.deviceType(),
+        country: nil
+    )
 }
 
 /// In-memory FIFO event queue with max capacity.
@@ -93,6 +213,17 @@ final class EventQueue: @unchecked Sendable {
         defer { lock.unlock() }
         let drained = events
         events.removeAll()
+        return drained
+    }
+
+    /// The oldest `limit` events, removed; the rest stay queued. `Transport.flush()` takes no
+    /// more than the offline queue can hold, so a failed flush persists everything it took.
+    func drain(upTo limit: Int) -> [EnrichedEvent] {
+        lock.lock()
+        defer { lock.unlock() }
+        let count = min(max(0, limit), events.count)
+        let drained = Array(events.prefix(count))
+        events.removeFirst(count)
         return drained
     }
 

@@ -115,7 +115,7 @@ final class FlagInspectionPublicAPITests: XCTestCase {
     }
 
     func testAllowFlagOverridesTrueEnablesOverridesEvenWithDebugFalse() {
-        // The Sermo scenario: a dev menu in an internal/TestFlight build
+        // The pilot scenario: a dev menu in an internal/TestFlight build
         // WITHOUT shipping verbose SDK logging.
         let sdk = SheepitClient.create(config: Self.makeConfig(debug: false, allowFlagOverrides: true))
         defer { sdk.destroy() }

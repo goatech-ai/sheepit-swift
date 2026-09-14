@@ -334,7 +334,7 @@ enum SDKDefaults {
     /// `publish-sdk-swift.yml` refuses to release on a mismatch. The package
     /// is deliberately on `0.x` while the API settles, and `2.0.0` is reserved
     /// for the first stable release — see the CHANGELOG's "Version policy".
-    static let sdkVersion = "0.4.0"
+    static let sdkVersion = "0.5.0"
     /// Stamped on every ingest batch (`context.sdk.name`) so the dashboard can filter /
     /// triage by which SDK sent a given event. Follows the monorepo directory-name
     /// convention (`sdk-js`, `sdk-server`, `sdk-swift`) and is pinned by
@@ -368,6 +368,17 @@ enum SDKDefaults {
     static let configMaxAge: TimeInterval = 24 * 60 * 60
     static let offlineQueueMax = 500
     static let eventNameMaxLength = 200
+    /// `ingestContextSchema.app.version` / `.build` — UTF-16 units, as zod counts them.
+    static let appVersionMaxLength = 64
+    /// `ingestContextSchema.user.id` and `deviceIdentifySchema.user_id`, UTF-16 units.
+    static let userIdMaxLength = 256
+
+    /// Back-off after the nth consecutive retryable ingest failure (5xx / network): 5 s,
+    /// doubling, capped at 5 minutes. Any 2xx resets the count.
+    static func failureBackoff(_ failures: Int) -> TimeInterval {
+        let exponent = Double(min(max(failures, 1), 10) - 1)
+        return min(300, 5 * pow(2, exponent))
+    }
     /// How long `start()` withholds a RETRY after a terminal (401/403/422) registration
     /// failure, before treating the device as eligible to try again. Matches
     /// `configMaxAge`'s once-a-day cadence — long enough that a permanently revoked key
@@ -392,6 +403,18 @@ enum StorageKeys {
     static let anonymousId = "gt_anonymous_id"
     static let identity = "gt_identity"
     static let sdkConfig = "gt_config"
+    /// When `sdkConfig` was written. A SEPARATE key rather than a field inside
+    /// the blob, because the blob is the raw HTTP response bytes — adding a
+    /// field would mean re-encoding it and would break every cache written by
+    /// an older version. Absent means "written before this key existed", which
+    /// `ConfigSync` treats as stale: one cache miss on upgrade, then correct.
+    static let sdkConfigCachedAt = "gt_config_cached_at"
+    /// The `ServerHeldUser` label the cached `sdkConfig` body was fetched under, as JSON. Absent
+    /// or unreadable means unknown: the body's assignments are then applied as `.unknown`.
+    static let sdkConfigFetchedUnder = "gt_config_fetched_under"
+    /// The `ServerHeldUser` state, as JSON with an explicit `state`. NOT cleared by `reset()`:
+    /// logout does not change the server's device row.
+    static let serverHeldUser = "gt_server_held_user"
     static let offlineQueue = "gt_offline_queue"
     static let sessionId = "gt_session_id"
     static let sessionLastSeen = "gt_session_last_seen"

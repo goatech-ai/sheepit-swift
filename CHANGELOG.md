@@ -27,6 +27,201 @@ package uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 > resolves `>=1.0.0 <2.0.0`, so **a consumer pinned to `1.0.x` will never
 > receive a `0.x` release.** They are frozen until they re-pin to `0.x`.
 
+## [Unreleased]
+
+## [0.5.0] - 2026-09-14
+
+> 🔴 **Roll out in this order.** 0.5.0 attaches `experiment_assignments` to every event
+> tracked while an experiment is active. An API without per-event experiment attribution
+> either rejects those events or accepts them and drops their attribution. SheepitKit does not
+> retry a rejected event, so events sent before step 1 are lost or unattributed.
+>
+> 1. **Upgrade the API first, and verify it.** A self-hosted install must run a build with
+>    per-event experiment attribution before any app ships 0.5.0. To verify, send an event
+>    that carries `experiment_assignments`: the ingest response's `rejected` list must be empty
+>    and the stored event must keep its attribution. An empty `rejected` list alone is not
+>    enough, because an older API accepts the event and drops the attribution.
+> 2. **Audit flag platforms.** SheepitKit registers devices with platform `ios`, and a current
+>    API enforces platform targeting. Every flag whose platform list is non-empty and does not
+>    include `ios` stops reaching the app and falls back to its compiled-in default.
+> 3. **Pin exactly.** Use `exact: "0.5.0"`. SPM's `from:` does not minor-lock `0.x`, so a
+>    later `0.x` would reach the app unreviewed.
+
+### Added
+
+- **Events carry their experiment assignments (S3d).** Each event records the experiment
+  assignments active when it is tracked, and sends them in its own `context`:
+  `experiments` (experiment key → variant key) and `experiment_assignments`
+  (`experiment_id`, `variant_key`, `subject_kind`, `bucketing_version`,
+  `assignment_revision`). `$experiment_exposure` carries them too. The SDK sends which unit
+  was randomized (`user` or `device`), never the user or device id: the API resolves that
+  from the event's own identity. An assignment from a config cached before the API supplied
+  this metadata is left out of `experiment_assignments`, so that experiment is unattributed
+  on the event rather than guessed. Before, events carried no experiment context at all.
+- **Events are marked `identity_changed` when the user a config was bucketed for is not the
+  event's user.** `/v1/config` buckets on the user the server's device row holds, which only an
+  identify POST changes, so each config is labelled with what the SDK knows about that row.
+  Calling `identify()` makes the label unknown. A successful identify POST sets it to the
+  posted user, whatever the app has identified since. A failed or unanswered POST leaves it
+  unknown. `reset()` does not change it, because logout does not change the row. Adopting a
+  newly minted device id sets it to "no user". The label is read when a config request starts,
+  and a response that lands after the label changed is applied as unknown. A user-bucketed
+  assignment on an event whose user differs from the label, or whose label is unknown, is sent
+  with `subject_status: "identity_changed"` and left out of `experiments`. Device-bucketed
+  assignments are unaffected. Events tracked after `reset()` are therefore marked until
+  another user is identified. The SDK reports this once per applied config as the
+  `experiment.identity_changed` diagnostic, which carries no user ids. The label also becomes
+  unknown whenever a queued identify POST is sent. One case is not covered: an identify request
+  the SDK stopped waiting for (a timeout, a lost connection, or a POST already on the wire when
+  `destroy()` is called) that the server still commits after a later identify POST succeeded
+  leaves the server on the earlier user while the SDK labels configs with the later one, so
+  that later user's user-bucketed events are credited to the earlier user's arms. It lasts
+  until the next identify POST succeeds online: every identified launch now sends one, and a
+  failed one is retried. Before this version it lasted until a different user was identified,
+  across relaunches (identifying the same user again is a no-op). An offline relaunch does not
+  extend it: the cached config is applied as unknown until a POST succeeds.
+- **`identify()` no longer latches the previous user's config.** The config ETag carries no
+  user and identifying does not change the config version, so every conditional fetch after
+  `identify()` answered 304 and the previous user's flags and experiments stayed applied
+  indefinitely. When the identify POST succeeds, the SDK now refetches with no
+  `If-None-Match` (keeping the cached body until the response lands), and the
+  `identity_changed` mark clears when that refetch lands. If that refetch fails, every later
+  fetch stays unconditional until one is applied. A response invalidated by a label
+  change keeps no ETag either. If the POST fails or its response is lost, the new user's
+  user-bucketed assignments stay unattributed until a later identify POST succeeds or the next
+  launch re-sends it. Identify POSTs are sent one at a time, in call order, and `destroy()`
+  cancels any still queued or waiting to retry.
+- **Config requests no longer use the URL cache.** A config response is sent with
+  `Cache-Control: private, max-age=60`, and the SDK's default URL session cached it: a second
+  request within 60 seconds was answered from the cache without reaching the server. The SDK
+  now always sends config requests to the network and revalidates with its own ETag.
+
+### Fixed
+
+- **`reset()` can no longer be undone by a config fetch, or wipe a newer cache.** `reset()`
+  cleared the cached config on disk synchronously but finished the job in a background task.
+  A config response that landed before that task ran could write the logged-out user's config
+  back to disk and apply it again, and the task could delete a cache written after the reset.
+  `reset()` now clears everything synchronously, and a config fetch that started before it
+  never writes, applies, or sends its old ETag afterwards. The same holds for the cached config
+  applied at launch.
+- **Retries no longer duplicate events (S3b, #1013).** Each event now sends the
+  `event_id` minted at track time and its own complete `context` (user, anonymous id,
+  device, session, app, OS). Before this, the id never left the device, so a resend after
+  a timeout or an offline period stored a second row. A batch also used the first event's
+  identity for every event in it. A retry of the same event now dedupes to one row.
+  App, build, device model, OS and country are captured when the event is tracked, not
+  when it is flushed.
+- **Large flushes are no longer rejected whole (S3c).** A flush is split into requests of
+  at most 100 events and about 900 KB. Before, a backlog after a 429 back-off or an
+  offline period went out as one request; the API answered 400 and every event in it was
+  dropped.
+- **Failed sends are actually retried.** Events kept after a 5xx, a network error or a 429
+  are re-sent, with the same `event_id` and timestamp, on the next flush. Before, they were
+  re-sent only when the device went offline and came back, so a device that stayed online
+  never retried them. A failure ends the flush, and the SDK then waits before sending again:
+  `Retry-After` for a 429, otherwise 5 seconds doubling to 5 minutes, reset by any success.
+  Events tracked during that wait are written to the offline queue on the next flush tick.
+  Flushes no longer overlap: a `flush()` called while one is running waits for it.
+- **Rejected events are reported.** The SDK now reads the ingest response. Events the API
+  rejects one by one (too large, missing or duplicate `event_id`, invalid context, outside
+  the storable window, schema) are
+  reported through the `transport.events_rejected` diagnostic — at most 10 per request,
+  reasons cut to 200 characters — and are not re-sent. A success response that does not
+  match its request is reported as `transport.rejection_unmatched` or
+  `transport.ingest_response_undecodable`; its events still count as delivered.
+- **Persisted events survive the app being killed mid-flush.** Events in the offline queue
+  now stay on disk until their request is answered (delivered or permanently refused). Before,
+  a flush removed them from disk before sending, so a kill during the request lost up to 500
+  events. A kill after the server stored a request but before the SDK recorded that is
+  resent on the next launch. The API stores it only once, deduplicating by `event_id`, but
+  usage metering counts accepted events, so that resend is counted and billed again.
+
+### Behaviour changes to know before upgrading
+
+- 🔴 **Requires an API that includes the S3d ingest change, not just S2 (#995).** An API with
+  #995 but without S3d requires a client-sent `subject` in every `experiment_assignments`
+  entry, so it rejects every event that carries the map: every event tracked while any
+  experiment is active.
+- **Events are larger while experiments are active.** Each active assignment adds about
+  260 bytes with a 20-character key, and up to about 720 bytes with a 128-character key and
+  variant. The API rejects an event over 32 KB and a map over 100 entries: 100 typical
+  assignments (about 23 KB) fit, but about 44 at the maximum lengths reach 32 KB. The SDK
+  does not truncate the map. An oversize event is rejected and reported through
+  `transport.events_rejected`. Usage metering is unchanged: it counts accepted events.
+- **Every identified launch sends one identify POST.** On each launch with a stored user id,
+  the SDK re-sends `POST /v1/devices/:id/identify` for that user once, even when it last
+  recorded the server as holding that user: one extra request per identified launch. The API
+  treats a repeat for the same user as an attribute merge only (no identity-merge record, no
+  merge rate limit). If that POST, or one sent by `identify()`, fails, the SDK sends it again,
+  as one POST without traits (the API then leaves stored traits untouched), at most once per
+  config refresh (every 5 minutes by default) and on each return from offline, while the user
+  is still stored and no identify POST is in flight; nothing more is sent once one succeeds. Until then, including while offline, the
+  cached config is applied as unknown and the user's user-bucketed assignments are
+  unattributed. An install with no stored user sends nothing. Traits passed to an `identify()`
+  whose POST fails are not re-sent: the retry carries none, and calling `identify()` again for
+  the same user sends nothing. They reach the server only through a later `identify()` made after
+  `reset()` or after identifying a different user.
+- **The identify retry stops where it cannot succeed, and a failing one no longer costs a full
+  config download on every poll.** No retry is sent while device registration is backed off
+  after a terminal failure (the device is not on the server), or for a user whose POST the API
+  rejected with a 400, 401, 403, 404 or other non-retryable 4xx; that user is sent again only by
+  the next identified launch or by identifying a different user first (identifying the same user
+  again is a no-op), and the rejection is reported once as `identity.identify_post_rejected`. A
+  400 on a POST that carried traits is treated as a trait problem instead: the identity is
+  re-sent once without traits (`identity.identify_traits_rejected`), so an invalid trait no
+  longer leaves the device on the previous user for the rest of the session. Empty traits (`traits: [:]`) count as none. A 429, 5xx or network failure is still retried,
+  but no longer discards the ETag of the config fetch in flight, which had turned every later
+  poll into a full 200 and a cache rewrite for as long as the POST kept failing, across
+  relaunches.
+- **No identify POST is sent for a user who logged out before it went out.** An `identify()`
+  POST waits for the one before it, the launch re-POST for device registration, the retry its
+  turn, and `HTTPClient` backs off between attempts; a `reset()` in any of those waits used to
+  bind the logged-out user to the device row. Every one of them, and the traits-less resend,
+  now checks before the first attempt and before every retry attempt after a 5xx or network
+  error that no `reset()` ran since it was queued (since `identify()` was called, for an
+  `identify()` POST); the automatic ones and the resend also check that the app still names
+  that user. An attempt already on the wire when `reset()` runs cannot be recalled; if it
+  succeeds the SDK records that the row holds that user, as any later config fetch would show.
+- **Do not call `reset()` from a `UserDefaults.didChangeNotification` observer.** The SDK writes
+  its `UserDefaults` suite while holding the lock that serializes `reset()` against config
+  writes, and `UserDefaults` posts that notification synchronously on the writing thread, inside
+  the write (measured for the SDK's suite, on the main thread and a background thread). An
+  observer that calls `reset()` from it deadlocks. Before this version the same observer
+  re-entered `reset()` from `reset()`'s own storage writes.
+- **The persisted offline queue grows with active experiments.** Each queued event stores its
+  assignments in `UserDefaults`, measured at about 212 bytes per assignment: 500 queued
+  events carry about 0.5 MB with 5 active assignments, about 2 MB with 20, and about 10 MB
+  with 100.
+- **Timestamps are the device clock, uncorrected.** The API suppresses clock-skew
+  correction for any batch that carries an `event_id`, because the retry identity includes
+  the timestamp (`apps/api/src/routes/v1/ingest.ts`). Every batch from this version
+  carries one, so a device whose clock runs fast can store future-dated rows.
+- **Events queued by an earlier SDK lose app/device fields.** Events already in the
+  offline queue when the app upgrades have no track-time snapshot. They are sent without
+  app version, build, device model, OS and country rather than filled in from the
+  upgraded app. With no `app.version` they get no release attribution.
+- **Requires an API that includes S2 (#995).** Requests no longer carry a batch-level
+  `context` (S3c). An older API ignores `event_id` and per-event `context`, so events sent
+  to it get no dedup and no user, device, session or app at all.
+- **429s are persisted.** Rate-limited events move to the disk-backed offline queue instead
+  of the in-memory queue, so they survive the app being killed during the back-off. The JS
+  SDK still keeps them in memory. The offline queue holds 500 events, so one flush sends at
+  most what that queue has room for; newer events wait in memory. Anything trimmed is
+  reported as `offline_queue.trimmed`.
+- **Events that cannot be encoded as JSON are dropped.** A property holding NaN or ±Infinity
+  can never be sent. Such an event is dropped on its own and reported as
+  `transport.event_unencodable` or `offline_queue.unencodable_dropped`. Before, it failed
+  its whole request, and it silently stopped the offline queue from being saved at all.
+- **`identify()` ignores a user id longer than 256 characters** (UTF-16 units) and emits
+  `identity.identify_rejected`; the device keeps its current identity. The API rejected
+  every event tracked under such an id. A queued event that already carries one is sent
+  without a user id.
+- **`appVersion` and the bundle build are cut to 64 characters** (UTF-16 units) when an
+  event is tracked. The API rejected longer values.
+- **Larger payloads.** Each event carries roughly 0.5–0.7 KB more, so the 32 KB
+  per-event and 1 MB per-request limits are reached sooner.
+
 ## [0.4.0] - 2026-09-11
 
 ### Added

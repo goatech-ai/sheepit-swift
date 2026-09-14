@@ -54,8 +54,8 @@ final class TransportErrorClassingTests: XCTestCase {
 
         await harness.transport.flush()
 
-        XCTAssertEqual(harness.queue.size(), 2, "429 must return the events to the live queue")
-        XCTAssertEqual(harness.offlineQueue.size(), 0)
+        XCTAssertEqual(harness.offlineQueue.size(), 2, "429 must persist the events (S3c), not drop them")
+        XCTAssertEqual(harness.queue.size(), 0)
     }
 
     /// Pins the BOUNDED-loss semantics of the 429 path: during a long
@@ -74,17 +74,18 @@ final class TransportErrorClassingTests: XCTestCase {
             retryAttempts: 1
         )
         let log = Logger(debug: false)
+        let offline = OfflineQueue(storage: InMemoryStorage())
         let transport = Transport(
             http: HTTPClient(config: config, log: log, urlProtocolClasses: [StubURLProtocol.self]),
             queue: queue,
-            offlineQueue: OfflineQueue(storage: InMemoryStorage()),
+            offlineQueue: offline,
             connectivity: ConnectivityMonitor(),
             log: log,
             diagnostics: bus
         )
 
         queue.add(makeStubEvent(name: "a"))
-        await transport.flush()  // 429 → re-queued, back-off armed
+        await transport.flush()  // 429 → persisted, back-off armed
 
         // Host keeps tracking through the back-off window.
         for index in 0..<6 { queue.add(makeStubEvent(name: "during_\(index)")) }
@@ -92,6 +93,12 @@ final class TransportErrorClassingTests: XCTestCase {
         XCTAssertEqual(queue.size(), 3, "the bound holds")
         let evictions = bus.getRecentDiagnostics().filter { $0.code == "queue.overflow_evicted" }
         XCTAssertFalse(evictions.isEmpty, "eviction under back-off must not be silent")
+
+        // A flush inside the back-off sends nothing, but persists what was tracked meanwhile.
+        await transport.flush()
+        XCTAssertEqual(StubURLProtocol.requestCount, 1, "no request inside the back-off")
+        XCTAssertEqual(offline.size(), 4, "the rate-limited event plus the three still queued")
+        XCTAssertEqual(queue.size(), 0)
     }
 
     func testRateLimitBacksOffBeforeTheNextFlush() async {
@@ -105,7 +112,7 @@ final class TransportErrorClassingTests: XCTestCase {
         // Within the Retry-After window the next flush must not hit the network.
         await harness.transport.flush()
         XCTAssertEqual(StubURLProtocol.requestCount, 1, "flush during back-off must be a no-op")
-        XCTAssertEqual(harness.queue.size(), 1, "events stay queued through the back-off")
+        XCTAssertEqual(harness.offlineQueue.size(), 1, "events stay persisted through the back-off")
     }
 
     func testServerErrorGoesToTheOfflineQueue() async {

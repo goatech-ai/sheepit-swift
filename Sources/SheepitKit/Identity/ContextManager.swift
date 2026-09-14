@@ -22,6 +22,12 @@ final class ContextManager: @unchecked Sendable {
     private var _anonymousId: String
     private var _sessionId: String
     private var _userId: String?
+    /// What the server's device row holds (`ServerHeldUser`). `/v1/config` buckets on the row, so
+    /// this — not `_userId` — is what a fetched config is labelled with.
+    private var _serverHeldUser: ServerHeldUser = .unknown
+    /// Bumped by every `setServerHeldUser`. A config fetch compares the epoch at its start with
+    /// the epoch when its response lands; any change in between invalidates its label.
+    private var _serverHeldEpoch: UInt64 = 0
     private var _userTraits: [String: Any] = [:]
     private var sessionLastSeen: Date
 
@@ -158,6 +164,8 @@ final class ContextManager: @unchecked Sendable {
            let identity = try? JSONDecoder().decode(StoredIdentity.self, from: identityData) {
             self._userId = identity.userId
         }
+        self._serverHeldUser = storage.data(forKey: StorageKeys.serverHeldUser)
+            .flatMap { try? JSONDecoder().decode(ServerHeldUser.self, from: $0) } ?? .unknown
 
         guard persistOnInit else { return }
 
@@ -273,6 +281,45 @@ final class ContextManager: @unchecked Sendable {
         persistIdentity()
     }
 
+    /// The server-held label and its epoch, read together. Persisted, so a relaunch keeps knowing
+    /// what the row holds, including that it does not know.
+    var serverHeldUser: (user: ServerHeldUser, epoch: UInt64) {
+        lock.lock()
+        defer { lock.unlock() }
+        return (_serverHeldUser, _serverHeldEpoch)
+    }
+
+    /// Record what the server's device row now holds (see `ServerHeldUser` for who calls this and
+    /// with what). Always bumps the epoch, even for an unchanged value: a fetch that started
+    /// before a label decision must not be trusted after it.
+    func setServerHeldUser(_ user: ServerHeldUser) {
+        lock.lock()
+        defer { lock.unlock() }
+        _serverHeldUser = user
+        _serverHeldEpoch &+= 1
+        if let data = try? JSONEncoder().encode(user) {
+            storage.set(data, forKey: StorageKeys.serverHeldUser)
+        }
+    }
+
+    /// Record that the SDK does not know what the row holds, moving the epoch only if it knew.
+    ///
+    /// For an identify POST's own send and failure. When the label is already `.unknown`, a fetch
+    /// in flight is applied as `.unknown` whatever happens here, so bumping would change only one
+    /// thing: `ConfigSync` drops that fetch's ETag. A retry that fails every time (5xx, 429,
+    /// offline) then made every poll a full 200 and a disk write, because each tick's POST moved
+    /// the epoch while that tick's GET was on the wire.
+    func markServerHeldUserUnknown() {
+        lock.lock()
+        defer { lock.unlock() }
+        guard _serverHeldUser != .unknown else { return }
+        _serverHeldUser = .unknown
+        _serverHeldEpoch &+= 1
+        if let data = try? JSONEncoder().encode(ServerHeldUser.unknown) {
+            storage.set(data, forKey: StorageKeys.serverHeldUser)
+        }
+    }
+
     func updateUserTraits(_ traits: [String: Any]) {
         lock.lock()
         defer { lock.unlock() }
@@ -285,6 +332,8 @@ final class ContextManager: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         _userId = nil
+        // The server-held label is deliberately NOT cleared: logout does not change the device
+        // row, which still holds the previous user until another identify POST succeeds.
         _userTraits = [:]
         _anonymousId = UUID().uuidString
         _sessionId = UUID().uuidString

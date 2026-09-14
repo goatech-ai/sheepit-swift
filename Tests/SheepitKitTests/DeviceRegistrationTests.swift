@@ -442,7 +442,7 @@ final class DeviceRegistrationTests: XCTestCase {
             let body = RegistrationStubURLProtocol.requests(method: "POST", path: SDKEndpoints.ingest)
                 .first?.body,
             let json = try? JSONSerialization.jsonObject(with: body) as? [String: Any],
-            let context = json["context"] as? [String: Any],
+            let context = (json["batch"] as? [[String: Any]])?.first?["context"] as? [String: Any],
             let device = context["device"] as? [String: Any]
         else {
             XCTFail("ingest request must carry a JSON body with context.device")
@@ -850,7 +850,7 @@ final class DeviceRegistrationTests: XCTestCase {
                 guard
                     let body = request.body,
                     let json = try? JSONSerialization.jsonObject(with: body) as? [String: Any],
-                    let context = json["context"] as? [String: Any],
+                    let context = (json["batch"] as? [[String: Any]])?.first?["context"] as? [String: Any],
                     let device = context["device"] as? [String: Any],
                     let id = device["id"] as? String,
                     id == "dev_race" || id == preRegistrationDeviceId

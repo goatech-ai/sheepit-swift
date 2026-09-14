@@ -70,12 +70,17 @@ actor HTTPClient {
         return try JSONDecoder().decode(ApiDataResponse<T>.self, from: data).data
     }
 
+    /// - Parameter sendIf: checked before EVERY attempt, the first and each retry after a 5xx or
+    ///   network error. `false` sends nothing more and throws `RequestPreconditionFailed`. For a
+    ///   request whose premise can end during the retry backoff (an identify POST for a user who
+    ///   has since logged out). Nil for every other caller, whose behaviour is unchanged.
     func postRaw(
         path: String,
         body: some Encodable & Sendable,
-        extraHeaders: [String: String] = [:]
+        extraHeaders: [String: String] = [:],
+        sendIf: (@Sendable () -> Bool)? = nil
     ) async throws -> Data {
-        try await performRequest("POST", path: path, body: body, extraHeaders: extraHeaders)
+        try await performRequest("POST", path: path, body: body, extraHeaders: extraHeaders, sendIf: sendIf)
     }
 
     func get<T: Decodable & Sendable>(
@@ -86,13 +91,19 @@ actor HTTPClient {
         return try JSONDecoder().decode(ApiDataResponse<T>.self, from: data).data
     }
 
+    /// - Parameter cachePolicy: `.reloadIgnoringLocalCacheData` for any response the SDK must never
+    ///   see stale. The session is `URLSessionConfiguration.default`, so it has the shared
+    ///   `URLCache`, and a `Cache-Control: max-age` response is otherwise served from it without a
+    ///   request.
     func getRaw(
         path: String,
-        extraHeaders: [String: String] = [:]
+        extraHeaders: [String: String] = [:],
+        cachePolicy: URLRequest.CachePolicy = .useProtocolCachePolicy
     ) async throws -> (Data, HTTPURLResponse) {
         let url = baseURL.appendingPathComponent(path)
         var request = URLRequest(url: url)
         request.httpMethod = "GET"
+        request.cachePolicy = cachePolicy
         applyHeaders(to: &request, extraHeaders: extraHeaders)
 
         let (data, response) = try await session.data(for: request)
@@ -117,8 +128,15 @@ actor HTTPClient {
         path: String,
         body: (any Encodable & Sendable)?,
         extraHeaders: [String: String],
+        sendIf: (@Sendable () -> Bool)? = nil,
         attempt: Int = 0
     ) async throws -> Data {
+        // A cancelled caller (a destroyed client's identify POST) must not send, or re-send.
+        try Task.checkCancellation()
+        // Outside the `do` below, so it is never mistaken for a network error and retried: a
+        // retry is itself a call to this function from inside a `catch`, and a throw from there
+        // propagates to the caller.
+        if let sendIf, !sendIf() { throw RequestPreconditionFailed() }
         let url = baseURL.appendingPathComponent(path)
         var request = URLRequest(url: url)
         request.httpMethod = method
@@ -168,16 +186,24 @@ actor HTTPClient {
                 let delay = retryBackoff[min(attempt, retryBackoff.count - 1)]
                 log.debug("Request failed (attempt \(attempt + 1)), retrying in \(delay)s")
                 try await Task.sleep(for: .seconds(delay))
-                return try await performRequest(method, path: path, body: body, extraHeaders: extraHeaders, attempt: attempt + 1)
+                try Task.checkCancellation()
+                return try await performRequest(
+                    method, path: path, body: body, extraHeaders: extraHeaders, sendIf: sendIf, attempt: attempt + 1
+                )
             }
             throw error
         } catch {
+            // Cancellation is not a network error: never retried.
+            if error is CancellationError || Task.isCancelled { throw error }
             // Network errors — retry
             if attempt < retryAttempts - 1 {
                 let delay = retryBackoff[min(attempt, retryBackoff.count - 1)]
                 log.debug("Network error (attempt \(attempt + 1)), retrying in \(delay)s")
                 try await Task.sleep(for: .seconds(delay))
-                return try await performRequest(method, path: path, body: body, extraHeaders: extraHeaders, attempt: attempt + 1)
+                try Task.checkCancellation()
+                return try await performRequest(
+                    method, path: path, body: body, extraHeaders: extraHeaders, sendIf: sendIf, attempt: attempt + 1
+                )
             }
             throw SDKError.networkError(error)
         }
@@ -259,3 +285,6 @@ private struct AnyEncodableWrapper: Encodable, @unchecked Sendable {
         try encode(encoder)
     }
 }
+
+/// Thrown by `HTTPClient.postRaw(sendIf:)` when its precondition no longer holds before an attempt.
+struct RequestPreconditionFailed: Error {}

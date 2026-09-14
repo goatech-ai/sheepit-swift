@@ -564,10 +564,11 @@ private final class EventNameRecorder: @unchecked Sendable {
     }
 }
 
-/// A drained batch can legitimately span two sessions, and the wire format has
-/// no per-event session field — `buildPayload` stamps one batch-level
-/// `context.session.id` from `events[0]`. So the flush must split by session or
-/// the tail of the batch is filed under the wrong one, unrecoverably.
+/// A drained batch can legitimately span two sessions. Since S3b each event carries
+/// its own session in its per-event context, but `buildPayload` still sends the
+/// first event's context at batch level for an API that predates per-event context,
+/// and that API files EVERY event under it. So the flush still splits by session,
+/// or on such an API the tail of the batch is filed under the wrong one.
 final class SessionBatchGroupingTests: XCTestCase {
     private func event(_ name: String, session: String) -> EnrichedEvent {
         EnrichedEvent(

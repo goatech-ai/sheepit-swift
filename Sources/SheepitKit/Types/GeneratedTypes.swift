@@ -111,9 +111,35 @@ struct SDKExperimentAssignment: Decodable, Sendable {
     let variantKey: String
     let payload: [String: AnyCodable]
 
+    // Attribution metadata (PILOT_CORRECTNESS_DESIGN.md section 2.3). Snapshotted
+    // onto events emitted while this assignment is active, so a readout attributes
+    // an outcome to the arm that produced it rather than to current state.
+    //
+    // OPTIONAL on purpose, and they must stay that way. ConfigSync caches the RAW
+    // response bytes under StorageKeys.sdkConfig, so the first launch after an app
+    // update decodes a body written by the PREVIOUS contract version. Non-optional
+    // here would throw on that decode and drop the cached config wholesale - flags
+    // would fall back to caller defaults until a network fetch succeeded, which is
+    // exactly the offline case the cache exists for.
+    //
+    // Absent means "delivered before the server vended these": unattributed, which
+    // is not the same as control.
+    let experimentId: String?
+    /// WHICH unit was randomized - "user" or "device" - never the unit itself.
+    /// The value is the customer's own end-user identifier and this endpoint is
+    /// opened by a publishable key, so it is resolved server-side at ingest.
+    let subjectKind: String?
+    let bucketingVersion: Int?
+    /// Canonical decimal string - the config_version that delivered this assignment.
+    let assignmentRevision: String?
+
     enum CodingKeys: String, CodingKey {
         case payload
         case variantKey = "variant_key"
+        case experimentId = "experiment_id"
+        case subjectKind = "subject_kind"
+        case bucketingVersion = "bucketing_version"
+        case assignmentRevision = "assignment_revision"
     }
 }
 
@@ -136,6 +162,21 @@ struct IngestEvent: Encodable, Sendable {
     let event: String
     let properties: [String: AnyCodable]?
     let timestamp: String?
+    // Minted once at track time and persisted with the event, so a resend of an
+    // ambiguous request (timeout, lost response, restored offline queue) carries the
+    // SAME id and the server stores one row (PILOT_CORRECTNESS_DESIGN.md section 2.2).
+    // The server rejects an event_id without a timestamp: the retry identity is
+    // (project, environment, event_id, timestamp).
+    let eventId: String?
+    // The COMPLETE context for this event, built only from its own track-time snapshot.
+    // Server-side it REPLACES the batch context rather than merging into it, so a batch
+    // mixing users, devices or sessions keeps each event's own identity.
+    let context: IngestContext?
+
+    enum CodingKeys: String, CodingKey {
+        case type, event, properties, timestamp, context
+        case eventId = "event_id"
+    }
 }
 
 struct IngestContext: Encodable, Sendable {
@@ -148,14 +189,45 @@ struct IngestContext: Encodable, Sendable {
     let device: IngestDevice?
     let session: IngestSession?
     let flags: [String: AnyCodable]?
+    // Experiment key -> variant key (persisted server-side as active_experiments). The
+    // SDK writes only strings here, and leaves out identity_changed entries: the legacy
+    // readout cannot see a status and would credit the new user to the old user's arm.
     let experiments: [String: AnyCodable]?
+    // Assignment metadata for the same keys (ingest correctness design, section 2.3).
+    // Complete entries only. Where a key is also in `experiments`, the variant keys must
+    // match: the server rejects the event when they disagree.
+    let experimentAssignments: [String: IngestExperimentAssignment]?
     let account: IngestAccount?
     let revenue: IngestRevenue?
     let releaseId: String?
 
     enum CodingKeys: String, CodingKey {
         case app, sdk, user, device, session, flags, experiments, account, revenue
+        case experimentAssignments = "experiment_assignments"
         case releaseId = "release_id"
+    }
+}
+
+struct IngestExperimentAssignment: Encodable, Sendable {
+    let experimentId: String
+    let variantKey: String
+    // "user" or "device". Never the subject VALUE: the server resolves u:/d: from this
+    // event's own context.user.id / context.device.id, and records a missing identity
+    // itself rather than falling back to the other kind.
+    let subjectKind: String
+    // nil, or "identity_changed" - the only value a client may send; any other rejects
+    // the whole event. Omitted from the JSON when nil.
+    let subjectStatus: String?
+    let bucketingVersion: Int
+    let assignmentRevision: String
+
+    enum CodingKeys: String, CodingKey {
+        case experimentId = "experiment_id"
+        case variantKey = "variant_key"
+        case subjectKind = "subject_kind"
+        case subjectStatus = "subject_status"
+        case bucketingVersion = "bucketing_version"
+        case assignmentRevision = "assignment_revision"
     }
 }
 
@@ -245,6 +317,14 @@ struct IngestRejection: Decodable, Sendable {
     let index: Int
     let event: String
     let reason: String
+    // Echoed only when the client sent a valid UUID for this event. Optional: an API that
+    // predates #995 never sends it, so `index` is the authoritative match.
+    let eventId: String?
+
+    enum CodingKeys: String, CodingKey {
+        case index, event, reason
+        case eventId = "event_id"
+    }
 }
 
 struct IngestWarning: Decodable, Sendable {

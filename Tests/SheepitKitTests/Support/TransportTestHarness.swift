@@ -34,7 +34,6 @@ func makeTransportHarness(retryAttempts: Int = 3) -> TransportHarness {
             offlineQueue: offlineQueue,
             connectivity: ConnectivityMonitor(),
             log: log,
-            appVersion: "test",
             diagnostics: diagnostics,
             lastFlushClock: clock
         ),
@@ -58,7 +57,10 @@ func makeStubEvent(name: String) -> EnrichedEvent {
         sdkVersion: SDKDefaults.sdkVersion,
         locale: "en_US",
         timezone: "UTC",
-        timestamp: ISO8601DateFormatter().string(from: Date())
+        timestamp: ISO8601DateFormatter().string(from: Date()),
+        // The same track-time capture `SheepitClient.track()` performs, so a payload test
+        // asserting live `DeviceProfile` values still sees them on the wire.
+        snapshot: TrackSnapshot.capture(appVersion: "test")
     )
 }
 

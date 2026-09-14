@@ -17,15 +17,15 @@ Web and backend get flags and experiments from the Sheepit SDKs, and native apps
 
 ## Install
 
-Sheepit is developed in the Sheepit monorepo (`packages/sdk-swift`) and published to the public mirror repository [`goatech-ai/sheepit-swift`](https://github.com/goatech-ai/sheepit-swift), which is what Swift Package Manager resolves against. Every release tag on the mirror is a bare semver version (`0.3.0`), mirrored from the monorepo by CI.
+Sheepit is developed in the Sheepit monorepo (`packages/sdk-swift`) and published to the public mirror repository [`goatech-ai/sheepit-swift`](https://github.com/goatech-ai/sheepit-swift), which is what Swift Package Manager resolves against. Every release tag on the mirror is a bare semver version (`0.5.0`), mirrored from the monorepo by CI.
 
 ### Xcode
 
-**File → Add Package Dependencies…** → enter `https://github.com/goatech-ai/sheepit-swift.git` → choose **Exact Version** and enter `0.3.0`.
+**File → Add Package Dependencies…** → enter `https://github.com/goatech-ai/sheepit-swift.git` → choose **Exact Version** and enter `0.5.0`.
 
 > 🔴 **Pin exactly while this package is on `0.x`.** SPM's "Up to Next Major"
-> does not special-case `0.x` the way npm and Cargo do — `from: "0.3.0"`
-> resolves `>=0.3.0 <1.0.0`, which would pull in every future `0.x` release,
+> does not special-case `0.x` the way npm and Cargo do — `from: "0.5.0"`
+> resolves `>=0.5.0 <1.0.0`, which would pull in every future `0.x` release,
 > and `0.x` is precisely where breaking changes are allowed. Pin exactly and
 > upgrade deliberately until `2.0.0`, the first stable release. See the
 > CHANGELOG's "Version policy" for why `1.0.x` is abandoned.
@@ -34,7 +34,7 @@ Sheepit is developed in the Sheepit monorepo (`packages/sdk-swift`) and publishe
 
 ```swift
 dependencies: [
-  .package(url: "https://github.com/goatech-ai/sheepit-swift.git", exact: "0.3.0"),
+  .package(url: "https://github.com/goatech-ai/sheepit-swift.git", exact: "0.5.0"),
 ]
 ```
 

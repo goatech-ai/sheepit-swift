@@ -34,6 +34,14 @@ final class ConnectivityMonitor: @unchecked Sendable {
         return _isOnline
     }
 
+    /// Test-only: `@testable import` only. `NWPathMonitor` cannot be driven offline in a unit
+    /// test, and `Transport`'s offline branch needs coverage. Fires no callbacks.
+    func setOnlineForTesting(_ online: Bool) {
+        lock.lock()
+        _isOnline = online
+        lock.unlock()
+    }
+
     init() {
         monitor.pathUpdateHandler = { [weak self] path in
             guard let self else { return }

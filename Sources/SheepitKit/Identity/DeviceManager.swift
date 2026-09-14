@@ -67,18 +67,65 @@ actor DeviceManager {
     }
 
     /// Post identity resolution to the server.
-    func identify(deviceId: String, userId: String, attributes: [String: Any]? = nil) async {
+    ///
+    /// Success is the status alone, not a decoded body: the caller only needs to know the device
+    /// row now names this user, and a response-shape drift must not make a stored identity look
+    /// unconfirmed forever. Re-posting the SAME user is safe: the route's same-user path merges
+    /// attributes only, creating no merge record and consuming no merge rate limit.
+    ///
+    /// - Parameter sendIf: checked before every HTTP attempt, retries included (`HTTPClient.postRaw`).
+    @discardableResult
+    func identify(
+        deviceId: String,
+        userId: String,
+        attributes: [String: Any]? = nil,
+        sendIf: (@Sendable () -> Bool)? = nil
+    ) async -> IdentifyOutcome {
         let attrMap: [String: AnyCodable]? = attributes?.mapValues { AnyCodable($0) }
         let request = DeviceIdentifyRequest(userId: userId, attributes: attrMap)
 
         do {
-            let _: DeviceIdentifyResponse = try await http.post(
+            _ = try await http.postRaw(
                 path: SDKEndpoints.deviceIdentify(deviceId: deviceId),
-                body: request
+                body: request,
+                sendIf: sendIf
             )
-            log.debug("Identity resolved: \(userId)")
+            log.debug("Identity resolved")
+            return .stored
+        } catch is RequestPreconditionFailed {
+            log.debug("Identity resolve abandoned before an attempt: its precondition no longer holds")
+            return .notSent
+        } catch SDKError.badRequest {
+            log.warn("Identity resolve rejected (400)")
+            return .rejected(statusCode: 400)
+        } catch SDKError.httpError(let statusCode) where Self.isRejection(statusCode) {
+            log.warn("Identity resolve rejected (\(statusCode))")
+            return .rejected(statusCode: statusCode)
         } catch {
             log.warn("Identity resolve failed: \(error.localizedDescription)")
+            return .failed
         }
     }
+
+    /// A 4xx the same request cannot turn into a 2xx by being sent again. 408 is a timeout and
+    /// 429 a rate limit (thrown as `SDKError.rateLimited`, never reaching here), so both stay
+    /// retryable.
+    private static func isRejection(_ statusCode: Int) -> Bool {
+        (400..<500).contains(statusCode) && statusCode != 408 && statusCode != 429
+    }
+}
+
+/// Outcome of `DeviceManager.identify()`.
+enum IdentifyOutcome: Sendable, Equatable {
+    /// A 2xx: the server's device row holds the posted user.
+    case stored
+    /// Network error, lost response, 5xx, 408 or 429. The row may or may not hold the user, and
+    /// sending the same request later can succeed.
+    case failed
+    /// Any other 4xx (400 invalid body or attributes, 401/403 key, 404 unknown device). Sending
+    /// the same request again gets the same answer.
+    case rejected(statusCode: Int)
+    /// The caller's `sendIf` stopped an attempt. An EARLIER attempt may have been sent (a 5xx or
+    /// network error before the retry), so the row may or may not hold the user.
+    case notSent
 }

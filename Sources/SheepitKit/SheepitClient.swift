@@ -399,6 +399,48 @@ public final class SheepitClient: @unchecked Sendable {
     /// an actual race to land in the window `initialize()` itself can't be paused inside of.
     /// `@testable`-internal, so it cannot be reached by an app linking the released package.
     /// See `LifecycleSafetyTests`/`ConcurrentInitializeSideEffectTests` (MF3-2).
+    /// Test-only seam: seed the in-memory experiment assignments the way a
+    /// `/v1/config` response would, without needing the network.
+    ///
+    /// 🔴 Exists because the difference between `clearAssignments()` and
+    /// `clearForLogout()` is visible ONLY in `assignments`, which nothing else
+    /// can reach from a test — so a `reset()` wired to the wrong one was
+    /// undetectable, which a mutation run proved. `@testable`-internal, so it
+    /// cannot be reached by an app linking the released package.
+    internal func seedAssignmentsForTesting(
+        _ assignments: [String: SDKExperimentAssignment],
+        appliedUnderUserId: String? = nil
+    ) {
+        experimentManager.setAssignments(assignments, appliedUnderUserId: appliedUnderUserId)
+    }
+
+    /// Test-only seam: one `/v1/config` fetch through the real `ConfigSync` and its real
+    /// `onConfig` wiring, so a test can prove which user id an applied config is recorded under.
+    internal func refreshConfigForTesting() async {
+        await configSync.refresh(deviceId: context.deviceId)
+    }
+
+    /// Test-only seam: exactly what a periodic config refresh tick runs for identity.
+    ///
+    /// - Parameter beforeSend: run inside the retry's task just before it decides whether to send,
+    ///   so a test can land a `reset()` in the window between the tick and the request.
+    internal func configRefreshTickForTesting(beforeSend: (@Sendable () -> Void)? = nil) {
+        retryIdentityIfUnknown(beforeSendForTesting: beforeSend)
+    }
+
+    /// Test-only seam: wait for every identify POST queued so far, including its confirmation
+    /// and the config refetch that follows a success.
+    internal func awaitIdentityPostForTesting() async {
+        await currentIdentifyTask()?.value
+    }
+
+    /// Synchronous so the lock is never held across a suspension point.
+    private func currentIdentifyTask() -> Task<Void, Never>? {
+        identifyLock.lock()
+        defer { identifyLock.unlock() }
+        return identifyTask
+    }
+
     internal func beginWorkForTesting() {
         beginWork()
     }
@@ -428,6 +470,8 @@ public final class SheepitClient: @unchecked Sendable {
     let flagManager: FlagManager
     private let experimentManager: ExperimentManager
     private let configSync: ConfigSync
+    /// Shared with `configSync`: `reset()` and config writes are serialized through it.
+    private let configResetGate: ConfigResetGate
     private let performanceMonitor: PerformanceMonitor?
     private let crashReporter: CrashReporter?
     private let diagnosticBus: DiagnosticBus
@@ -435,6 +479,18 @@ public final class SheepitClient: @unchecked Sendable {
     private let lastFlushClock = LastFlushClock()
 
     private var flushTask: Task<Void, Never>?
+    /// The most recent identify POST (`postIdentity`). Each one waits for its predecessor, so the
+    /// server stores identities in the order `identify()` was called and a slow earlier POST
+    /// cannot land after a later one. Guarded by `identifyLock`: `identify()` runs on any thread.
+    private var identifyTask: Task<Void, Never>?
+    /// Identify POSTs queued or in flight. Guarded by `identifyLock`; `retryIdentityIfUnknown()`
+    /// sends nothing while it is non-zero.
+    private var pendingIdentifyPosts = 0
+    /// The user whose identify POST the API last rejected with a non-retryable 4xx
+    /// (`IdentifyOutcome.rejected`). Guarded by `identifyLock`; `retryIdentityIfUnknown()` does not
+    /// re-send for this user, and a 2xx for any user clears it.
+    private var identifyRejectedUserId: String?
+    private let identifyLock = NSLock()
     private let destroyedFlag = AtomicFlag()
     /// How many times `releaseSelfStartingComponents()` has actually run. Internal, not
     /// private, purely so a test can prove it runs — replacing a prior assertion
@@ -517,7 +573,6 @@ public final class SheepitClient: @unchecked Sendable {
             offlineQueue: offlineQueue,
             connectivity: connectivity,
             log: log,
-            appVersion: config.appVersion,
             diagnostics: bus,
             lastFlushClock: lastFlushClock
         )
@@ -526,21 +581,30 @@ public final class SheepitClient: @unchecked Sendable {
         if inertReason == nil {
             self.flagManager.setOverridesAllowed(config.allowFlagOverrides ?? config.debug)
         }
-        self.experimentManager = ExperimentManager(storage: storage)
+        self.experimentManager = ExperimentManager(storage: storage, diagnostics: bus)
 
         // ConfigSync callback applies config to flag/experiment managers.
         // Capture managers (not self) to avoid a reference cycle.
         let fm = self.flagManager
         let em = self.experimentManager
+        let contextRef = self.context
         let logger = self.log
+        let resetGate = ConfigResetGate()
+        self.configResetGate = resetGate
         self.configSync = ConfigSync(
             http: http,
             storage: storage,
             refreshInterval: config.configRefreshInterval,
             log: log,
-            onConfig: { response in
+            resetGate: resetGate,
+            // What the server's device row holds, not the app's id: see `ConfigSync.identityProvider`.
+            identityProvider: {
+                let held = contextRef.serverHeldUser
+                return (held.user.configIdentity, held.epoch)
+            },
+            onConfig: { response, fetchedUnder in
                 fm.setEvaluatedFlags(response.flags)
-                em.setAssignments(response.experiments)
+                em.setAssignments(response.experiments, appliedUnder: fetchedUnder)
                 logger.debug(
                     "Config applied: \(response.flags.count) flags, "
                     + "\(response.experiments.count) experiments"
@@ -695,9 +759,19 @@ public final class SheepitClient: @unchecked Sendable {
             userId: ctx.userId,
             platform: ctx.platform,
             sdkVersion: ctx.sdkVersion,
-            locale: ctx.locale,
+            // Bounded at capture to `ingestContextSchema.device.locale`'s max(16); see
+            // `Transport.context(for:)` for the calendar-extension case that exceeds it.
+            locale: DeviceProfile.bounded(ctx.locale, 16),
             timezone: ctx.timezone,
-            timestamp: SheepitClient.formatEventTimestamp(Date())
+            timestamp: SheepitClient.formatEventTimestamp(Date()),
+            // Frozen HERE, not read at flush: an event that waits in the offline queue
+            // across an app update or a region change must still describe the app and
+            // device that produced it (PILOT_CORRECTNESS_DESIGN.md §2.2).
+            snapshot: TrackSnapshot.capture(appVersion: config.appVersion),
+            // Also frozen here, against the SAME `ctx.userId` the event carries, so the
+            // identity comparison and the event's own user cannot disagree (§2.3). This covers
+            // `$experiment_exposure`, which is tracked through this method.
+            assignments: experimentManager.snapshot(eventUserId: ctx.userId)
         )
 
         queue.add(event)
@@ -901,6 +975,29 @@ public final class SheepitClient: @unchecked Sendable {
     public func identify(userId: String, traits: [String: Any]? = nil) {
         guard !destroyedFlag.value else { return }
 
+        // Refused, not truncated (founder decision, S3c): ingest and device identify both cap
+        // a user id at 256 UTF-16 units, so every event tracked under a longer one was
+        // rejected. Truncating would silently merge two users sharing a prefix.
+        guard userId.utf16.count <= SDKDefaults.userIdMaxLength else {
+            log.error("identify() ignored: userId is \(userId.utf16.count) UTF-16 units, max \(SDKDefaults.userIdMaxLength)")
+            diagnosticBus.emit(
+                .error,
+                .identity,
+                code: "identity.identify_rejected",
+                message: "identify() ignored — userId exceeds \(SDKDefaults.userIdMaxLength) characters",
+                data: [
+                    "length": AnyCodable(userId.utf16.count),
+                    "max_length": AnyCodable(SDKDefaults.userIdMaxLength),
+                ]
+            )
+            return
+        }
+
+        // Empty traits are no traits: sent as `{}` they made a non-trait 400 look like a trait one.
+        let traits = traits?.isEmpty == false ? traits : nil
+        // Read BEFORE the identity changes: the POST is sent only while no `reset()` has run since
+        // this call (`identifySendGuard`). Read after, a `reset()` in between would go unseen.
+        let resetToken = configResetGate.current
         let previousUserId = context.userId
 
         guard previousUserId != userId else {
@@ -921,7 +1018,9 @@ public final class SheepitClient: @unchecked Sendable {
         context.setUserId(userId)
         if let traits { context.updateUserTraits(traits) }
 
-        // Reset experiments for the new user
+        // Clears the sticky map and exposures only. The server's assignments stay, still labelled
+        // with the row's previous user, so events tracked until the identify POST succeeds and its
+        // refetch lands carry `identity_changed` for user-bucketed experiments.
         experimentManager.clearAssignments()
         flagManager.clearExposed()
 
@@ -933,17 +1032,208 @@ public final class SheepitClient: @unchecked Sendable {
             data: ["has_previous_user": AnyCodable(previousUserId != nil)]
         )
 
-        // Post identity to server (fire-and-forget). Await registration so
-        // /v1/devices/:deviceId/identify targets a device the server knows.
-        Task { [weak self] in
-            guard let self else { return }
-            await self.registrationTask?.value
-            await self.deviceManager.identify(
+        // Synchronously, before the POST is even queued: from here until a POST answers, the SDK
+        // cannot say which user the server's device row holds (`ServerHeldUser`).
+        context.setServerHeldUser(.unknown)
+        postIdentity(userId: userId, attributes: traits, sendIf: identifySendGuard(resetToken: resetToken))
+    }
+
+    /// POST the identity and record what the server's device row holds afterwards.
+    ///
+    /// 🔴 A 2xx records `.known(userId)` REGARDLESS of the app's current identity: the row holds
+    /// the posted user, and labelling it with anything else is how a bounce (A, then B, then A
+    /// with the last POST failing) credited A's events to the arms bucketed for B. A failure
+    /// records `.unknown`: an unanswered POST may have been stored. A fetch in flight across the
+    /// answer is applied as unknown: the label was set unknown when the request was sent, and a
+    /// success moves the epoch. A failure moves it only if something recorded a known user since
+    /// (`ContextManager.markServerHeldUserUnknown()`).
+    ///
+    /// 🔴 After a success the config is refetched with no `If-None-Match`. The ETag carries no
+    /// user and identifying moves no `config_version`, so a conditional refetch would 304 and keep
+    /// the previous user's body. Done here, after the POST, not in `identify()`: a refetch before
+    /// the server holds the new user would only fetch the old bucketing again.
+    ///
+    /// A success that lands after `reset()` still records `.known(userId)` and refetches: the row
+    /// does hold that user, and `/v1/config` resolves the user from the row, not from the request
+    /// (`config-evaluation-context.ts`), so that refetch returns exactly what the next ordinary poll
+    /// after the logout returns. What must not happen is SENDING a POST for a user who has since
+    /// logged out, which is `sendIf`.
+    ///
+    /// - Parameters:
+    ///   - sendIf: checked before the request is first sent (`false` sends nothing and leaves the
+    ///     label alone) and again before every HTTP retry attempt (`false` ends the POST as
+    ///     `.notSent`, label unknown). `identifySendGuard` for `identify()`,
+    ///     `automaticIdentifySendGuard` for the launch re-POST and the retry.
+    ///   - beforeSendForTesting: see `configRefreshTickForTesting(beforeSend:)`.
+    private func postIdentity(
+        userId: String,
+        attributes: [String: Any]?,
+        onlyIfIdle: Bool = false,
+        sendIf: (@Sendable () -> Bool)? = nil,
+        beforeSendForTesting: (@Sendable () -> Void)? = nil
+    ) {
+        identifyLock.lock()
+        defer { identifyLock.unlock() }
+        // Checked and counted under the same lock, so two triggers cannot both see "idle".
+        if onlyIfIdle, pendingIdentifyPosts > 0 { return }
+        pendingIdentifyPosts += 1
+        let previous = identifyTask
+        identifyTask = Task { [weak self] in
+            defer { self?.identifyPostFinished() }
+            // Cancelling this task (`destroy()`) cancels every POST queued before it too, so no
+            // queued or retrying POST from a destroyed client can move the row later.
+            await withTaskCancellationHandler {
+                await previous?.value
+            } onCancel: {
+                previous?.cancel()
+            }
+            guard !Task.isCancelled, let self, !self.destroyedFlag.value else { return }
+            // Await registration so /v1/devices/:deviceId/identify targets a device the server knows.
+            // Through the gate, which is lock-guarded: `registrationTask` itself is written by
+            // `start()` and `destroy()` on other threads, and ticks and reconnects reach this path.
+            await self.registrationGate.awaitSettlement()
+            guard !Task.isCancelled, !self.destroyedFlag.value else { return }
+            beforeSendForTesting?()
+            // 🔴 Re-checked here, after the queue and the registration wait, not only when the
+            // POST was queued: a `reset()` in between would otherwise bind the logged-out user to
+            // the device row again. Checked once more before every HTTP attempt (`sendIf` goes into
+            // `HTTPClient`): a `reset()` during the backoff after a 5xx must stop the retry too.
+            // Only a `reset()` while an attempt is on the wire cannot be undone by the client.
+            if let sendIf, !sendIf() { return }
+            // 🔴 Unknown again as the POST goes out, not only when `identify()` was called: an
+            // earlier queued POST may have answered in between and set a known user, and from the
+            // moment this request is sent the server may commit it before any config fetch is
+            // evaluated. Moving from a known user also moves the epoch, invalidating a fetch
+            // already in flight.
+            self.context.markServerHeldUserUnknown()
+            var outcome = await self.deviceManager.identify(
                 deviceId: self.context.deviceId,
                 userId: userId,
-                attributes: traits
+                attributes: attributes,
+                sendIf: sendIf
             )
+            guard !Task.isCancelled, !self.destroyedFlag.value else { return }
+            // 🔴 A 400 on a POST carrying traits is most likely the traits (the route validates
+            // them before any write, and the SDK does not). Blocking the user for it would leave the
+            // row on the previous user all session, since identifying the same user again is a
+            // no-op. The identity goes again, once, without them. Only an `identify()` POST carries
+            // traits: the launch re-POST and the retry never do, so this runs at most once per call.
+            //
+            // 🔴 Guarded like the POST it replaces, and also on the app still naming this user: it
+            // is a NEW request, and after a `reset()` (or an `identify()` of someone else) during
+            // the rejected one it would bind a user the app no longer names.
+            if case .rejected(400) = outcome, attributes?.isEmpty == false {
+                self.diagnosticBus.emit(
+                    .warn,
+                    .identity,
+                    code: "identity.identify_traits_rejected",
+                    message: "Identify POST with traits rejected (400); re-sent once without traits"
+                )
+                let context = self.context
+                let fallbackSendIf: @Sendable () -> Bool = {
+                    (sendIf?() ?? true) && context.userId == userId
+                }
+                outcome = await self.deviceManager.identify(
+                    deviceId: self.context.deviceId,
+                    userId: userId,
+                    attributes: nil,
+                    sendIf: fallbackSendIf
+                )
+                guard !Task.isCancelled, !self.destroyedFlag.value else { return }
+            }
+            switch outcome {
+            case .stored:
+                // Recorded even if `sendIf` stopped holding while the answer was on the wire: the
+                // row does hold this user, and `/v1/config` resolves the user from the row, so the
+                // refetch returns what the next poll after that `reset()` returns (`ServerHeldUser`).
+                self.recordIdentifyRejection(nil)
+                self.context.setServerHeldUser(.known(userId))
+                await self.configSync.refetchUnconditionally(deviceId: self.context.deviceId)
+            case .failed, .notSent:
+                self.context.markServerHeldUserUnknown()
+            case .rejected(let statusCode):
+                self.context.markServerHeldUserUnknown()
+                self.recordIdentifyRejection(userId)
+                self.diagnosticBus.emit(
+                    .warn,
+                    .identity,
+                    code: "identity.identify_post_rejected",
+                    message: "Identify POST rejected (\(statusCode)); not retried for this user",
+                    data: ["status_code": AnyCodable(statusCode)]
+                )
+            }
         }
+    }
+
+    private func identifyPostFinished() {
+        identifyLock.lock()
+        pendingIdentifyPosts -= 1
+        identifyLock.unlock()
+    }
+
+    /// Synchronous so the lock is never held across a suspension point.
+    private func recordIdentifyRejection(_ userId: String?) {
+        identifyLock.lock()
+        identifyRejectedUserId = userId
+        identifyLock.unlock()
+    }
+
+    private func identifyRejected(for userId: String) -> Bool {
+        identifyLock.lock()
+        defer { identifyLock.unlock() }
+        return identifyRejectedUserId == userId
+    }
+
+    /// `sendIf` for an `identify()` POST: send only while no `reset()` has run since `identify()` was
+    /// called. Not bound to the user: identifying A then B still sends A's POST first, in order.
+    private func identifySendGuard(resetToken: UInt64) -> @Sendable () -> Bool {
+        let gate = configResetGate
+        return { gate.current == resetToken }
+    }
+
+    /// `sendIf` for a POST the SDK re-sends on its own: send only while no `reset()` has run since
+    /// it was queued and the app still names this user. The token is read before the caller reads
+    /// the user id, so a `reset()` racing the queueing either clears that read or moves the token.
+    /// Takes the gate's lock, then the context's, one after the other; never both at once.
+    private func automaticIdentifySendGuard(userId: String, resetToken: UInt64) -> @Sendable () -> Bool {
+        let gate = configResetGate
+        let context = self.context
+        return { gate.current == resetToken && context.userId == userId }
+    }
+
+    /// Re-send the identify POST while a user is stored, the server-held label is `.unknown`, and no
+    /// identify POST is queued or in flight.
+    ///
+    /// Any identify POST that fails (offline, a 5xx, a 429, a lost response), whether sent at launch
+    /// or by `identify()`, otherwise leaves the label unknown for the rest of the session, and every
+    /// user-bucketed entry unattributed. Called at most once per periodic config refresh (not the
+    /// launch fetch) and on each offline→online transition. A retry is one POST with no traits (so
+    /// no traits-less resend follows it), which bounds it to one POST per refresh interval plus one
+    /// per reconnect, and none once a POST succeeds. It goes through the same serialized chain as
+    /// `identify()`: the label is set unknown as the request is sent, and `destroy()` cancels it.
+    ///
+    /// 🔴 Never traits. `ContextManager.userTraits` is one store that only `reset()` clears, so
+    /// the traits held in memory can belong to a PREVIOUS user; sent with this user's id they were
+    /// merged onto the wrong profile. A POST without `attributes` leaves stored traits untouched
+    /// (the route skips the merge).
+    ///
+    /// Not sent while device registration is backed off after a terminal failure (the device is not
+    /// on the server, so the POST can only 404), nor for a user whose POST was rejected with a
+    /// non-retryable 4xx. Nor once `reset()` ran or the app names another user by the time the POST
+    /// would go out (`automaticIdentifySendGuard`).
+    private func retryIdentityIfUnknown(beforeSendForTesting: (@Sendable () -> Void)? = nil) {
+        let resetToken = configResetGate.current
+        guard !destroyedFlag.value, let userId = context.userId,
+              context.serverHeldUser.user == .unknown,
+              !deviceRegistrationBackoffActive(),
+              !identifyRejected(for: userId) else { return }
+        postIdentity(
+            userId: userId,
+            attributes: nil,
+            onlyIfIdle: true,
+            sendIf: automaticIdentifySendGuard(userId: userId, resetToken: resetToken),
+            beforeSendForTesting: beforeSendForTesting
+        )
     }
 
     /// Reset identity. Call on logout.
@@ -952,8 +1242,40 @@ public final class SheepitClient: @unchecked Sendable {
 
         Task { await flush() }
         context.resetIdentity()
-        experimentManager.clearAssignments()
-        flagManager.clearExposed()
+        // 🔴 `resetIdentity()` clears the IDENTITY. It does not clear what was
+        // evaluated FOR that identity, and those are three separate places: the
+        // cached `/v1/config` body in `UserDefaults`, the evaluated flag values
+        // in memory, and the server experiment assignments in memory.
+        //
+        // Leaving any of them means the next user of this device — or this
+        // device after a restore, since `UserDefaults` is included in backups —
+        // sees the previous user's targeting. The cache key carries no user
+        // component, so it persisted and was re-applied on the next launch.
+        //
+        // Queued events are NOT dropped: `flush()` above sends them, and
+        // anything still queued is owed to whoever generated it.
+        //
+        // 🔴 All of it in ONE critical section of `configResetGate`, which also bumps its token.
+        // A config fetch that started before this point writes and applies only inside the same
+        // gate and only if the token has not moved, so it can neither write the logged-out user's
+        // body back to disk nor apply it to memory, and its ETag is never sent afterwards.
+        //
+        // There is deliberately no follow-up clear on the `ConfigSync` actor. A detached
+        // `clearCache()` ran at an arbitrary later time: it could miss a response that landed
+        // first, and it deleted whatever cache was on disk when it finally ran, including one
+        // written after this reset (measured deleting a cache seeded 42 µs later).
+        configResetGate.reset {
+            experimentManager.clearForLogout()
+            flagManager.clearEvaluated()
+            // 🔴 The on-disk copy goes SYNCHRONOUSLY, here. A user who logs out and immediately
+            // force-quits (or is killed by the OS) must not leave `gt_config` on disk for the next
+            // launch to re-apply via `loadFromCache()` — precisely the case this exists to prevent,
+            // and the one where inclusion in device backups matters most. sdk-js clears
+            // synchronously; this keeps the two platforms honest.
+            storage.removeObject(forKey: StorageKeys.sdkConfig)
+            storage.removeObject(forKey: StorageKeys.sdkConfigCachedAt)
+            storage.removeObject(forKey: StorageKeys.sdkConfigFetchedUnder)
+        }
     }
 
     // MARK: - Public API: Performance
@@ -1040,6 +1362,11 @@ public final class SheepitClient: @unchecked Sendable {
     }
 
     /// Shut down the SDK. Flushes pending events and performance metrics.
+    ///
+    /// The final flush is fire-and-forget, and the offline backlog stays on disk until it is
+    /// answered. A client created on the same storage before that flush finishes loads and sends
+    /// the same backlog: stored once (dedup on `event_id`), metered twice. See PENDING_WORK.md,
+    /// "two clients on one storage key".
     public func destroy() {
         // testAndSet so exactly one caller runs teardown even if
         // destroy() is called concurrently from two threads.
@@ -1059,6 +1386,9 @@ public final class SheepitClient: @unchecked Sendable {
         flushTask?.cancel()
         flushTask = nil
         registrationTask?.cancel()
+        // An identify POST that retries after teardown (HTTPClient backs off 1 s then 5 s) could
+        // move the server's row after a newer client has already recorded what it holds.
+        currentIdentifyTask()?.cancel()
         registrationTask = nil
         Task { await configSync.stop() }
         if let monitor = performanceMonitor {
@@ -1256,42 +1586,31 @@ public final class SheepitClient: @unchecked Sendable {
                     existingDeviceId: self.context.didMintDeviceId ? nil : self.context.deviceId
                 ) {
                 case .success(let deviceId):
-                    // 🔴 Re-stamp the queue FIRST, then adopt the id. Order is
-                    // load-bearing and this is the second time it has been argued;
-                    // the deciding fact is the WIRE SHAPE, so read it before touching
-                    // these two lines.
+                    // 🔴 Re-stamp both queues FIRST, then adopt the id.
                     //
-                    // `IngestEvent` carries NO device id (`Types/GeneratedTypes.swift`:
-                    // type/event/properties/timestamp only). The id on the wire is
-                    // `first.deviceId` — the HEAD of each session group
-                    // (`Events/Transport.swift`, `buildPayload`), and groups are cut by
-                    // session alone. So a queued event's own `deviceId` is invisible to
-                    // the server unless that event is the head of its group.
+                    // Since S3b every event sends its OWN `device.id`
+                    // (`Transport.context(for:)`), so any queued event still carrying the
+                    // pre-registration id files under an id the server never issued.
+                    // `flush()` is public and deliberately ungated (it never awaits
+                    // registration settlement), and `destroy()` fires one. Re-stamping
+                    // first means a flush landing between these statements sends only
+                    // re-stamped events; adopting first would not change what is queued.
+                    // `OfflineQueue` is re-stamped too because 429s and 5xx now persist
+                    // there (S3c).
                     //
-                    // That is what makes this order the safe one. `flush()` is public and
-                    // deliberately ungated (it never awaits registration settlement), and
-                    // `destroy()` also fires one. If a flush lands between these two
-                    // statements:
-                    //
-                    //   • re-stamp first (this order): every queued head already carries
-                    //     the NEW id, so the batch files correctly.
-                    //   • adopt first: the heads still carry the OLD id, so the WHOLE
-                    //     batch files under the pre-registration id — and `drain()` has
-                    //     already moved those events to the wire or to `OfflineQueue`,
-                    //     which nothing re-stamps, so it is permanent.
-                    //
-                    // The queue is essentially never empty here ($session_start is
-                    // enqueued synchronously in `start()` and auto-flushes are gated), so
-                    // "adopt first" loses in the COMMON case, not a rare one.
-                    //
-                    // The residual this order still carries: a `track()` landing in the
-                    // gap reads the old id, and if the queue happens to be empty right
-                    // then (a public `flush()` drained it) that event becomes a head and
-                    // files under the old id. It needs an empty queue AND a racing
-                    // `track()`, so it is strictly narrower than the flush window above.
-                    // Closing it fully is structural — see PENDING_WORK.md.
+                    // Residuals, both structural (see PENDING_WORK.md): a `track()` racing
+                    // this block reads the old id and enqueues it after the re-stamp; and a
+                    // request already in flight that then fails persists its LIVE old-id
+                    // events after the re-stamp ran. Persisted events it carried stay on disk
+                    // and are re-stamped.
                     if deviceId != preRegistrationDeviceId {
                         self.queue.restampDeviceId(from: preRegistrationDeviceId, to: deviceId)
+                        self.offlineQueue.restampDeviceId(from: preRegistrationDeviceId, to: deviceId)
+                        // A changed id only comes back when none was sent, and the route then
+                        // mints `dev_<uuid>` on its create path: a new row, holding no user (the
+                        // register request carries no user field). Recorded before the id is
+                        // adopted, so no config is fetched for the new row under the old label.
+                        self.context.setServerHeldUser(.known(nil))
                     }
                     self.context.setDeviceId(deviceId)
                     self.storage.set("1", forKey: StorageKeys.deviceRegistered)
@@ -1322,11 +1641,37 @@ public final class SheepitClient: @unchecked Sendable {
             registrationGate.setTask(registrationTask)
         }
 
+        // 🔴 Every identified launch re-sends its identify POST once, whatever the label says. The
+        // client cannot see the server's commit order: a POST it stopped waiting for (a timeout, a
+        // lost connection, or one already on the wire when `destroy()` ran) can commit after a
+        // later POST succeeded, leaving the row on another user while the label names this one.
+        // Re-sending bounds that to the session it happened in; without it, it lasted until a
+        // different user was identified, across relaunches (identifying the same user is a no-op).
+        // It also covers an install upgraded from an SDK that did not record the row, and a POST
+        // that failed before the app was killed. Cost: one POST per identified launch. The route's
+        // same-user path merges attributes only (no merge record, no merge rate limit).
+        //
+        // 🔴 Unknown BEFORE config sync starts: this POST changes what the row is known to hold,
+        // and the previous process's POST may already be committed.
+        //
+        // 🔴 Guarded like the retry: it waits for registration, and a `reset()` in that window ("session
+        // expired" at launch) must not bind the logged-out user to the row again.
+        let launchResetToken = configResetGate.current
+        if let userId = context.userId {
+            context.setServerHeldUser(.unknown)
+            postIdentity(
+                userId: userId,
+                attributes: nil,
+                sendIf: automaticIdentifySendGuard(userId: userId, resetToken: launchResetToken)
+            )
+        }
+
         // Start config sync
         Task {
-            await configSync.start { [weak self] in
-                self?.context.deviceId ?? ""
-            }
+            await configSync.start(
+                deviceIdGetter: { [weak self] in self?.context.deviceId ?? "" },
+                onRefreshTick: { [weak self] in self?.retryIdentityIfUnknown() }
+            )
         }
 
         // Start periodic flush. `[weak self]` deliberately: this loop otherwise runs for the
@@ -1392,17 +1737,17 @@ public final class SheepitClient: @unchecked Sendable {
         // above already consumed the new-session flag on this launch.
         emitSessionStartIfOwed()
 
-        // Drain offline queue when back online
+        // Flush as soon as connectivity returns rather than waiting for the next tick.
+        // `Transport.flush()` sends the offline queue itself (S3c), so this no longer moves
+        // anything; moving it here too would put one event in both queues.
         connectivity.onOnline { [weak self] in
             guard let self else { return }
-            let queued = self.offlineQueue.drain()
-            if !queued.isEmpty {
-                self.log.debug("Back online — re-queuing \(queued.count) offline events")
-                for event in queued { self.queue.add(event) }
-                Task {
-                    await self.awaitDeviceIdSettlementForAutoFlush()
-                    await self.transport.flush()
-                }
+            // A launch identify POST that failed while offline is re-sent once the network is back.
+            self.retryIdentityIfUnknown()
+            guard self.offlineQueue.size() > 0 else { return }
+            Task {
+                await self.awaitDeviceIdSettlementForAutoFlush()
+                await self.transport.flush()
             }
         }
     }
@@ -1488,7 +1833,7 @@ public final class SheepitClient: @unchecked Sendable {
     /// `StorageKeys.deviceId` exist" by the time this runs.
     ///
     /// The version resolved here MUST match what every other event's wire payload carries.
-    /// `Transport.buildPayload` (audit L-005) prefers the host-provided `config.appVersion`
+    /// `TrackSnapshot.capture(appVersion:)` (audit L-005) prefers the host-provided `config.appVersion`
     /// (a release-binding customer sets this to a commit SHA / build tag, not
     /// `CFBundleShortVersionString`, so events resolve to a `Release` row) and only falls
     /// back to `CFBundleShortVersionString` when the host never set it. Using

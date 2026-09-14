@@ -206,6 +206,25 @@ final class FlagManager: @unchecked Sendable {
         exposed.removeAll()
     }
 
+    /// Forget the evaluated values. Called on `reset()` (logout).
+    ///
+    /// Clearing the cached config is not enough on its own: the values are also
+    /// held here, so `flag()` would keep returning the logged-out user's values
+    /// until the next `/v1/config` landed. Debug overrides are deliberately NOT
+    /// cleared — they are set by the developer, not by the user.
+    func clearEvaluated() {
+        lock.lock()
+        flagValues.removeAll()
+        exposed.removeAll()
+        lock.unlock()
+        // 🔴 Every other mutator notifies; this one did not. A SwiftUI view
+        // awaiting `changes()` would keep rendering the logged-out user's
+        // gated surfaces — the manager empty, the screen stale — until some
+        // unrelated re-render happened to ask again. Notify OUTSIDE the lock,
+        // as the other call sites do.
+        notifyChange()
+    }
+
     // MARK: - Change notification
 
     /// Fires on config apply (`setEvaluatedFlags`), override set

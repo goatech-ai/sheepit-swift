@@ -43,7 +43,8 @@ final class LockedBox<Value>: @unchecked Sendable {
 ///     `If-None-Match` equals the body's ETag (`honorIfNoneMatch`), which is what the real route
 ///     does after `identify()`. `scriptConfig` answers requests in order with per-request delays.
 ///   - `/v1/devices/register`: the minted `registerDeviceId`, or `{}` (unreadable) when unset;
-///     held until `releaseHeldRegister()` while `holdRegister` is set.
+///     held until `releaseHeldRegister()` while `holdRegister` is set; a 500 for the next
+///     `failNextRegisterRequests` requests. Bodies are recorded.
 ///   - `/v1/devices/:id/identify`: the reply set for that user — a status, a lost response, or
 ///     held until `releaseHeldIdentify()` — and 200 otherwise. Keyed by user, so a retry of the
 ///     same request gets the same answer.
@@ -75,6 +76,13 @@ final class AttributionCaptureProtocol: URLProtocol, @unchecked Sendable {
         var heldRegister: [() -> Void] = []
         var registerRequests = 0
         var identifyAttributes: [[String: Any]?] = []
+        var configDeviceIds: [String] = []
+        var identifyDeviceIds: [String] = []
+        var registerBodies: [[String: Any]] = []
+        var failRegisterRequests = 0
+        var failRegisterStatus = 500
+        var failRegisterBody = #"{"error":{"code":"INTERNAL","message":"stub"}}"#
+        var echoRegisteredDeviceId = false
     }
 
     private static let lock = NSLock()
@@ -111,6 +119,41 @@ final class AttributionCaptureProtocol: URLProtocol, @unchecked Sendable {
     /// The `attributes` of each identify request, in order; nil when a request sent none.
     static var identifyAttributes: [[String: Any]?] { with { $0.identifyAttributes } }
     static var registerRequestCount: Int { with { $0.registerRequests } }
+    /// The `X-Device-ID` of each config request, in order.
+    static var configDeviceIds: [String] { with { $0.configDeviceIds } }
+    /// The device id in each identify request's path, in order.
+    static var identifyDeviceIds: [String] { with { $0.identifyDeviceIds } }
+    /// The JSON body of each register request, in order.
+    static var registerBodies: [[String: Any]] { with { $0.registerBodies } }
+    /// The next `count` register requests are answered with `status` (a 500 by default) and `body`.
+    static func failNextRegisterRequests(
+        _ count: Int,
+        status: Int = 500,
+        body: String = #"{"error":{"code":"INTERNAL","message":"stub"}}"#
+    ) {
+        with {
+            $0.failRegisterRequests = count
+            $0.failRegisterStatus = status
+            $0.failRegisterBody = body
+        }
+    }
+    /// While set, a register request that sends a `device_id` gets that id back (the real route
+    /// upserts the row it names); one that sends none gets `registerDeviceId`.
+    static var echoRegisteredDeviceId: Bool {
+        get { with { $0.echoRegisteredDeviceId } }
+        set { with { $0.echoRegisteredDeviceId = newValue } }
+    }
+
+    /// Answers only the `index`-th register request still held (in arrival order).
+    static func releaseHeldRegister(index: Int) {
+        let held = with { state -> (() -> Void)? in
+            guard state.heldRegister.indices.contains(index) else { return nil }
+            let answer = state.heldRegister[index]
+            state.heldRegister[index] = {}
+            return answer
+        }
+        held?()
+    }
     /// While set, `/v1/devices/register` requests are not answered until `releaseHeldRegister()`.
     static var holdRegister: Bool {
         get { with { $0.holdRegister } }
@@ -171,8 +214,10 @@ final class AttributionCaptureProtocol: URLProtocol, @unchecked Sendable {
         let ifNoneMatch = request.value(forHTTPHeaderField: "If-None-Match")
 
         if path.hasSuffix(SDKEndpoints.config) {
+            let deviceHeader = request.value(forHTTPHeaderField: "X-Device-ID") ?? ""
             let (reply, delay, hook) = Self.with { state -> ((Int, String), TimeInterval, (@Sendable () -> Void)?) in
                 state.configRequests += 1
+                state.configDeviceIds.append(deviceHeader)
                 state.configIfNoneMatch.append(ifNoneMatch)
                 if state.failConfigRequests > 0 {
                     state.failConfigRequests -= 1
@@ -196,13 +241,32 @@ final class AttributionCaptureProtocol: URLProtocol, @unchecked Sendable {
                 respond(reply.0, reply.1)
             }
         } else if path.hasSuffix("/v1/devices/register") {
+            let registerBody = (try? JSONSerialization.jsonObject(with: body) as? [String: Any]) ?? [:]
+            let echoed = Self.echoRegisteredDeviceId ? registerBody["device_id"] as? String : nil
             let answer = {
-                if let minted = Self.registerDeviceId {
+                if let minted = echoed ?? Self.registerDeviceId {
                     self.respond(201, #"{"data":{"device_id":"\#(minted)","anonymous_id":"anon","flag_assignments":{},"#
                         + #""experiment_assignments":{},"config":{"flush_interval_ms":5000,"flush_size":20}}}"#)
                 } else {
                     self.respond(200, "{}")
                 }
+            }
+            let failure = Self.with { state -> (Int, String)? in
+                state.registerBodies.append(registerBody)
+                guard state.failRegisterRequests > 0 else { return nil }
+                state.failRegisterRequests -= 1
+                state.registerRequests += 1
+                return (state.failRegisterStatus, state.failRegisterBody)
+            }
+            if let failure {
+                // Held like a success while `holdRegister` is set, so a test can order a failure.
+                let heldFailure = Self.with { state -> Bool in
+                    guard state.holdRegister else { return false }
+                    state.heldRegister.append { self.respond(failure.0, failure.1) }
+                    return true
+                }
+                if !heldFailure { respond(failure.0, failure.1) }
+                return
             }
             let held = Self.with { state -> Bool in
                 state.registerRequests += 1
@@ -215,8 +279,11 @@ final class AttributionCaptureProtocol: URLProtocol, @unchecked Sendable {
             let json = try? JSONSerialization.jsonObject(with: body) as? [String: Any]
             let userId = json?["user_id"] as? String ?? ""
             let attributes = json?["attributes"] as? [String: Any]
+            let components = path.split(separator: "/")
+            let deviceInPath = components.count >= 2 ? String(components[components.count - 2]) : ""
             let reply = Self.with { state -> IdentifyReply in
                 state.identifyUserIds.append(userId)
+                state.identifyDeviceIds.append(deviceInPath)
                 state.identifyAttributes.append(attributes)
                 return state.identifyReplies[userId] ?? .status(200)
             }

@@ -334,7 +334,7 @@ enum SDKDefaults {
     /// `publish-sdk-swift.yml` refuses to release on a mismatch. The package
     /// is deliberately on `0.x` while the API settles, and `2.0.0` is reserved
     /// for the first stable release — see the CHANGELOG's "Version policy".
-    static let sdkVersion = "0.5.0"
+    static let sdkVersion = "0.6.0"
     /// Stamped on every ingest batch (`context.sdk.name`) so the dashboard can filter /
     /// triage by which SDK sent a given event. Follows the monorepo directory-name
     /// convention (`sdk-js`, `sdk-server`, `sdk-swift`) and is pinned by
@@ -412,8 +412,9 @@ enum StorageKeys {
     /// The `ServerHeldUser` label the cached `sdkConfig` body was fetched under, as JSON. Absent
     /// or unreadable means unknown: the body's assignments are then applied as `.unknown`.
     static let sdkConfigFetchedUnder = "gt_config_fetched_under"
-    /// The `ServerHeldUser` state, as JSON with an explicit `state`. NOT cleared by `reset()`:
-    /// logout does not change the server's device row.
+    /// The `ServerHeldUser` state, as JSON with an explicit `state`. Not cleared by `reset()`:
+    /// logout does not change the server's device row. It is what `reset()` reads to decide
+    /// whether to switch to a fresh device (`DeviceRotation`).
     static let serverHeldUser = "gt_server_held_user"
     static let offlineQueue = "gt_offline_queue"
     static let sessionId = "gt_session_id"
@@ -422,12 +423,19 @@ enum StorageKeys {
     /// Set only after a SUCCESSFUL `POST /v1/devices/register` round trip — not merely
     /// once a device id has been minted locally. See `SheepitClient.start()`'s guard.
     static let deviceRegistered = "gt_device_registered"
-    /// Epoch-seconds string. Set only after a TERMINAL registration failure (401/403/422 —
+    /// The device id an identify POST was last SENT for (written before the request, so an
+    /// unanswered POST counts). While set, `reset()` treats the device as possibly bound and
+    /// rotates it (`DeviceRotation`); a rotation clears it.
+    static let deviceBindAttempted = "gt_device_bind_attempted"
+    /// Epoch-seconds string. Set only after a TERMINAL registration failure (400/401/403/422 —
     /// see `RegistrationOutcome`), never after success or a transient failure. Deliberately
     /// NOT the same key as `deviceRegistered`: a revoked key that gets fixed in a later
     /// build must still be retried eventually, just not on every single cold start while
     /// it's broken. See `SheepitClient.start()`'s guard.
     static let deviceRegistrationBackoffUntil = "gt_device_registration_backoff_until"
+    /// `SDKDefaults.sdkVersion` of the build that wrote `deviceRegistrationBackoffUntil`. A
+    /// backoff from any other build is ignored — see `RegistrationBackoff`.
+    static let deviceRegistrationBackoffSDKVersion = "gt_device_registration_backoff_sdk"
     /// The app version (`CFBundleShortVersionString`) recorded the last time
     /// `SheepitClient.emitAppInstallOrUpdateIfOwed()` ran. Absent on every install that
     /// predates 0.4.0 — its absence is what triggers the backfill-without-emitting path on

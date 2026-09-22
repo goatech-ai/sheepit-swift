@@ -10,7 +10,10 @@ import Foundation
 /// - A successful identify POST makes it `.known(postedUserId)`, whatever the app has identified
 ///   since. That is what the row holds.
 /// - A failed or unanswered POST leaves it `.unknown`: the server may or may not have stored it.
-/// - `reset()` leaves it alone: logout does not change the row.
+/// - `reset()` on a device that may hold a user switches to a fresh device (`DeviceRotation`) and
+///   makes it `.known(nil)`. On a device known to hold nobody, `reset()` leaves it alone.
+/// - An identify POST answered after its device was rotated away is ignored: it describes the
+///   abandoned row.
 /// - Adopting a newly minted device id makes it `.known(nil)`: a new row holds no user.
 ///
 /// Persisted with an explicit `state`, so `.unknown` survives a relaunch rather than reading back

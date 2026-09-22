@@ -12,9 +12,10 @@ import Foundation
 /// join that same list, rather than being unreachable from exactly the call site — app
 /// backgrounding on the very first launch — where the race it closes is real.
 ///
-/// `SheepitClient.start()` (which DOES have a fully-initialized `self`) is the only writer,
-/// via `setTask(_:)`, once per process — called at most once, since `start()` creates
-/// `registrationTask` at most once per client. Every reader just calls `awaitSettlement()`.
+/// Two writers, via `setTask(_:)`: `SheepitClient.start()` (first-launch registration, at most
+/// once per client) and `DeviceRotation.rotate()` (the fresh device a logout registers). Every
+/// reader just calls `awaitSettlement()`, so an `identify()` issued during a rotation binds the
+/// new device, not the one the logout left.
 final class RegistrationGate: @unchecked Sendable {
     private let lock = NSLock()
     private var task: Task<Void, Never>?

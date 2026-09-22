@@ -332,8 +332,9 @@ final class ContextManager: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         _userId = nil
-        // The server-held label is deliberately NOT cleared: logout does not change the device
-        // row, which still holds the previous user until another identify POST succeeds.
+        // The server-held label is not touched here: logout does not change the device row. When
+        // that row may hold a user, `SheepitClient.reset()` switches to a fresh device
+        // (`DeviceRotation`), which sets the label for the new row.
         _userTraits = [:]
         _anonymousId = UUID().uuidString
         _sessionId = UUID().uuidString
@@ -358,7 +359,9 @@ final class ContextManager: @unchecked Sendable {
             sessionId: _sessionId,
             userId: _userId,
             platform: "ios",
-            locale: Locale.current.identifier,
+            // The same BCP-47 tag registration sends; see `DeviceProfile.wireLocaleTag`.
+            locale: DeviceProfile.wireLocaleTag(.current)
+                ?? DeviceProfile.bounded(Locale.current.identifier, DeviceProfile.localeMaxLength),
             timezone: DeviceProfile.timezone(),
             sdkVersion: SDKDefaults.sdkVersion
         )

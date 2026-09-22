@@ -445,6 +445,13 @@ public final class SheepitClient: @unchecked Sendable {
         beginWork()
     }
 
+    /// Test-only seam: the wait before each retry of a failed logout rotation, so a test does not
+    /// sit out the real 1 s…60 s backoff (`DeviceRotation`).
+    internal var deviceRotationRetryDelayForTesting: (@Sendable (Int) -> Duration)? {
+        get { deviceRotation.retryDelayOverride }
+        set { deviceRotation.retryDelayOverride = newValue }
+    }
+
     // MARK: - Internal Components
 
     /// Non-nil when `create(config:)` refused this client's API key OR apiUrl. Such a client
@@ -518,6 +525,12 @@ public final class SheepitClient: @unchecked Sendable {
     /// around). `start()` writes to both; every other reader can use whichever it already
     /// has access to.
     private let registrationGate = RegistrationGate()
+    /// Logout rotation (`reset()` on a device a user may be bound to). See the type's doc.
+    private let deviceRotation: DeviceRotation
+    /// Refreshes the crash context after any device-id change. Built in `init`; see there.
+    private let deviceIdDidChange: @Sendable () -> Void
+    /// Test-only: called with the device id every time `deviceIdDidChange` runs.
+    let deviceIdChangeHookForTesting = LockedHook<String>()
     /// The SDK's clock — same injected value `ContextManager` gets, kept here too so
     /// `deviceRegistrationBackoffActive()` can compare against it without threading a
     /// second clock through. Tests age a terminal-registration-failure backoff window with
@@ -639,6 +652,33 @@ public final class SheepitClient: @unchecked Sendable {
             self.crashReporter = nil
         }
 
+        // One closure for every path that changes the device id (the launch registration's
+        // adoption in `start()`, and both halves of a logout rotation), so crash reports
+        // always carry the current id. Launch adoption used to skip it: a crash between the
+        // first registration and the next context refresh shipped the pre-registration id.
+        let crashReporterRef = self.crashReporter
+        let deviceIdChangeHook = self.deviceIdChangeHookForTesting
+        let deviceIdDidChange: @Sendable () -> Void = {
+            crashReporterRef?.updateContext()
+            deviceIdChangeHook.value?(contextRef.deviceId)
+        }
+        self.deviceIdDidChange = deviceIdDidChange
+
+        let destroyedFlagRef = self.destroyedFlag
+        self.deviceRotation = DeviceRotation(.init(
+            context: context,
+            deviceManager: deviceManager,
+            queue: queue,
+            offlineQueue: offlineQueue,
+            storage: storage,
+            diagnostics: bus,
+            configSync: configSync,
+            registrationGate: registrationGate,
+            now: now,
+            isDestroyed: { destroyedFlagRef.value },
+            onDeviceIdChanged: deviceIdDidChange
+        ))
+
         // Flush on app background so queued events survive suspension.
         // `transport`/`registrationGate` are captured directly (not self) to avoid
         // retaining the client for its whole process lifetime through this long-lived
@@ -658,14 +698,14 @@ public final class SheepitClient: @unchecked Sendable {
 
         // Wire error tracking callbacks
         if let monitor = performanceMonitor {
-            Task {
+            Task { [self] in
                 await monitor.setOnError { [weak self] error, endpoint in
                     self?.trackSDKError(source: "performance", error: error, endpoint: endpoint)
                 }
             }
         }
         if let reporter = crashReporter {
-            Task {
+            Task { [self] in
                 await reporter.setOnError { [weak self] error, endpoint in
                     self?.trackSDKError(source: "crashes", error: error, endpoint: endpoint)
                 }
@@ -1106,8 +1146,14 @@ public final class SheepitClient: @unchecked Sendable {
             // evaluated. Moving from a known user also moves the epoch, invalidating a fetch
             // already in flight.
             self.context.markServerHeldUserUnknown()
+            // What the answer is about. After a logout rotation the context names another device,
+            // and this answer says nothing about that one (`DeviceRotation`).
+            let postedDeviceId = self.context.deviceId
+            // 🔴 Before the request: an unanswered POST may still be committed, and a logout must
+            // then rotate this device (`DeviceRotation.deviceMayBeBound()`).
+            self.deviceRotation.markBindAttempted(deviceId: postedDeviceId)
             var outcome = await self.deviceManager.identify(
-                deviceId: self.context.deviceId,
+                deviceId: postedDeviceId,
                 userId: userId,
                 attributes: attributes,
                 sendIf: sendIf
@@ -1134,12 +1180,24 @@ public final class SheepitClient: @unchecked Sendable {
                     (sendIf?() ?? true) && context.userId == userId
                 }
                 outcome = await self.deviceManager.identify(
-                    deviceId: self.context.deviceId,
+                    deviceId: postedDeviceId,
                     userId: userId,
                     attributes: nil,
                     sendIf: fallbackSendIf
                 )
                 guard !Task.isCancelled, !self.destroyedFlag.value else { return }
+            }
+            // 🔴 A POST for a device the client has since rotated away from: whatever it did, it did
+            // to the abandoned row. Recording it would label the NEW row with that user, and its
+            // refetch would name the old device again.
+            guard self.context.deviceId == postedDeviceId else {
+                self.diagnosticBus.emit(
+                    .debug,
+                    .identity,
+                    code: "identity.identify_answer_for_rotated_device",
+                    message: "Identify POST answered for a device replaced by reset() — ignored"
+                )
+                return
             }
             switch outcome {
             case .stored:
@@ -1241,7 +1299,23 @@ public final class SheepitClient: @unchecked Sendable {
         guard !destroyedFlag.value else { return }
 
         Task { await flush() }
+        // Read before anything is cleared: whether a user is, or may be, on the server's row.
+        let rotateDevice = deviceRotation.deviceMayBeBound()
         context.resetIdentity()
+        // 🔴 Clearing locally is not enough: `/v1/config` evaluates the SERVER's device row, which
+        // stays bound to the logged-out user (there is no unbind), so the next fetch re-delivered
+        // their values. A device a user may be bound to is swapped for a fresh one (`DeviceRotation`).
+        // Before the gate below moves, so a fetch that starts after it cannot name the old device.
+        if rotateDevice {
+            deviceRotation.rotate()
+        } else {
+            diagnosticBus.emit(
+                .debug,
+                .identity,
+                code: "identity.device_kept_on_reset",
+                message: "reset() on a device no user is bound to — device kept"
+            )
+        }
         // 🔴 `resetIdentity()` clears the IDENTITY. It does not clear what was
         // evaluated FOR that identity, and those are three separate places: the
         // cached `/v1/config` body in `UserDefaults`, the evaluated flag values
@@ -1386,6 +1460,7 @@ public final class SheepitClient: @unchecked Sendable {
         flushTask?.cancel()
         flushTask = nil
         registrationTask?.cancel()
+        deviceRotation.cancel()
         // An identify POST that retries after teardown (HTTPClient backs off 1 s then 5 s) could
         // move the server's row after a newer client has already recorded what it holds.
         currentIdentifyTask()?.cancel()
@@ -1586,6 +1661,18 @@ public final class SheepitClient: @unchecked Sendable {
                     existingDeviceId: self.context.didMintDeviceId ? nil : self.context.deviceId
                 ) {
                 case .success(let deviceId):
+                    // 🔴 A logout rotation ran while this was in flight (`DeviceRotation`): the
+                    // device this request registered is the one the logout abandoned. Adopting it
+                    // would put the logged-out user's row back in use.
+                    guard self.context.deviceId == preRegistrationDeviceId else {
+                        self.diagnosticBus.emit(
+                            .debug,
+                            .identity,
+                            code: "identity.device_registration_superseded",
+                            message: "Launch registration answered after reset() switched devices — discarded"
+                        )
+                        return
+                    }
                     // 🔴 Re-stamp both queues FIRST, then adopt the id.
                     //
                     // Since S3b every event sends its OWN `device.id`
@@ -1614,23 +1701,32 @@ public final class SheepitClient: @unchecked Sendable {
                     }
                     self.context.setDeviceId(deviceId)
                     self.storage.set("1", forKey: StorageKeys.deviceRegistered)
+                    RegistrationBackoff.clear(storage: self.storage)
+                    self.deviceIdDidChange()
                 case .transientFailure:
                     break // Flag stays unset — the next launch's start() retries, unchanged.
-                case .terminalFailure(let statusCode):
-                    self.storage.set(
-                        String(self.now().timeIntervalSince1970 + SDKDefaults.deviceRegistrationTerminalBackoff),
-                        forKey: StorageKeys.deviceRegistrationBackoffUntil
-                    )
+                case .terminalFailure(let rejection):
+                    // Same guard as the success branch: a rejection answered after `reset()` moved
+                    // to another device says nothing about that device, and must not back it off.
+                    guard self.context.deviceId == preRegistrationDeviceId else {
+                        self.diagnosticBus.emit(
+                            .debug,
+                            .identity,
+                            code: "identity.device_registration_superseded",
+                            message: "Launch registration rejected after reset() switched devices — discarded"
+                        )
+                        return
+                    }
+                    RegistrationBackoff.record(storage: self.storage, now: self.now())
+                    var data = rejection.diagnosticData
+                    data["outcome"] = AnyCodable(Self.terminalFailureOutcome(for: rejection.statusCode))
                     self.diagnosticBus.emit(
                         .error,
                         .identity,
                         code: "identity.device_registration_terminal_failure",
-                        message: "Device registration permanently rejected (\(statusCode)) — " +
+                        message: "Device registration permanently rejected (\(rejection.statusCode)) — " +
                             "backing off rather than retrying every launch",
-                        data: [
-                            "status_code": AnyCodable(statusCode),
-                            "outcome": AnyCodable(Self.terminalFailureOutcome(for: statusCode)),
-                        ]
+                        data: data
                     )
                 }
             }
@@ -1667,7 +1763,7 @@ public final class SheepitClient: @unchecked Sendable {
         }
 
         // Start config sync
-        Task {
+        Task { [self] in
             await configSync.start(
                 deviceIdGetter: { [weak self] in self?.context.deviceId ?? "" },
                 onRefreshTick: { [weak self] in self?.retryIdentityIfUnknown() }
@@ -1752,7 +1848,7 @@ public final class SheepitClient: @unchecked Sendable {
         }
     }
 
-    /// True while a TERMINAL registration failure (401/403/422 — see `RegistrationOutcome`)
+    /// True while a TERMINAL registration failure (400/401/403/422 — see `RegistrationOutcome`)
     /// is still inside its `SDKDefaults.deviceRegistrationTerminalBackoff` window. Checked
     /// alongside — never in place of — `StorageKeys.deviceRegistered` in `start()`'s guard:
     /// that flag means "succeeded," this one means "gave up for now." Conflating them would
@@ -1761,11 +1857,7 @@ public final class SheepitClient: @unchecked Sendable {
     /// (treating backoff as success). A device with neither flag set — the ordinary case —
     /// always attempts registration, matching the code before this method existed.
     private func deviceRegistrationBackoffActive() -> Bool {
-        guard
-            let raw = storage.string(forKey: StorageKeys.deviceRegistrationBackoffUntil),
-            let until = TimeInterval(raw)
-        else { return false }
-        return now().timeIntervalSince1970 < until
+        RegistrationBackoff.isActive(storage: storage, now: now())
     }
 
     /// One `outcome` value per terminal HTTP status, matching this repo's bug-fix
@@ -1773,6 +1865,7 @@ public final class SheepitClient: @unchecked Sendable {
     /// enum-shaped value per failure mode rather than a single generic string.
     private static func terminalFailureOutcome(for statusCode: Int) -> String {
         switch statusCode {
+        case 400: return "invalid_request"
         case 401: return "revoked_key"
         case 403: return "forbidden"
         case 422: return "device_cap_reached"

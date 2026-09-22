@@ -27,7 +27,83 @@ package uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 > resolves `>=1.0.0 <2.0.0`, so **a consumer pinned to `1.0.x` will never
 > receive a `0.x` release.** They are frozen until they re-pin to `0.x`.
 
-## [Unreleased]
+## [0.6.0] - 2026-09-22
+
+### Upgrading from 0.5.0
+
+- **Logout now switches to a fresh device.** `reset()` after `identify()` replaces the device id
+  and registers a new anonymous device; until it is registered, config evaluates anonymously
+  (#1105). See "Logging out" under Fixed.
+- **`locale` now arrives as `en-US`, not `en_US`**, matching the web SDK — a locale breakdown
+  splits at this release (#1112).
+- **Pin `exact:` the new version.** The mirror's `1.0.x` tags are older code; see "Version policy"
+  above.
+
+### Added
+
+- **`SDKEndpoints.ingestCapabilities`** (`"/v1/ingest/capabilities"`), a new public endpoint
+  constant alongside the existing `SDKEndpoints` paths (#1031).
+
+### Changed
+
+- **Builds cleanly with Swift 6.4.** Three `Task { }` closures in `SheepitClient` now capture
+  `self` explicitly (`Task { [self] in … }`), which the Swift 6.4 compiler requires; the CI lane
+  that gates releases pins its Xcode version (#1062). No behaviour change.
+
+### Fixed
+
+- **Device registration no longer fails for users with a non-default calendar, numbering system,
+  collation or a Latin-America region.** Registration sent `Locale.current.identifier` as `locale`
+  and `Locale.region` as `country`; the API caps `locale` at 16 characters and requires a 2-letter
+  `country`, so it answered 400 for identifiers such as `en_US@calendar=japanese` (23),
+  `ja_JP@calendar=japanese` (23), `es_419@numbers=latn` (19), `de_DE@collation=phonebook` (25),
+  `zh_CN@calendar=chinese` (22) and `ar_SA@calendar=gregorian;numbers=latn` (37), and for every
+  `es_419` / `en_001` device (region `419` / `001`). A device that never registers gets no
+  server-side flags or experiment assignments and identify has nothing to bind. `locale` is now
+  the BCP-47 tag without extensions (`en-US`, `es-419`, `zh-Hant-TW`), cut on a subtag boundary
+  to 16 characters; `country` is sent only when it is a 2-letter code; `app_version` and
+  `build_number` are bounded to 64. Event and performance-batch contexts use the same values.
+  **Behaviour change:** iOS locales now arrive as `en-US` rather than `en_US`, matching the web
+  SDK, so a locale breakdown splits at this release.
+- **A 400 from device registration is terminal.** `HTTPClient` throws `.badRequest` for a 400, not
+  `.httpError(400)`, so registration treated it as transient: re-sent on every launch, and every
+  60 s for the life of the process during a logout rotation. It now backs off like a 401/403/422
+  (24 h at launch; not retried during a rotation). The `identity.device_registration_terminal_failure`
+  and `identity.device_rotation_failed` diagnostics carry `outcome` (`invalid_request` at launch),
+  `status_code`, the API's `reason` code and `rejected_fields` (field names only, never values).
+  Only the API's own `VALIDATION_ERROR` is terminal: a 400 without its error envelope (a proxy or
+  load-balancer page) is retried next launch. The backoff belongs to the SDK build that wrote it
+  (a new SDK version retries at once), is ignored if it ends more than 24 h out (clock skew), is
+  cleared by any successful registration, and is not written by a launch rejection answered after
+  `reset()` already moved to another device.
+- **Crash reports carry the device id adopted at launch.** The crash context was refreshed when a
+  logout rotation changed the device id but not when the first launch registration adopted the
+  server-assigned one, so a crash before the next refresh shipped the pre-registration id.
+
+- **Logging out (`reset()`) after `identify()` now switches to a fresh device, so a shared device
+  no longer receives the previous user's flag values or experiment variants from the server.**
+  `/v1/config` evaluates the server's device record, which only an identify request writes and
+  nothing unbinds, so keeping the device id kept the previous user.
+  - **When it rotates.** The SDK persists that an identify request was sent for the device,
+    before the request goes out, so an unanswered request counts. An install upgraded from an
+    earlier version also rotates if its persisted server-held label names a user. `reset()` then
+    replaces the device id at once, registers a new anonymous device under the rotated anonymous
+    id, re-stamps events queued since the logout, refreshes the crash-report context, and fetches
+    config for the new device as soon as it is registered. A `reset()` on a device no identify was
+    sent for keeps it, so anonymous logouts create no extra device records.
+  - **Races.** An `identify()` made during the rotation waits for the new device and binds to it.
+    A registration or identify answer that arrives for the replaced device is ignored.
+  - **Failures.** A failed registration is retried with backoff (1 s doubling to 60 s) and never
+    falls back to the old device. A 401, 403 or 422 is not retried.
+  - **Remaining limit.** Until the new device is registered, the SDK uses a locally minted id that
+    has no server record: config fetched under it evaluates anonymously. An event flushed through
+    the public `flush()` in that window is sent under that id.
+
+  The server-held label for the new device is "no user", so events tracked after such a logout
+  are no longer marked `identity_changed`. New diagnostics: `identity.device_rotation_started`,
+  `identity.device_rotated_on_reset`, `identity.device_rotation_failed`,
+  `identity.device_kept_on_reset`, `identity.device_registration_superseded`,
+  `identity.identify_answer_for_rotated_device`.
 
 ## [0.5.0] - 2026-09-14
 

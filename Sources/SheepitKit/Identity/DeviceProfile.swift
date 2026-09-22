@@ -102,6 +102,39 @@ enum DeviceProfile {
         Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String
     }
 
+    /// `max(16)` on both `deviceRegisterSchema.locale` and `ingestContextSchema.device.locale`.
+    static let localeMaxLength = 16
+
+    /// The locale as a BCP-47 language tag with no extensions, at most `localeMaxLength` long:
+    /// `"en-US"`, `"es-419"`, `"zh-Hant-TW"`. Nil only when no subtag fits.
+    ///
+    /// 🔴 Not `Locale.identifier`. That is ICU's format and carries `@key=value` keywords once the
+    /// user picks a non-default calendar, numbering system or collation in Settings:
+    /// `"en_US@calendar=japanese"` is 23 characters, `"es_419@numbers=latn"` 19,
+    /// `"ar_SA@calendar=gregorian;numbers=latn"` 37. Registration sent it verbatim and the API
+    /// answered 400, so the device never registered. The keywords describe formatting
+    /// preferences, not the language, so they are dropped rather than truncated into garbage.
+    /// `identifier(.bcp47)` is available from the SDK's floor (iOS 16 / macOS 13 / tvOS 16 /
+    /// watchOS 9) and puts them behind a `-u-` singleton, which `clampLanguageTag` cuts at.
+    static func wireLocaleTag(_ locale: Locale) -> String? {
+        clampLanguageTag(locale.identifier(.bcp47), localeMaxLength)
+    }
+
+    /// Keeps whole subtags of a BCP-47 tag up to the first singleton (`-u-`, `-t-`, `-x-` and
+    /// the like start extensions and private use) or until the next subtag would pass
+    /// `maxUTF16` UTF-16 units, so a clamped tag is always a valid, shorter tag rather than a
+    /// cut-off one. Nil when nothing fits.
+    static func clampLanguageTag(_ tag: String, _ maxUTF16: Int) -> String? {
+        var out = ""
+        for subtag in tag.split(separator: "-") {
+            if subtag.utf16.count == 1 { break }
+            let candidate = out.isEmpty ? String(subtag) : out + "-" + subtag
+            if candidate.utf16.count > maxUTF16 { break }
+            out = candidate
+        }
+        return out.isEmpty ? nil : out
+    }
+
     static func buildNumber() -> String? {
         Bundle.main.infoDictionary?["CFBundleVersion"] as? String
     }

@@ -13,6 +13,7 @@ public enum SDKEndpoints {
     }
     public static let config = "/v1/config"
     public static let ingest = "/v1/ingest"
+    public static let ingestCapabilities = "/v1/ingest/capabilities"
     public static let crashReport = "/v1/crashes/report"
     public static let perfIngest = "/v1/performance/ingest"
 }

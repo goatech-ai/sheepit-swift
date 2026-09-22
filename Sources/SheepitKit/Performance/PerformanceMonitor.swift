@@ -164,14 +164,16 @@ actor PerformanceMonitor {
             batch: metrics,
             context: PerfBatchContext(
                 platform: "ios",
-                appVersion: DeviceProfile.appVersion(),
-                buildNumber: DeviceProfile.buildNumber(),
+                // `perfBatchContextSchema` caps both at 64; they are host-supplied Info.plist strings.
+                appVersion: DeviceProfile.appVersion().map { DeviceProfile.bounded($0, SDKDefaults.appVersionMaxLength) },
+                buildNumber: DeviceProfile.buildNumber().map { DeviceProfile.bounded($0, SDKDefaults.appVersionMaxLength) },
                 osVersion: DeviceProfile.osVersion(),
                 deviceModel: DeviceProfile.deviceModel(),
                 userId: ctx.userId,
                 sessionId: ctx.sessionId,
                 deviceId: ctx.deviceId,
-                country: Locale.current.region?.identifier,
+                // `perfBatchContextSchema.country` is `length(2)`: see `TrackSnapshot.countryCode`.
+                country: TrackSnapshot.countryCode(Locale.current.region?.identifier),
                 networkType: nil,
                 activeFlags: nil,
                 activeExperiments: nil

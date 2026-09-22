@@ -448,3 +448,22 @@ struct ApiErrorDetail: Decodable, Sendable {
     let code: String
     let message: String
 }
+
+// MARK: - Ingest capability negotiation (GET /v1/ingest/capabilities)
+
+struct RuntimeCapabilitiesResponse: Decodable, Sendable {
+    let runtimeAttributionVersion: Int
+    let maxRuntimeContextBytes: Int
+    let perEventAnalyticsContext: Bool
+    let perMetricPerformanceContext: Bool
+    let runtimeReleaseMembership: Bool
+    let runtimeCaptureDeclaration: Bool?
+    enum CodingKeys: String, CodingKey {
+        case runtimeAttributionVersion = "runtime_attribution_version"
+        case maxRuntimeContextBytes = "max_runtime_context_bytes"
+        case perEventAnalyticsContext = "per_event_analytics_context"
+        case perMetricPerformanceContext = "per_metric_performance_context"
+        case runtimeReleaseMembership = "runtime_release_membership"
+        case runtimeCaptureDeclaration = "runtime_capture_declaration"
+    }
+}

@@ -549,9 +549,19 @@ final class ExperimentAttributionClientTests: XCTestCase {
         XCTAssertNil(entries(sent)["pricing_test"]?["subject_status"])
     }
 
-    /// Logout does not change the device row: the next config is still bucketed for the previous
-    /// user, so anonymous events must be marked and kept out of the legacy `experiments` map.
-    func testResetKeepsTheServerHeldUserAndMarksAnonymousEvents() async throws {
+    /// Logout on a device bound to a user switches to a fresh device (`DeviceRotation`), whose row
+    /// holds nobody: the label becomes `.known(nil)`, so an anonymous event is attributed to the
+    /// arm the anonymous config bucketed it into. Before the rotation existed the row kept the
+    /// previous user, the next config was bucketed for them, and these events had to be marked.
+    func testResetRotatesToAFreshDeviceWhoseAnonymousEventsAreAttributed() async throws {
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: Self.suite))
+        defaults.set("1", forKey: StorageKeys.deviceRegistered)
+        defer {
+            defaults.removeObject(forKey: StorageKeys.deviceRegistered)
+            defaults.removeObject(forKey: StorageKeys.deviceId)
+        }
+        let minted = "dev_\(UUID().uuidString)"
+        AttributionCaptureProtocol.registerDeviceId = minted
         let client = makeClient()
         defer { client.destroy() }
         await waitForStartupFetch()
@@ -564,19 +574,21 @@ final class ExperimentAttributionClientTests: XCTestCase {
         await client.awaitIdentityPostForTesting()
         client.reset()
         client.track(rightAfterReset)
-        // `reset()` clears the actor half of the cache in a Task; a fetch it overtakes is
-        // discarded, so refetch until one applies.
+        let rotated = await waitUntil { client.context.deviceId == minted }
+        XCTAssertTrue(rotated, "precondition: the fresh device was adopted")
         for _ in 0..<50 where client.status().experimentCount == 0 {
             await client.refreshConfigForTesting()
         }
         client.track(afterRefetch)
         await client.flush()
 
-        XCTAssertEqual(client.context.serverHeldUser.user, .known(userA))
+        XCTAssertEqual(client.context.serverHeldUser.user, .known(nil))
         let loggedOut = try context(of: rightAfterReset)
         XCTAssertNil(loggedOut["experiments"])
         XCTAssertNil(loggedOut["experiment_assignments"])
-        try assertUserEntryMarked(afterRefetch)
+        let sent = try context(of: afterRefetch)
+        XCTAssertEqual(experiments(sent)["pricing_test"] as? String, "treatment")
+        XCTAssertNil(entries(sent)["pricing_test"]?["subject_status"])
     }
 
     func testAdoptingANewlyMintedDeviceIdRecordsThatTheRowHoldsNoUser() async throws {

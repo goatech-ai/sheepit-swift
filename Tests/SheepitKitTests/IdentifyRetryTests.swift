@@ -14,7 +14,8 @@ final class IdentifyRetryTests: XCTestCase {
         guard let defaults = UserDefaults(suiteName: suite) else { return }
         for key in [StorageKeys.sdkConfig, StorageKeys.sdkConfigCachedAt,
                     StorageKeys.sdkConfigFetchedUnder, StorageKeys.serverHeldUser,
-                    StorageKeys.identity, StorageKeys.deviceRegistrationBackoffUntil] {
+                    StorageKeys.identity, StorageKeys.deviceRegistrationBackoffUntil,
+                    StorageKeys.deviceRegistrationBackoffSDKVersion, StorageKeys.deviceBindAttempted] {
             defaults.removeObject(forKey: key)
         }
     }
@@ -23,6 +24,8 @@ final class IdentifyRetryTests: XCTestCase {
         super.setUp()
         Self.clearStorage()
         AttributionCaptureProtocol.reset()
+        // A `reset()` after an identify now registers a fresh device (`DeviceRotation`); answer it.
+        AttributionCaptureProtocol.registerDeviceId = "dev_rotated_\(UUID().uuidString)"
     }
 
     override func tearDown() {
@@ -38,7 +41,7 @@ final class IdentifyRetryTests: XCTestCase {
     """#
 
     private func makeClient(retryAttempts: Int = 1) -> SheepitClient {
-        SheepitClient.createForTesting(
+        let client = SheepitClient.createForTesting(
             config: SheepitConfig(
                 apiKey: "lp_pub_tst_" + String(repeating: "a", count: 64),
                 apiUrl: "https://stub.invalid",
@@ -52,6 +55,8 @@ final class IdentifyRetryTests: XCTestCase {
             now: { Date() },
             urlProtocolClasses: [AttributionCaptureProtocol.self]
         )
+        client.deviceRotationRetryDelayForTesting = { _ in .milliseconds(20) }
+        return client
     }
 
     private func uniqueUser(_ prefix: String) -> String {
@@ -88,12 +93,11 @@ final class IdentifyRetryTests: XCTestCase {
 
     // MARK: - reset()
 
-    /// DESIGN GUARD (passes on the code before the fix too). A retry already on the wire when
-    /// `reset()` runs cannot be unsent, and its 2xx means the row holds that user. `/v1/config` sends
-    /// only `X-Device-ID` and the server resolves the user from the row, so the refetch after the
-    /// answer returns what the next ordinary poll after logout returns. Pinned: the label records the
-    /// row, and the logged-out user's events are not credited to the row's user-bucketed arms.
-    func testARetryAnsweredAfterResetRecordsTheRowItBoundAndCreditsNoAnonymousEvent() async throws {
+    /// A retry already on the wire when `reset()` runs cannot be unsent, and its 2xx means the OLD
+    /// row holds that user. The logout switched to a fresh device (`DeviceRotation`), so that answer
+    /// describes an abandoned row: it must not label the new one, and events after the logout are
+    /// attributed under the new, anonymous row's config.
+    func testARetryAnsweredAfterResetDescribesTheAbandonedRowNotTheNewOne() async throws {
         let client = makeClient()
         defer { client.destroy() }
         await waitForStartupFetch()
@@ -107,21 +111,25 @@ final class IdentifyRetryTests: XCTestCase {
         client.configRefreshTickForTesting()
         let onWire = await waitUntil { posts(for: userA) == 2 }
         XCTAssertTrue(onWire, "precondition: the retry is on the wire")
+        let oldDevice = client.context.deviceId
         client.reset()
         AttributionCaptureProtocol.releaseHeldIdentify()
         await client.awaitIdentityPostForTesting()
+        let rotated = await waitUntil { client.context.deviceId.hasPrefix("dev_rotated_") }
+        XCTAssertTrue(rotated, "precondition: the logout switched devices")
+        await client.refreshConfigForTesting()
         client.track(name)
         await client.flush()
         client.configRefreshTickForTesting()
         await client.awaitIdentityPostForTesting()
 
-        XCTAssertEqual(client.context.serverHeldUser.user, .known(userA), "the row holds the user the retry posted")
+        XCTAssertNotEqual(client.context.deviceId, oldDevice)
+        XCTAssertEqual(client.context.serverHeldUser.user, .known(nil), "the new row holds nobody")
         let event = try XCTUnwrap(AttributionCaptureProtocol.event(named: name))
         let context = try XCTUnwrap(event["context"] as? [String: Any])
         let experiments = context["experiments"] as? [String: Any] ?? [:]
         let entries = context["experiment_assignments"] as? [String: [String: Any]] ?? [:]
-        XCTAssertNil(experiments["pricing_test"], "a logged-out event must not be credited to the row's user arm")
-        XCTAssertEqual(entries["pricing_test"]?["subject_status"] as? String, "identity_changed")
+        XCTAssertNil(entries["pricing_test"]?["subject_status"], "bucketed for the anonymous row it is sent from")
         XCTAssertEqual(experiments["onboarding_test"] as? String, "b", "precondition: the refetch was applied")
         XCTAssertEqual(posts(for: userA), 2, "nothing is re-sent for a logged-out user")
     }
@@ -140,7 +148,9 @@ final class IdentifyRetryTests: XCTestCase {
         await client.awaitIdentityPostForTesting()
 
         XCTAssertEqual(posts(for: userA), 1, "only the original POST; the retry was for a logged-out user")
-        XCTAssertEqual(client.context.serverHeldUser.user, .unknown, "a POST that was not sent changes nothing")
+        XCTAssertEqual(
+            client.context.serverHeldUser.user, .known(nil),
+            "the original POST may have bound the row, so the logout switched to a fresh device")
     }
 
     /// The same, when the app identifies the same user again inside that window: the retry is still
@@ -412,6 +422,7 @@ final class IdentifyRetryTests: XCTestCase {
 
         await identifyWithFailedPost(client, userA)
         defaults.set(String(Date().timeIntervalSince1970 + 3600), forKey: StorageKeys.deviceRegistrationBackoffUntil)
+        defaults.set(SDKDefaults.sdkVersion, forKey: StorageKeys.deviceRegistrationBackoffSDKVersion)
         client.configRefreshTickForTesting()
         await client.awaitIdentityPostForTesting()
 

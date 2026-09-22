@@ -17,24 +17,23 @@ Web and backend get flags and experiments from the Sheepit SDKs, and native apps
 
 ## Install
 
-Sheepit is developed in the Sheepit monorepo (`packages/sdk-swift`) and published to the public mirror repository [`goatech-ai/sheepit-swift`](https://github.com/goatech-ai/sheepit-swift), which is what Swift Package Manager resolves against. Every release tag on the mirror is a bare semver version (`0.5.0`), mirrored from the monorepo by CI.
+Sheepit is developed in the Sheepit monorepo (`packages/sdk-swift`) and published to the public mirror repository [`goatech-ai/sheepit-swift`](https://github.com/goatech-ai/sheepit-swift), which is what Swift Package Manager resolves against. Every release tag on the mirror is a bare semver version (`0.6.0`), mirrored from the monorepo by CI.
 
 ### Xcode
 
-**File → Add Package Dependencies…** → enter `https://github.com/goatech-ai/sheepit-swift.git` → choose **Exact Version** and enter `0.5.0`.
+**File → Add Package Dependencies…** → enter `https://github.com/goatech-ai/sheepit-swift.git` → choose **Exact Version** and enter `0.6.0`.
 
-> 🔴 **Pin exactly while this package is on `0.x`.** SPM's "Up to Next Major"
-> does not special-case `0.x` the way npm and Cargo do — `from: "0.5.0"`
-> resolves `>=0.5.0 <1.0.0`, which would pull in every future `0.x` release,
-> and `0.x` is precisely where breaking changes are allowed. Pin exactly and
-> upgrade deliberately until `2.0.0`, the first stable release. See the
-> CHANGELOG's "Version policy" for why `1.0.x` is abandoned.
+> 🔴 **Choose "Exact Version" `0.6.0`. Do not accept Xcode's default "Up to Next Major", and do not use `from:`.**
+> The mirror also carries tags `1.0.0` and `1.0.1`. They are **older** code than `0.6.0` and
+> export a different product name (`SheepitSDK`, not `SheepitKit`). Semver ranks them higher,
+> so Xcode pre-fills its default rule from `1.0.1` and resolves the wrong release. Pin
+> `exact: "0.6.0"` and upgrade deliberately. See the CHANGELOG's "Version policy".
 
 ### Package.swift
 
 ```swift
 dependencies: [
-  .package(url: "https://github.com/goatech-ai/sheepit-swift.git", exact: "0.5.0"),
+  .package(url: "https://github.com/goatech-ai/sheepit-swift.git", exact: "0.6.0"),
 ]
 ```
 
@@ -46,6 +45,10 @@ dependencies: [
 ```
 
 Supported platforms (from `Package.swift`): iOS 16+, macOS 13+, tvOS 16+, watchOS 9+. Swift tools 5.9+.
+
+## Key type
+
+Use a **publishable** key (`lp_pub_…`). It is the only type the SDK accepts; a secret or developer key produces an inert client (see the FAQ). Never ship a secret key (`lp_sec_…`) in an app binary.
 
 ## Usage
 
@@ -93,20 +96,68 @@ struct ContentView: View {
 ```
 
 ```swift
-// track an event
-sheepit?.track("course_viewed", properties: ["course_id": "abc-123"])
+import SheepitKit
 
-// evaluate a flag
-let showBeta = sheepit?.flag("show_beta_ui", default: .bool(false))
+func example(sheepit: SheepitClient) async {
+    // track an event
+    sheepit.track("checkout_started", properties: ["cart_value": 42])
 
-// assign an experiment variant (sticky per device)
-let result = sheepit?.experiment("checkout_redesign")
-print(result?.variant ?? "control")
+    // identity: after login. For a new user id, traits are sent to the API as device
+    // attributes (usable for targeting); re-identifying the same user only merges them locally.
+    sheepit.identify(userId: "user_abc", traits: ["plan": "pro"])
 
-// identity
-sheepit?.identify(userId: "user_abc", traits: ["plan": "pro"])
-sheepit?.reset()
+    // evaluate a flag (synchronous; returns the default until config has loaded)
+    let showBeta = sheepit.flag("show_beta_ui", default: .bool(false))
+    if showBeta.boolValue == true { /* ... */ }
+
+    // experiment variant; "control" when there is no assignment
+    let result = sheepit.experiment("checkout_redesign")
+    print(result.variant, result.payload ?? [:])
+
+    // send queued events now
+    await sheepit.flush()
+
+    // logout: clears identity, cached config, evaluated flags and assignments
+    sheepit.reset()
+
+    // teardown: stops timers and handlers; final flush is fire-and-forget
+    sheepit.destroy()
+}
 ```
+
+### How flags and experiments resolve
+
+SheepitKit evaluates nothing locally. It fetches `GET /v1/config`, which returns values the API has already evaluated for this device, and caches them. `flag(_:default:)` and `experiment(_:)` read that cache synchronously.
+
+- Configuration is polled every `configRefreshInterval`, **300 seconds by default**. A flag change or kill switch can therefore take up to about five minutes to reach a running app; lower `configRefreshInterval` if you need faster propagation.
+- The first `flag` read per flag and the first `experiment` read per experiment emit `$flag_exposure` / `$experiment_exposure`. `inspect(_:default:)` never emits exposure.
+- Events from macOS, tvOS, and watchOS currently report `platform: "ios"`; the OS name is recorded separately on the device.
+
+## Configuration
+
+`SheepitConfig.init(apiKey:…)`; every parameter except `apiKey` has a default.
+
+| Parameter                | Type                                            | Default                               |
+| ------------------------ | ----------------------------------------------- | ------------------------------------- |
+| `apiKey`                 | `String` (required)                             | —                                     |
+| `environment`            | `String`                                        | `"production"`                        |
+| `apiUrl`                 | `String`                                        | `"https://api.sheepit.ai"`            |
+| `flushInterval`          | `TimeInterval` (s)                              | `5.0`                                 |
+| `flushSize`              | `Int`                                           | `20`                                  |
+| `configRefreshInterval`  | `TimeInterval` (s)                              | `300`                                 |
+| `maxQueueSize`           | `Int`                                           | `1000`                                |
+| `retryAttempts`          | `Int`                                           | `3`                                   |
+| `debug`                  | `Bool`                                          | `false`                               |
+| `onEvent`                | `(@Sendable (String, [String: Any]?) -> Void)?` | `nil`                                 |
+| `performance`            | `PerformanceConfig`                             | `.init()`: **off** (`enabled: false`) |
+| `crashes`                | `CrashConfig`                                   | `.init()`: **on** (`enabled: true`)   |
+| `appVersion`             | `String?`                                       | `nil` → `CFBundleShortVersionString`  |
+| `onDiagnostic`           | `DiagnosticListener?`                           | `nil`                                 |
+| `diagnosticBufferSize`   | `Int`                                           | `100`                                 |
+| `allowFlagOverrides`     | `Bool?`                                         | `nil` (follows `debug`)               |
+| `allowSecretKeyInClient` | `Bool`                                          | `false` (tests only)                  |
+
+Pass your git SHA or build tag as `appVersion` so events attribute to the right release; the marketing version rarely matches a release record.
 
 ## API reference
 
@@ -118,6 +169,9 @@ sheepit?.reset()
 | `flag(_:default:)`                                                  | Evaluate a flag; returns a `FlagValue`                             |
 | `experiment(_:)`                                                    | Get a `SheepitExperimentResult` (with `.variant`)                  |
 | `identify(userId:traits:)` / `reset()`                              | Set or clear user identity                                         |
+| `flush() async` / `destroy()`                                       | Send queued events / tear down                                     |
+| `addBreadcrumb(category:message:)` / `setScreen(_:)`                | Context attached to crash reports                                  |
+| `startSpan(_:attributes:)` / `endSpan(_:)` / `markFirstFrame()`     | Performance spans (when `performance.enabled`)                     |
 | `FlagValue`                                                         | Enum: `.bool`, `.string`, `.int`, `.double`, `.json`               |
 | `overrideFlag(_:value:)` / `clearOverride(_:)` / `clearOverrides()` | Set/clear debug flag overrides                                     |
 | `getOverrides()`                                                    | Read the debug flag overrides currently set                        |
@@ -177,7 +231,8 @@ import SwiftUI
 import SheepitKit
 
 /// The full key list is the UNION of two sources, deduped:
-/// - `Flag.allCases` (from `sheepit codegen --swift`) — works on a fresh
+/// - `Flag.allCases` (from `sheepit codegen` with `codegen.outputs.swift`
+///   set in sheepit.config.json) — works on a fresh
 ///   install even with the API down.
 /// - `sheepit.knownFlagKeys()` — server keys your local codegen doesn't
 ///   know about yet (a stale-codegen detector). Skipping this half is
@@ -268,13 +323,17 @@ if let reason = sheepit.status().rejectionReason {
 
 An error is also logged to `os_log`, and a `lifecycle.api_key_rejected` diagnostic is emitted — subscribe with `SheepitConfig.onDiagnostic` or read `getRecentDiagnostics()`. If the key is fine, check that the device has network and that events are being flushed (`status().queueDepth`).
 
-**Does the SDK hardcode the `lp_` key prefix?** No. It validates the shape of a key — `{prefix}_pub_{env}_{secret}` — but never the vendor prefix itself, so a key minted under a future prefix works on a version you have already pinned. A published Swift package version is immutable, so anything compiled in here is compiled in forever.
+**How do I get type-safe flags?** `sheepit codegen` from [@sheepit-ai/cli](https://www.npmjs.com/package/@sheepit-ai/cli) generates a Swift `Flag` enum (`String`, `CaseIterable`) when `codegen.outputs.swift` is set in `sheepit.config.json`. Reference flags by `Flag.<name>.rawValue`.
 
-**How do I get type-safe flags?** The `sheepit codegen` command in [@sheepit-ai/cli](https://www.npmjs.com/package/@sheepit-ai/cli) generates a Swift `Flag` enum for your project. Reference flags by `Flag.<name>.rawValue`.
-
-**How does experiment bucketing work?** The server assigns the variant and the SDK caches it per device, so a device keeps its assignment across launches.
+**How does experiment bucketing work?** The API assigns the variant; the SDK only caches the result. There is no on-device bucketing.
 
 **Is the SDK concurrency-safe?** Yes, within one process. `SheepitClient` is `Sendable` and its internals are actor-isolated, so its public methods are safe to call from any thread. That guarantee does not extend across process boundaries: `create()`/`initialize()` persist device and session identity under a fixed `UserDefaults` suite that is not an App Group id, so **do not link SheepitKit into an app extension alongside a host app**, and do not run two independent processes against the same install — each process would compute its own fresh device id and independently report its own `$app_install` and `$session_start(is_first_session: true)`, double-counting a single real install.
+
+## Links
+
+- [`@sheepit-ai/sdk-js`](https://www.npmjs.com/package/@sheepit-ai/sdk-js) · [`@sheepit-ai/react`](https://www.npmjs.com/package/@sheepit-ai/react) · [`@sheepit-ai/server`](https://www.npmjs.com/package/@sheepit-ai/server) · [`@sheepit-ai/cli`](https://www.npmjs.com/package/@sheepit-ai/cli)
+- Android and .NET SDKs: coming soon.
+- [sheepit.ai](https://www.sheepit.ai)
 
 ## License
 

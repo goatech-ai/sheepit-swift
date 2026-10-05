@@ -19,6 +19,12 @@ final class Logger: Sendable {
         os_log(.default, log: osLog, "[Sheepit] ⚠️ %{public}@", message)
     }
 
+    /// Always shown (debug or not), unredacted in the Xcode console. Only for text the SDK
+    /// composed itself that carries no credential, e.g. which host an Info.plist config resolved to.
+    func notice(_ message: String) {
+        os_log(.default, log: osLog, "[Sheepit] %{public}@", message)
+    }
+
     func error(_ message: String, _ context: Any?...) {
         // %{private}@ — error messages can carry host/attacker-influenced strings (e.g. a
         // rejected apiUrl's rejection reason), and the redaction regex protecting that one

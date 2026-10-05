@@ -55,8 +55,6 @@ final class AttributionCaptureProtocol: URLProtocol, @unchecked Sendable {
         case status(Int)
         case lost
         case hold
-        /// 400 when the request carries `attributes`, `otherwise` when it carries none.
-        case rejectAttributes(otherwise: Int)
     }
 
     private struct State {
@@ -294,12 +292,6 @@ final class AttributionCaptureProtocol: URLProtocol, @unchecked Sendable {
                 client?.urlProtocol(self, didFailWithError: URLError(.networkConnectionLost))
             case .hold:
                 Self.with { $0.heldIdentify.append { status in self.respond(status, #"{"data":{}}"#) } }
-            case .rejectAttributes(let otherwise):
-                if attributes != nil {
-                    respond(400, #"{"error":{"code":"INVALID_ATTRIBUTES","message":"stub"}}"#)
-                } else {
-                    respond(otherwise, #"{"data":{}}"#)
-                }
             }
         } else if path.hasSuffix(SDKEndpoints.ingest) {
             let count = Self.batch(body).count

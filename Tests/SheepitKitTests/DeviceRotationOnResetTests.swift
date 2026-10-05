@@ -38,12 +38,16 @@ final class DeviceRotationOnResetTests: XCTestCase {
         defaults?.set(Self.oldDevice, forKey: StorageKeys.deviceId)
         defaults?.set("1", forKey: StorageKeys.deviceRegistered)
         AttributionCaptureProtocol.registerDeviceId = Self.newDevice
+        TeardownFlushes.install()
     }
 
-    override func tearDown() {
+    /// Awaits every destroyed client's fire-and-forget final flush before the shared stub and
+    /// storage are reset, so it cannot land in the next test (`TeardownFlushes`).
+    override func tearDown() async throws {
+        await TeardownFlushes.drain(context: name)
         Self.clearStorage()
         AttributionCaptureProtocol.reset()
-        super.tearDown()
+        try await super.tearDown()
     }
 
     private func makeClient() -> SheepitClient {

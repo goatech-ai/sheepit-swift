@@ -102,12 +102,16 @@ final class DeviceRegistrationPayloadTests: XCTestCase {
         super.setUp()
         clearDeviceStorage()
         RegistrationStubURLProtocol.reset()
+        TeardownFlushes.install()
     }
 
-    override func tearDown() {
+    /// Awaits every destroyed client's fire-and-forget final flush before the shared stub and
+    /// storage are reset, so it cannot land in the next test (`TeardownFlushes`).
+    override func tearDown() async throws {
+        await TeardownFlushes.drain(context: name)
         clearDeviceStorage()
         RegistrationStubURLProtocol.reset()
-        super.tearDown()
+        try await super.tearDown()
     }
 
     private func makeConfig() -> SheepitConfig {

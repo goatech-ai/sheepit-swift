@@ -42,11 +42,22 @@ actor HTTPClient {
         // "initialized" client sent every request to a domain that doesn't exist (2026-09
         // security follow-up round 3, finding MF-4). Gate and transport must agree on the
         // SAME string.
-        self.baseURL = URL(string: config.apiUrl.trimmingCharacters(in: .whitespacesAndNewlines))
+        self.baseURL = URL(string: HTTPClient.normalizedBaseURLString(config.apiUrl))
             ?? HTTPClient.unreachableFallbackURL
         self.retryAttempts = config.retryAttempts
         self.retryBackoff = SDKDefaults.retryBackoff
         self.log = log
+    }
+
+    /// `apiUrl` trimmed, then stripped of trailing `/`. The base may carry a path (a same-origin
+    /// proxy such as `https://app.example.com/_sheepit`), and every endpoint is joined with
+    /// `appendingPathComponent("/v1/...")`, which keeps a doubled slash: `…/_sheepit//` became
+    /// `…/_sheepit//v1/ingest`, a different path to most proxies and routers. Stripping here
+    /// makes `x`, `x/` and `x//` one base.
+    static func normalizedBaseURLString(_ apiUrl: String) -> String {
+        var trimmed = Substring(apiUrl.trimmingCharacters(in: .whitespacesAndNewlines))
+        while trimmed.hasSuffix("/") { trimmed = trimmed.dropLast() }
+        return String(trimmed)
     }
 
     /// A well-formed, compile-time-constant URL — never derived from config/attacker input,
@@ -74,13 +85,19 @@ actor HTTPClient {
     ///   network error. `false` sends nothing more and throws `RequestPreconditionFailed`. For a
     ///   request whose premise can end during the retry backoff (an identify POST for a user who
     ///   has since logged out). Nil for every other caller, whose behaviour is unchanged.
+    /// - Parameter maxAttempts: overrides `config.retryAttempts` for this call. `1` for a caller
+    ///   that retries on its own schedule (crash uploads retry across launches).
     func postRaw(
         path: String,
         body: some Encodable & Sendable,
         extraHeaders: [String: String] = [:],
-        sendIf: (@Sendable () -> Bool)? = nil
+        sendIf: (@Sendable () -> Bool)? = nil,
+        maxAttempts: Int? = nil
     ) async throws -> Data {
-        try await performRequest("POST", path: path, body: body, extraHeaders: extraHeaders, sendIf: sendIf)
+        try await performRequest(
+            "POST", path: path, body: body, extraHeaders: extraHeaders, sendIf: sendIf,
+            maxAttempts: maxAttempts
+        )
     }
 
     func get<T: Decodable & Sendable>(
@@ -129,8 +146,10 @@ actor HTTPClient {
         body: (any Encodable & Sendable)?,
         extraHeaders: [String: String],
         sendIf: (@Sendable () -> Bool)? = nil,
+        maxAttempts: Int? = nil,
         attempt: Int = 0
     ) async throws -> Data {
+        let attemptLimit = maxAttempts ?? retryAttempts
         // A cancelled caller (a destroyed client's identify POST) must not send, or re-send.
         try Task.checkCancellation()
         // Outside the `do` below, so it is never mistaken for a network error and retried: a
@@ -182,13 +201,14 @@ actor HTTPClient {
             throw SDKError.httpError(httpResponse.statusCode)
         } catch let error as SDKError {
             // Only retry on server errors
-            if case .serverError = error, attempt < retryAttempts - 1 {
+            if case .serverError = error, attempt < attemptLimit - 1 {
                 let delay = retryBackoff[min(attempt, retryBackoff.count - 1)]
                 log.debug("Request failed (attempt \(attempt + 1)), retrying in \(delay)s")
                 try await Task.sleep(for: .seconds(delay))
                 try Task.checkCancellation()
                 return try await performRequest(
-                    method, path: path, body: body, extraHeaders: extraHeaders, sendIf: sendIf, attempt: attempt + 1
+                    method, path: path, body: body, extraHeaders: extraHeaders, sendIf: sendIf,
+                    maxAttempts: maxAttempts, attempt: attempt + 1
                 )
             }
             throw error
@@ -196,13 +216,14 @@ actor HTTPClient {
             // Cancellation is not a network error: never retried.
             if error is CancellationError || Task.isCancelled { throw error }
             // Network errors — retry
-            if attempt < retryAttempts - 1 {
+            if attempt < attemptLimit - 1 {
                 let delay = retryBackoff[min(attempt, retryBackoff.count - 1)]
                 log.debug("Network error (attempt \(attempt + 1)), retrying in \(delay)s")
                 try await Task.sleep(for: .seconds(delay))
                 try Task.checkCancellation()
                 return try await performRequest(
-                    method, path: path, body: body, extraHeaders: extraHeaders, sendIf: sendIf, attempt: attempt + 1
+                    method, path: path, body: body, extraHeaders: extraHeaders, sendIf: sendIf,
+                    maxAttempts: maxAttempts, attempt: attempt + 1
                 )
             }
             throw SDKError.networkError(error)

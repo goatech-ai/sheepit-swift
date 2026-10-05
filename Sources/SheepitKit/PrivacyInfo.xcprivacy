@@ -41,7 +41,8 @@
 			</array>
 		</dict>
 
-		<!-- User id + traits: only what the host app passes to identify(). -->
+		<!-- User id: only what the host app passes to identify(). Traits are not collected —
+		     the parameter was removed in 0.7.0 (D-SDK4). -->
 		<dict>
 			<key>NSPrivacyCollectedDataType</key>
 			<string>NSPrivacyCollectedDataTypeUserID</string>
@@ -129,7 +130,11 @@
 		</dict>
 
 		<!-- Performance/StartupTracker.swift: ProcessInfo.systemUptime,
-		     used to time cold/warm start within the app. -->
+		     used to time cold/warm start within the app.
+		     Diagnostics/ErrorCaptureLimiter.swift: ProcessInfo.systemUptime,
+		     used as the monotonic clock for captureError's in-app rate-limit
+		     windows. Same declared reason: elapsed time inside the app, never
+		     sent off the device. -->
 		<dict>
 			<key>NSPrivacyAccessedAPIType</key>
 			<string>NSPrivacyAccessedAPICategorySystemBootTime</string>

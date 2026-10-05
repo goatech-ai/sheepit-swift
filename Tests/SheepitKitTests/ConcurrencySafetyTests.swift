@@ -140,7 +140,7 @@ final class ConcurrencySafetyTests: XCTestCase {
         DispatchQueue.concurrentPerform(iterations: 200) { index in
             switch index % 4 {
             case 0: context.setUserId("user_\(index)")
-            case 1: context.updateUserTraits(["plan": "pro", "n": index])
+            case 1: context.setServerHeldUser(.known("user_\(index)"))
             case 2: context.touchSession()
             default: _ = context.eventContext()
             }

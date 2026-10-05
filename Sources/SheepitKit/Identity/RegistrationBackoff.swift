@@ -9,9 +9,16 @@ import Foundation
 ///   - **Clock skew.** A window ending further out than `deviceRegistrationTerminalBackoff` from now
 ///     can only come from a clock that has since moved back, and is ignored.
 enum RegistrationBackoff {
-    static func record(storage: StorageProvider, now: Date) {
+    /// `duration` defaults to the terminal (24h) window; the shorter `SDKDefaults.
+    /// deviceRegistrationCapBackoff` is passed explicitly for a 422 (environment device cap) —
+    /// see `RegistrationOutcome.capReached`'s doc for why that case gets a shorter window.
+    static func record(
+        storage: StorageProvider,
+        now: Date,
+        duration: TimeInterval = SDKDefaults.deviceRegistrationTerminalBackoff
+    ) {
         storage.set(
-            String(now.timeIntervalSince1970 + SDKDefaults.deviceRegistrationTerminalBackoff),
+            String(now.timeIntervalSince1970 + duration),
             forKey: StorageKeys.deviceRegistrationBackoffUntil
         )
         storage.set(SDKDefaults.sdkVersion, forKey: StorageKeys.deviceRegistrationBackoffSDKVersion)

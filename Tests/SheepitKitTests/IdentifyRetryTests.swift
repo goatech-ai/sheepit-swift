@@ -83,10 +83,9 @@ final class IdentifyRetryTests: XCTestCase {
 
     /// Identifies `userId` with a POST that fails, leaving the label unknown so a tick retries.
     private func identifyWithFailedPost(_ client: SheepitClient, _ userId: String,
-                                        reply: AttributionCaptureProtocol.IdentifyReply = .lost,
-                                        traits: [String: Any]? = nil) async {
+                                        reply: AttributionCaptureProtocol.IdentifyReply = .lost) async {
         AttributionCaptureProtocol.setIdentifyReply(reply, for: userId)
-        client.identify(userId: userId, traits: traits)
+        client.identify(userId: userId)
         await client.awaitIdentityPostForTesting()
         XCTAssertEqual(client.context.serverHeldUser.user, .unknown, "precondition: the identify POST failed")
     }
@@ -272,51 +271,55 @@ final class IdentifyRetryTests: XCTestCase {
         XCTAssertEqual(client.getRecentDiagnostics().filter { $0.code == "identity.identify_post_rejected" }.count, 1)
     }
 
-    /// A 400 on a POST carrying traits (an invalid trait, which the route rejects before any write)
-    /// must not leave the device on the previous user all session: identifying the same user again
-    /// is a no-op, so nothing else would ever re-send it.
-    func testAnIdentifyPostWhoseTraitsAreRejectedIsReSentWithoutThem() async throws {
+    /// D-SDK4: no identify POST carries an `attributes` body, ever.
+    ///
+    /// The `traits` parameter was REMOVED in 0.7.0, so the strongest guard is the compiler —
+    /// `client.identify(userId:traits:)` no longer exists and a call site passing traits does
+    /// not build. This test guards the half the compiler cannot: that the request body the SDK
+    /// constructs carries no `attributes` key, whatever route it takes to the wire. It fails
+    /// against the pre-D-SDK4 code, where `postIdentity` mapped traits into the body.
+    func testNoIdentifyPostCarriesAttributes() async throws {
         let client = makeClient()
         defer { client.destroy() }
         await waitForStartupFetch()
         let userC = uniqueUser("user-c")
-        AttributionCaptureProtocol.setIdentifyReply(.rejectAttributes(otherwise: 200), for: userC)
 
-        client.identify(userId: userC, traits: ["plan": "pro"])
+        client.identify(userId: userC)
         await client.awaitIdentityPostForTesting()
 
         let attributes = AttributionCaptureProtocol.identifyAttributes
-        XCTAssertEqual(attributes.count, 2, "the POST with traits, then one without")
-        let first: [String: Any]? = attributes.first ?? nil
-        let second: [String: Any]? = attributes.last ?? nil
-        XCTAssertEqual(first?["plan"] as? String, "pro")
-        XCTAssertNil(second)
+        XCTAssertEqual(attributes.count, 1, "one POST, and no traits-rejected resend to make")
+        XCTAssertNil(attributes.first ?? nil, "the wire body must carry no attributes")
         XCTAssertEqual(client.context.serverHeldUser.user, .known(userC))
     }
 
-    /// `identify()` with traits, `reset()` while that POST is on the wire, then a 400 that stored
-    /// nothing: the traits-less resend is a new request and must not bind the logged-out user.
-    func testTheTraitsLessResendIsNotSentAfterAResetDuringTheRejectedPost() async throws {
+    /// Re-identifying the same user is still a no-op — the removal of `traits` must not have
+    /// turned the same-user path into a POST, which is the regression a careless deletion of the
+    /// trait-merge line would cause.
+    func testReIdentifyingTheSameUserStillSendsNoPost() async throws {
         let client = makeClient()
         defer { client.destroy() }
         await waitForStartupFetch()
         let userA = uniqueUser("user-a")
-        AttributionCaptureProtocol.setIdentifyReply(.hold, for: userA)
 
-        client.identify(userId: userA, traits: ["plan": "pro"])
-        let onWire = await waitUntil { posts(for: userA) == 1 }
-        XCTAssertTrue(onWire, "precondition: the POST with traits is on the wire")
-        client.reset()
-        AttributionCaptureProtocol.setIdentifyReply(.rejectAttributes(otherwise: 200), for: userA)
-        AttributionCaptureProtocol.releaseHeldIdentify(status: 400)
+        client.identify(userId: userA)
         await client.awaitIdentityPostForTesting()
+        client.identify(userId: userA)
+        client.identify(userId: userA)
 
-        XCTAssertEqual(posts(for: userA), 1, "no traits-less POST for a user who logged out")
-        XCTAssertNotEqual(client.context.serverHeldUser.user, .known(userA))
+        XCTAssertEqual(posts(for: userA), 1, "three calls, one POST")
+        XCTAssertEqual(
+            client.getRecentDiagnostics().filter { $0.code == "identity.identify_noop" }.count,
+            2,
+            "the two repeats each take the no-op path"
+        )
     }
 
-    /// An `identify()` POST whose first attempt 5xxs, with `reset()` during `HTTPClient`'s backoff:
-    /// the next attempt would bind the logged-out user to a row that did not hold them.
+    /// `reset()` during the backoff of the INITIAL POST's own HTTP retry — a different window from
+    /// `testAResetDuringTheHTTPRetryBackoffStopsTheNextIdentifyAttempt`, which covers the
+    /// config-tick-driven retry after the first POST and its HTTP retry have both failed. The first
+    /// attempt did not store the user, so a later one would newly bind a logged-out user to a row
+    /// that never held them.
     func testAResetDuringTheHTTPRetryBackoffStopsTheNextAttemptOfAnIdentifyCall() async throws {
         let client = makeClient(retryAttempts: 2)
         defer { client.destroy() }
@@ -335,64 +338,26 @@ final class IdentifyRetryTests: XCTestCase {
         XCTAssertNotEqual(client.context.serverHeldUser.user, .known(userA))
     }
 
-    /// The traits held in memory belong to whoever last passed them, not to the user a retry is for:
-    /// identify(A, traits) rejected, then identify(B) with none whose POST fails. B's retry must not
-    /// send A's traits (merged onto B's profile, or rejected again and resent: two POSTs a tick).
-    func testAnIdentifyRetryDoesNotSendAnEarlierUsersTraits() async throws {
+    /// Cross-user: one person's POST, then another's whose POST fails and is retried. No request in
+    /// the sequence may carry an `attributes` body — the shape that used to leak the earlier user's
+    /// traits onto the later user's profile.
+    func testNoRequestInACrossUserIdentifySequenceCarriesAttributes() async throws {
         let client = makeClient()
         defer { client.destroy() }
         await waitForStartupFetch()
         let (userA, userB) = (uniqueUser("user-a"), uniqueUser("user-b"))
-        AttributionCaptureProtocol.setIdentifyReply(.rejectAttributes(otherwise: 200), for: userA)
-        client.identify(userId: userA, traits: ["plan": "pro"])
-        await client.awaitIdentityPostForTesting()
 
+        client.identify(userId: userA)
+        await client.awaitIdentityPostForTesting()
         await identifyWithFailedPost(client, userB, reply: .status(500))
         client.configRefreshTickForTesting()
         await client.awaitIdentityPostForTesting()
 
         XCTAssertEqual(posts(for: userB), 2, "precondition: B's POST and one retry")
-        let retried: [String: Any]? = AttributionCaptureProtocol.identifyAttributes.last ?? nil
-        XCTAssertNil(retried, "a retry carries no attributes")
-    }
-
-    /// The traits-less resend checks, on its own, that the app still names the user: identify(A)
-    /// with traits, identify(B) while A's POST is on the wire, then A's 400. No reset() ran, so only
-    /// that check stands between it and a POST that binds A after B.
-    func testTheTraitsLessResendIsNotSentOnceAnotherUserIsIdentified() async throws {
-        let client = makeClient()
-        defer { client.destroy() }
-        await waitForStartupFetch()
-        let (userA, userB) = (uniqueUser("user-a"), uniqueUser("user-b"))
-        AttributionCaptureProtocol.setIdentifyReply(.hold, for: userA)
-
-        client.identify(userId: userA, traits: ["plan": "pro"])
-        let onWire = await waitUntil { posts(for: userA) == 1 }
-        XCTAssertTrue(onWire, "precondition: A's POST with traits is on the wire")
-        client.identify(userId: userB)
-        AttributionCaptureProtocol.setIdentifyReply(.rejectAttributes(otherwise: 200), for: userA)
-        AttributionCaptureProtocol.releaseHeldIdentify(status: 400)
-        await client.awaitIdentityPostForTesting() // B's POST, queued behind A's
-
-        XCTAssertEqual(posts(for: userA), 1, "no traits-less POST for A once the app names B")
-        XCTAssertEqual(posts(for: userB), 1)
-        XCTAssertEqual(client.context.serverHeldUser.user, .known(userB))
-    }
-
-    /// `identify(u, traits: [:])` carries no traits: a 400 it gets is not a trait rejection.
-    func testEmptyTraitsAreSentAsNoTraits() async throws {
-        let client = makeClient()
-        defer { client.destroy() }
-        await waitForStartupFetch()
-        let userA = uniqueUser("user-a")
-        AttributionCaptureProtocol.setIdentifyReply(.status(400), for: userA)
-
-        client.identify(userId: userA, traits: [:])
-        await client.awaitIdentityPostForTesting()
-
-        XCTAssertEqual(posts(for: userA), 1, "a non-trait 400 is not re-sent as if traits caused it")
-        let sent: [String: Any]? = AttributionCaptureProtocol.identifyAttributes.first ?? nil
-        XCTAssertNil(sent, "empty traits go out as no attributes")
+        XCTAssertTrue(
+            AttributionCaptureProtocol.identifyAttributes.allSatisfy { $0 == nil },
+            "no request in the sequence carries attributes"
+        )
     }
 
     /// DESIGN GUARD (passes on the code before the fix too): a 429 is transient and stays retryable.
@@ -429,15 +394,15 @@ final class IdentifyRetryTests: XCTestCase {
         XCTAssertEqual(posts(for: userA), 1)
     }
 
-    /// A retry of a failed `identify()` that carried traits sends none: a POST without `attributes`
-    /// leaves the stored traits alone, and one retry stays one POST.
-    func testAnIdentifyRetrySendsNoTraits() async throws {
+    /// Neither the original POST nor its retry carries attributes (D-SDK4), and one retry stays
+    /// one POST. Before that decision the first POST DID carry them and only the retry did not.
+    func testNeitherAnIdentifyPostNorItsRetrySendsAttributes() async throws {
         let client = makeClient()
         defer { client.destroy() }
         await waitForStartupFetch()
         let userA = uniqueUser("user-a")
 
-        await identifyWithFailedPost(client, userA, traits: ["plan": "pro"])
+        await identifyWithFailedPost(client, userA)
         AttributionCaptureProtocol.setIdentifyReply(.status(200), for: userA)
         client.configRefreshTickForTesting()
         await client.awaitIdentityPostForTesting()
@@ -446,7 +411,7 @@ final class IdentifyRetryTests: XCTestCase {
         XCTAssertEqual(attributes.count, 2, "precondition: the original POST and one retry")
         let first: [String: Any]? = attributes.first ?? nil
         let retried: [String: Any]? = attributes.last ?? nil
-        XCTAssertEqual(first?["plan"] as? String, "pro", "precondition: identify() sent its traits")
+        XCTAssertNil(first, "identify() puts no attributes on the wire")
         XCTAssertNil(retried)
     }
 }

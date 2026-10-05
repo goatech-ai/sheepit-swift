@@ -80,6 +80,8 @@ struct DeviceIdentifyResponse: Decodable, Sendable {
     let mergeStatus: String?
     let flagAssignments: [String: AnyCodable]
     let experimentAssignments: [String: AnyCodable]
+    /// Optional: servers that predate it omit the key (treat nil as true).
+    let configCacheInvalidated: Bool?
 
     enum CodingKeys: String, CodingKey {
         case deviceId = "device_id"
@@ -89,6 +91,7 @@ struct DeviceIdentifyResponse: Decodable, Sendable {
         case mergeStatus = "merge_status"
         case flagAssignments = "flag_assignments"
         case experimentAssignments = "experiment_assignments"
+        case configCacheInvalidated = "config_cache_invalidated"
     }
 }
 

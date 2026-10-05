@@ -37,12 +37,17 @@ final class DeviceRegistrationTests: XCTestCase {
         super.setUp()
         clearDeviceStorage()
         RegistrationStubURLProtocol.reset()
+        TeardownFlushes.install()
     }
 
-    override func tearDown() {
+    /// Awaits every destroyed client's final flush BEFORE resetting the stub: it is
+    /// fire-and-forget, and used to land in the next test's request log (the two
+    /// `testAnAlreadyRegistered…` tests run as a pair failed 30/30).
+    override func tearDown() async throws {
+        await TeardownFlushes.drain(context: name)
         clearDeviceStorage()
         RegistrationStubURLProtocol.reset()
-        super.tearDown()
+        try await super.tearDown()
     }
 
     private func makeConfig(
@@ -539,7 +544,7 @@ final class DeviceRegistrationTests: XCTestCase {
         )
     }
 
-    // MARK: - 7. Terminal registration failures (401/403/422)
+    // MARK: - 7. Terminal registration failures (401/403)
 
     /// A revoked key must stop being retried on every cold start, but the founder's ruling
     /// was explicit that it must not be silently confused with success either — so this
@@ -695,6 +700,308 @@ final class DeviceRegistrationTests: XCTestCase {
             UserDefaults(suiteName: suiteName)?.string(forKey: StorageKeys.deviceRegistered),
             "1",
             "a retry that now succeeds must be recorded as such"
+        )
+    }
+
+    // MARK: - 7b. 422 (environment device cap) is CAPPED, not TERMINAL (client-trust hardening, 2026-09-29)
+
+    /// 🔴 A 422 used to share `RegistrationOutcome.terminalFailure`'s flat 24h backoff with a
+    /// revoked key (401/403) — but unlike those, this device did nothing wrong: the
+    /// environment's `MAX_DEVICES_PER_ENVIRONMENT` ceiling is operator-raisable, and hosted's
+    /// default (100,000) means a device landing on it is plausibly close to being under it
+    /// again soon. Split into its own `.capReached` case with a SHORTER window
+    /// (`SDKDefaults.deviceRegistrationCapBackoff`, 1h) — this test pins that it is NOT the
+    /// 24h terminal window, and that it gets its own diagnostic code and outcome.
+    func testDeviceCapBacksOffOnAShorterWindowThanATerminalFailure() async {
+        RegistrationStubURLProtocol.setResponder { method, path in
+            if method == "POST", path == SDKEndpoints.deviceRegister {
+                return .status(422, body: "{}")
+            }
+            return .status(200, body: self.configSuccessBody)
+        }
+
+        let fixedNow = Date(timeIntervalSince1970: 1_700_000_000)
+        let client = SheepitClient.createForTesting(
+            config: makeConfig(),
+            now: { fixedNow },
+            urlProtocolClasses: [RegistrationStubURLProtocol.self]
+        )
+        defer { client.destroy() }
+
+        await waitUntil {
+            RegistrationStubURLProtocol.requests(method: "POST", path: SDKEndpoints.deviceRegister).count >= 1
+        }
+        try? await Task.sleep(for: .milliseconds(50))
+
+        XCTAssertNil(
+            UserDefaults(suiteName: suiteName)?.string(forKey: StorageKeys.deviceRegistered),
+            "a capped registration must never be recorded as a success"
+        )
+
+        guard
+            let raw = UserDefaults(suiteName: suiteName)?.string(
+                forKey: StorageKeys.deviceRegistrationBackoffUntil
+            ),
+            let until = TimeInterval(raw)
+        else {
+            XCTFail("a 422 must record a backoff window")
+            return
+        }
+        let remaining = until - fixedNow.timeIntervalSince1970
+        XCTAssertEqual(
+            remaining,
+            SDKDefaults.deviceRegistrationCapBackoff,
+            accuracy: 1,
+            "the window must be the SHORTER cap backoff, not the 24h terminal one"
+        )
+        XCTAssertLessThan(
+            SDKDefaults.deviceRegistrationCapBackoff,
+            SDKDefaults.deviceRegistrationTerminalBackoff,
+            "the cap backoff must be strictly shorter than the terminal one — the whole point of the split"
+        )
+
+        let diagnostic = client.getRecentDiagnostics().first {
+            $0.code == "identity.device_registration_cap_reached"
+        }
+        XCTAssertNotNil(diagnostic, "a 422 gets its own diagnostic code, distinct from a terminal failure")
+    }
+
+    /// A device inside the cap-backoff window must not retry on the next cold start — same
+    /// "don't hammer the endpoint" guarantee `testTerminalFailureDoesNotRetryWithinTheBackoffWindow`
+    /// pins for a terminal failure, over the shorter window.
+    func testDeviceCapDoesNotRetryWithinItsBackoffWindow() async {
+        RegistrationStubURLProtocol.setResponder { method, path in
+            if method == "POST", path == SDKEndpoints.deviceRegister {
+                return .status(422, body: "{}")
+            }
+            return .status(200, body: self.configSuccessBody)
+        }
+
+        let fixedNow = Date(timeIntervalSince1970: 1_700_000_000)
+        let first = SheepitClient.createForTesting(
+            config: makeConfig(),
+            now: { fixedNow },
+            urlProtocolClasses: [RegistrationStubURLProtocol.self]
+        )
+        await waitUntil {
+            RegistrationStubURLProtocol.requests(method: "POST", path: SDKEndpoints.deviceRegister).count >= 1
+        }
+        try? await Task.sleep(for: .milliseconds(50))
+        first.destroy()
+
+        let second = SheepitClient.createForTesting(
+            config: makeConfig(),
+            now: { fixedNow.addingTimeInterval(60) }, // one minute later — inside the 1h window
+            urlProtocolClasses: [RegistrationStubURLProtocol.self]
+        )
+        defer { second.destroy() }
+        try? await Task.sleep(for: .milliseconds(100))
+
+        XCTAssertEqual(
+            RegistrationStubURLProtocol.requests(method: "POST", path: SDKEndpoints.deviceRegister).count,
+            1,
+            "a second launch inside the cap-backoff window must not retry"
+        )
+    }
+
+    // MARK: - 7c. Fix round 2 (PR #1170 review, item 11) — 402, 429, in-session retry, identify
+
+    /// 402 (daily registration cap) must get the SAME `.capReached` classification as 422
+    /// (environment device cap) — both mean "not now, try later," neither is a network error.
+    func test402AlsoMapsToCapReachedWithItsOwnBackoffWindow() async {
+        RegistrationStubURLProtocol.setResponder { method, path in
+            if method == "POST", path == SDKEndpoints.deviceRegister {
+                return .status(402, body: "{}")
+            }
+            return .status(200, body: self.configSuccessBody)
+        }
+
+        let fixedNow = Date(timeIntervalSince1970: 1_700_000_000)
+        let client = SheepitClient.createForTesting(
+            config: makeConfig(),
+            now: { fixedNow },
+            urlProtocolClasses: [RegistrationStubURLProtocol.self]
+        )
+        defer { client.destroy() }
+
+        await waitUntil {
+            RegistrationStubURLProtocol.requests(method: "POST", path: SDKEndpoints.deviceRegister).count >= 1
+        }
+        try? await Task.sleep(for: .milliseconds(50))
+
+        let diagnostic = client.getRecentDiagnostics().first {
+            $0.code == "identity.device_registration_cap_reached"
+        }
+        XCTAssertNotNil(diagnostic, "402 gets the cap-reached diagnostic, same as 422")
+
+        guard
+            let raw = UserDefaults(suiteName: suiteName)?.string(
+                forKey: StorageKeys.deviceRegistrationBackoffUntil
+            ),
+            let until = TimeInterval(raw)
+        else {
+            XCTFail("402, like 422, must record a backoff window")
+            return
+        }
+        XCTAssertEqual(
+            until - fixedNow.timeIntervalSince1970,
+            SDKDefaults.deviceRegistrationCapBackoff,
+            accuracy: 1
+        )
+    }
+
+    /// 429 gets its own `.rateLimited` outcome — fix round 2, item 12: unlike 402/422, it must
+    /// NOT persist the cross-cold-start backoff window (a rate limit is not a durable capacity
+    /// fact the way a device/daily cap is).
+    func test429MapsToRateLimitedAndDoesNotPersistABackoffWindow() async {
+        RegistrationStubURLProtocol.setResponder { method, path in
+            if method == "POST", path == SDKEndpoints.deviceRegister {
+                return .status(429, body: "{}")
+            }
+            return .status(200, body: self.configSuccessBody)
+        }
+
+        let client = SheepitClient.createForTesting(
+            config: makeConfig(),
+            now: { Date() },
+            urlProtocolClasses: [RegistrationStubURLProtocol.self]
+        )
+        defer { client.destroy() }
+
+        await waitUntil {
+            RegistrationStubURLProtocol.requests(method: "POST", path: SDKEndpoints.deviceRegister).count >= 1
+        }
+        try? await Task.sleep(for: .milliseconds(50))
+
+        let diagnostic = client.getRecentDiagnostics().first {
+            $0.code == "identity.device_registration_cap_reached" &&
+                ($0.data?["outcome"]?.value as? String) == "rate_limited"
+        }
+        XCTAssertNotNil(diagnostic, "429 gets its own outcome value, distinct from a 402/422")
+
+        XCTAssertNil(
+            UserDefaults(suiteName: suiteName)?.string(forKey: StorageKeys.deviceRegistrationBackoffUntil),
+            "a 429 must NOT persist the cross-cold-start backoff window — only 402/422 do"
+        )
+    }
+
+    /// The in-session retry chain actually reaches success after a transient cap failure —
+    /// not just "records a backoff and stops," which item 15/16's own tests above pin, but the
+    /// forward-looking half: does it ever come back?
+    func testInSessionRetryChainEventuallySucceedsAfterOneCapFailure() async {
+        // `startLoading()` invokes the responder WHILE HOLDING `RegistrationStubURLProtocol`'s
+        // own lock, so calling back into `requests(...)` from inside a responder would
+        // deadlock (a non-recursive `NSLock` re-locked on the same thread) — hence this
+        // dedicated, separately-locked counter instead of either a plain captured `var`
+        // (a Sendable-closure mutation error under `-warnings-as-errors`) or `requests(...)`.
+        let attempts = LockedCounter()
+        RegistrationStubURLProtocol.setResponder { method, path in
+            if method == "POST", path == SDKEndpoints.deviceRegister {
+                if attempts.incrementAndGet() == 1 { return .status(422, body: "{}") }
+                return .status(200, body: self.registerSuccessBody(deviceId: "dev_after_cap_retry"))
+            }
+            return .status(200, body: self.configSuccessBody)
+        }
+
+        let client = SheepitClient.createForTesting(
+            config: makeConfig(),
+            now: { Date() },
+            urlProtocolClasses: [RegistrationStubURLProtocol.self]
+        )
+        defer { client.destroy() }
+
+        // The first (failing) attempt is real-time-bounded at ~1s by
+        // `RegistrationRetryPolicy` at failures=0 — see `RegistrationRetryPolicyTests`. Poll
+        // well past that, but nowhere near the 1h ceiling this chain would otherwise use.
+        await waitUntil(timeout: 3.0) {
+            RegistrationStubURLProtocol.requests(method: "POST", path: SDKEndpoints.deviceRegister).count >= 2
+        }
+        await waitUntil(timeout: 1.0) {
+            UserDefaults(suiteName: self.suiteName)?.string(forKey: StorageKeys.deviceRegistered) == "1"
+        }
+        XCTAssertEqual(client.status().deviceId, "dev_after_cap_retry")
+        XCTAssertNil(
+            UserDefaults(suiteName: suiteName)?.string(forKey: StorageKeys.deviceRegistrationBackoffUntil),
+            "a chain that eventually succeeds must clear whatever backoff the failed attempt recorded"
+        )
+    }
+
+    /// Fix round 2, item 10's whole point: `destroy()` mid-chain must actually stop it — a
+    /// server that keeps rejecting forever must not keep this client retrying forever in the
+    /// background after teardown.
+    func testInSessionRetryChainStopsOnTeardown() async {
+        RegistrationStubURLProtocol.setResponder { method, path in
+            if method == "POST", path == SDKEndpoints.deviceRegister {
+                return .status(422, body: "{}") // never succeeds
+            }
+            return .status(200, body: self.configSuccessBody)
+        }
+
+        let client = SheepitClient.createForTesting(
+            config: makeConfig(),
+            now: { Date() },
+            urlProtocolClasses: [RegistrationStubURLProtocol.self]
+        )
+
+        await waitUntil {
+            RegistrationStubURLProtocol.requests(method: "POST", path: SDKEndpoints.deviceRegister).count >= 1
+        }
+        try? await Task.sleep(for: .milliseconds(50))
+        let countAtTeardown = RegistrationStubURLProtocol.requests(
+            method: "POST",
+            path: SDKEndpoints.deviceRegister
+        ).count
+
+        client.destroy()
+
+        // The would-be next attempt (~1s away at failures=0) must never fire — give it well
+        // over a second to prove absence, not just a race it happened to win.
+        try? await Task.sleep(for: .milliseconds(1_500))
+        XCTAssertEqual(
+            RegistrationStubURLProtocol.requests(method: "POST", path: SDKEndpoints.deviceRegister).count,
+            countAtTeardown,
+            "destroy() must stop the in-session retry chain, not just the task it happened to hold at the time"
+        )
+    }
+
+    /// Fix round 2, item 11: `identify()` must not wait for the WHOLE retry chain to settle —
+    /// only the registrationGate's FIRST attempt, exactly like the auto-flush guarantee
+    /// `testATransientRegistrationFailureStillUnblocksTheAutoFlush` pins for the flush path.
+    func testIdentifyIsNotBlockedByTheInSessionRetryChain() async {
+        RegistrationStubURLProtocol.setResponder { method, path in
+            if method == "POST", path == SDKEndpoints.deviceRegister {
+                return .status(422, body: "{}") // never succeeds within this test's window
+            }
+            if method == "POST", path.contains("/identify") {
+                return .status(200, body: "{}")
+            }
+            return .status(200, body: self.configSuccessBody)
+        }
+
+        let client = SheepitClient.createForTesting(
+            config: makeConfig(),
+            now: { Date() },
+            urlProtocolClasses: [RegistrationStubURLProtocol.self]
+        )
+        defer { client.destroy() }
+
+        await waitUntil {
+            RegistrationStubURLProtocol.requests(method: "POST", path: SDKEndpoints.deviceRegister).count >= 1
+        }
+        try? await Task.sleep(for: .milliseconds(50)) // let the first (failing) attempt process
+
+        client.identify(userId: "user-cap-wait")
+
+        // identify()'s POST waits on `registrationGate`, which settles right after the FIRST
+        // (failing) attempt — well under the ~1s+ this chain would need before even its
+        // SECOND attempt, let alone the 1h ceiling.
+        await waitUntil(timeout: 2.0) {
+            RegistrationStubURLProtocol.requests(method: "POST", pathContains: "/identify").count >= 1
+        }
+        XCTAssertGreaterThanOrEqual(
+            RegistrationStubURLProtocol.requests(method: "POST", pathContains: "/identify").count,
+            1,
+            "identify() must proceed once the FIRST registration attempt settles, not wait for the chain"
         )
     }
 
@@ -954,6 +1261,14 @@ final class RegistrationStubURLProtocol: URLProtocol, @unchecked Sendable {
         return recorded.filter { $0.method == method && $0.path == path }
     }
 
+    /// Fix round 2 (PR #1170 review, item 11): the identify path carries a dynamic device id
+    /// (`/v1/devices/:deviceId/identify`) a test may not know ahead of time — e.g. the
+    /// locally-minted placeholder `identify()` targets while registration is still retrying.
+    static func requests(method: String, pathContains substring: String) -> [RecordedRequest] {
+        lock.lock(); defer { lock.unlock() }
+        return recorded.filter { $0.method == method && $0.path.contains(substring) }
+    }
+
     static func reset() {
         lock.lock()
         responder = nil
@@ -1033,4 +1348,19 @@ final class RegistrationStubURLProtocol: URLProtocol, @unchecked Sendable {
     }
 
     override func stopLoading() {}
+}
+
+/// A trivially-locked counter for a `@Sendable` responder closure that needs to count its own
+/// invocations — mutating a captured `var` directly is a Sendable-closure-capture error under
+/// `-warnings-as-errors` (`check.sh`'s gate). Fix round 2 (PR #1170 review, item 11).
+final class LockedCounter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value = 0
+
+    @discardableResult
+    func incrementAndGet() -> Int {
+        lock.lock(); defer { lock.unlock() }
+        value += 1
+        return value
+    }
 }

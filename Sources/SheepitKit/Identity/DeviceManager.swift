@@ -7,16 +7,29 @@ import Foundation
 /// behaviour), the latter must stop hammering the endpoint and tell someone.
 enum RegistrationOutcome: Sendable {
     case success(deviceId: String)
-    /// Network error, 5xx, 429, or a 400 without the API's `VALIDATION_ERROR` envelope — the
-    /// next launch's `start()` should retry
-    /// unconditionally, exactly as before this type existed.
+    /// Network error, 5xx, or a 400 without the API's `VALIDATION_ERROR` envelope — retried
+    /// with a short (≤60s, no jitter) backoff, unchanged by this PR.
     case transientFailure
-    /// 400 `VALIDATION_ERROR`/401/403/422 — a body the API rejects, a revoked/rejected API key, or a device-cap
-    /// ceiling. Retrying on EVERY cold start cannot fix any of these; only a human action can
-    /// (ship a corrected build, rotate the key, or free up capacity). The caller backs this
-    /// off rather than retrying every launch, but must NOT treat it as permanent success
-    /// either — see `SheepitClient.start()`'s backoff-window doc for why.
+    /// 400 `VALIDATION_ERROR`/401/403 — a body the API rejects or a revoked/rejected API key.
+    /// Retrying on EVERY cold start cannot fix any of these; only a human action can (ship a
+    /// corrected build or rotate the key). The caller backs this off rather than retrying
+    /// every launch, but must NOT treat it as permanent success either — see
+    /// `SheepitClient.start()`'s backoff-window doc for why.
     case terminalFailure(RegistrationRejection)
+    /// 402 (hosted daily registration cap) or 422 (environment `MAX_DEVICES_PER_ENVIRONMENT`
+    /// ceiling). Split out from `terminalFailure` 2026-09-29 (client-trust hardening): unlike
+    /// a revoked key, this device did nothing wrong — a daily cap resets at UTC midnight, and
+    /// the environment ceiling is operator-raisable. Fix round 1 (PR #1170 review): 402 joined
+    /// 422 here (was falling into `transientFailure`, retried every ≤60s with no jitter — fine
+    /// for a network hiccup, wrong for a cap that only clears at midnight). Backs off up to an
+    /// HOUR with full jitter (`RegistrationRetryPolicy`), never `SDKDefaults.
+    /// deviceRegistrationTerminalBackoff`'s 24h.
+    case capReached(RegistrationRejection)
+    /// 429 — rate limited. Fix round 1 (PR #1170 review): used to fall into `transientFailure`
+    /// (retried every ≤60s with no jitter, ignoring the server's own `Retry-After`). Backs off
+    /// like `capReached`, but `retryAfter` (parsed by `HTTPClient`, RFC 7231 §7.1.3) dominates
+    /// the jittered value when the server asked for longer.
+    case rateLimited(retryAfter: TimeInterval?)
 }
 
 /// Why the API refused a registration, for diagnostics. Carries the error code and the names of
@@ -70,11 +83,16 @@ actor DeviceManager {
     private let http: HTTPClient
     private let log: Logger
 
-    /// 401 (revoked/invalid key), 403 (forbidden), 422 (device-cap reached) — the statuses
-    /// `HTTPClient` throws as `.httpError` that no amount of retrying will ever turn into
-    /// success. A 400 is terminal too but arrives as `.badRequest` (its own catch below).
-    /// Every other 4xx/5xx/network error is `transientFailure`.
-    private static let terminalStatusCodes: Set<Int> = [401, 403, 422]
+    /// 401 (revoked/invalid key), 403 (forbidden) — the statuses `HTTPClient` throws as
+    /// `.httpError` that no amount of retrying will ever turn into success. A 400 is terminal
+    /// too but arrives as `.badRequest` (its own catch below). 402/422 (cap reached) and 429
+    /// (rate limited) are their OWN cases (caught separately below) — not in this set — since
+    /// 2026-09-29 (client-trust hardening): every other 4xx/5xx/network error is
+    /// `transientFailure`.
+    private static let terminalStatusCodes: Set<Int> = [401, 403]
+    /// The hosted daily cap (402) and the environment device-cap (422) — split from
+    /// `terminalStatusCodes` above. Fix round 1 (PR #1170 review): 402 joined 422 here.
+    private static let capStatusCodes: Set<Int> = [402, 422]
 
     init(http: HTTPClient, log: Logger) {
         self.http = http
@@ -114,6 +132,12 @@ actor DeviceManager {
                     (rejection.rejectedFields.isEmpty ? "none named" : rejection.rejectedFields.joined(separator: ", "))
             )
             return .terminalFailure(rejection)
+        } catch SDKError.rateLimited(let retryAfter) {
+            log.warn("Device registration rate limited (429) — backing off, honoring Retry-After")
+            return .rateLimited(retryAfter: retryAfter)
+        } catch SDKError.httpError(let statusCode) where Self.capStatusCodes.contains(statusCode) {
+            log.warn("Device registration rejected (\(statusCode), cap reached) — backing off, not every launch")
+            return .capReached(RegistrationRejection(statusCode: statusCode))
         } catch SDKError.httpError(let statusCode) where Self.terminalStatusCodes.contains(statusCode) {
             log.warn("Device registration permanently rejected (\(statusCode)) — will not retry every launch")
             return .terminalFailure(RegistrationRejection(statusCode: statusCode))
@@ -152,19 +176,20 @@ actor DeviceManager {
     ///
     /// Success is the status alone, not a decoded body: the caller only needs to know the device
     /// row now names this user, and a response-shape drift must not make a stored identity look
-    /// unconfirmed forever. Re-posting the SAME user is safe: the route's same-user path merges
-    /// attributes only, creating no merge record and consuming no merge rate limit.
+    /// unconfirmed forever. Re-posting the SAME user is safe: the route's same-user path writes
+    /// no merge record and consumes no merge rate limit.
+    ///
+    /// 🔴 Never sends `attributes`. The SDK used to forward `identify()` traits into
+    /// `device_assignments.attributes`, which GDPR erase did not clear — see D-SDK4.
     ///
     /// - Parameter sendIf: checked before every HTTP attempt, retries included (`HTTPClient.postRaw`).
     @discardableResult
     func identify(
         deviceId: String,
         userId: String,
-        attributes: [String: Any]? = nil,
         sendIf: (@Sendable () -> Bool)? = nil
     ) async -> IdentifyOutcome {
-        let attrMap: [String: AnyCodable]? = attributes?.mapValues { AnyCodable($0) }
-        let request = DeviceIdentifyRequest(userId: userId, attributes: attrMap)
+        let request = DeviceIdentifyRequest(userId: userId, attributes: nil)
 
         do {
             _ = try await http.postRaw(
@@ -204,7 +229,7 @@ enum IdentifyOutcome: Sendable, Equatable {
     /// Network error, lost response, 5xx, 408 or 429. The row may or may not hold the user, and
     /// sending the same request later can succeed.
     case failed
-    /// Any other 4xx (400 invalid body or attributes, 401/403 key, 404 unknown device). Sending
+    /// Any other 4xx (400 invalid body, 401/403 key, 404 unknown device). Sending
     /// the same request again gets the same answer.
     case rejected(statusCode: Int)
     /// The caller's `sendIf` stopped an attempt. An EARLIER attempt may have been sent (a 5xx or

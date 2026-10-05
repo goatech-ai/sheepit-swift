@@ -176,6 +176,58 @@ final class DeviceRotation: @unchecked Sendable {
                     ]) { _, new in new }
                 )
                 return
+            case .capReached(let rejection):
+                // Fix round 1 (PR #1170 review), item 15: unlike `.terminalFailure`, this
+                // does NOT give up — it keeps retrying, just on the LONGER, jittered,
+                // `RegistrationRetryPolicy` schedule (up to 1h) instead of the ≤60s transient
+                // one, since a cap/rate-limit condition is not this device's fault and can
+                // clear on its own. `RegistrationBackoff` is still written on every occurrence
+                // (harmless to repeat) so a kill-and-relaunch mid-wait doesn't hammer either.
+                failures += 1
+                RegistrationBackoff.record(
+                    storage: deps.storage,
+                    now: deps.now(),
+                    duration: SDKDefaults.deviceRegistrationCapBackoff
+                )
+                let delay = RegistrationRetryPolicy.delay(afterFailures: failures - 1, retryAfter: nil)
+                deps.diagnostics.emit(
+                    .warn,
+                    .identity,
+                    code: "identity.device_rotation_failed",
+                    message: "Registering the fresh device was rejected (\(rejection.statusCode), cap reached) — retrying with backoff",
+                    data: rejection.diagnosticData.merging([
+                        "attempt": AnyCodable(failures),
+                        "outcome": AnyCodable("device_cap_reached"),
+                        "retry_in_ms": AnyCodable(Int(delay / .milliseconds(1))),
+                    ]) { _, new in new }
+                )
+                try? await Task.sleep(for: delay)
+            case .rateLimited(let retryAfter):
+                // Same shape as `.capReached` above, but the delay honors the server's own
+                // `Retry-After` when it asks for longer than the jittered exponential value.
+                //
+                // Fix round 2 (PR #1170 review), item 12: unlike `.capReached`, this does NOT
+                // call `RegistrationBackoff.record` — a 429 is the network/gateway telling this
+                // client to slow down, not a durable capacity fact about the environment the
+                // way a 402/422 is. Persisting the 1h cap window here would gate the NEXT cold
+                // start and `retryIdentityIfUnknown()` on a condition that may already have
+                // cleared by the time either runs. The in-session retry loop above already
+                // paces itself with `RegistrationRetryPolicy`; nothing durable needs to survive
+                // a reload for this outcome, same as `.transientFailure`.
+                failures += 1
+                let delay = RegistrationRetryPolicy.delay(afterFailures: failures - 1, retryAfter: retryAfter)
+                deps.diagnostics.emit(
+                    .warn,
+                    .identity,
+                    code: "identity.device_rotation_failed",
+                    message: "Registering the fresh device was rate limited (429) — retrying with backoff",
+                    data: [
+                        "attempt": AnyCodable(failures),
+                        "outcome": AnyCodable("rate_limited"),
+                        "retry_in_ms": AnyCodable(Int(delay / .milliseconds(1))),
+                    ]
+                )
+                try? await Task.sleep(for: delay)
             }
         }
     }

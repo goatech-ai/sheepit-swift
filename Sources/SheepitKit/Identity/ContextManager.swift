@@ -3,8 +3,8 @@ import Foundation
 /// Manages device, session, anonymous, and user identity state.
 /// Mirrors packages/sdk-js/src/context.ts
 ///
-/// Lock-guarded: `identify()` writes `userId` / `userTraits` while every
-/// `track()` reads the whole set through `eventContext()`, and
+/// Lock-guarded: `identify()` writes `userId` while every
+/// `track()` reads the event set through `eventContext()`, and
 /// `touchSession()` mutates session state on the caller's thread.
 /// ThreadSanitizer reports the unguarded version as a `Swift access
 /// race`. `eventContext()` takes the lock once so the snapshot it returns
@@ -28,7 +28,6 @@ final class ContextManager: @unchecked Sendable {
     /// Bumped by every `setServerHeldUser`. A config fetch compares the epoch at its start with
     /// the epoch when its response lands; any change in between invalidates its label.
     private var _serverHeldEpoch: UInt64 = 0
-    private var _userTraits: [String: Any] = [:]
     private var sessionLastSeen: Date
 
     /// True when `init` minted `_deviceId` fresh because storage held nothing for
@@ -91,12 +90,6 @@ final class ContextManager: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         return _userId
-    }
-
-    var userTraits: [String: Any] {
-        lock.lock()
-        defer { lock.unlock() }
-        return _userTraits
     }
 
     /// - Parameter now: injected clock so session-rollover tests do not have to wait out the
@@ -320,14 +313,6 @@ final class ContextManager: @unchecked Sendable {
         }
     }
 
-    func updateUserTraits(_ traits: [String: Any]) {
-        lock.lock()
-        defer { lock.unlock() }
-        for (key, value) in traits {
-            _userTraits[key] = value
-        }
-    }
-
     func resetIdentity() {
         lock.lock()
         defer { lock.unlock() }
@@ -335,7 +320,6 @@ final class ContextManager: @unchecked Sendable {
         // The server-held label is not touched here: logout does not change the device row. When
         // that row may hold a user, `SheepitClient.reset()` switches to a fresh device
         // (`DeviceRotation`), which sets the label for the new row.
-        _userTraits = [:]
         _anonymousId = UUID().uuidString
         _sessionId = UUID().uuidString
         sessionLastSeen = now()

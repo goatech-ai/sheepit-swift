@@ -81,6 +81,13 @@ final class StubURLProtocol: URLProtocol, @unchecked Sendable {
     /// The most recently seen request's headers — lets a test assert what `HTTPClient`
     /// actually sent (e.g. that `Authorization` was trimmed) without a real network hop.
     nonisolated(unsafe) private static var _lastRequestHeaders: [String: String]?
+    /// The most recently seen request's full URL — lets a test assert how `HTTPClient` joined
+    /// `config.apiUrl` and an endpoint path (e.g. a proxy base with its own path segment).
+    nonisolated(unsafe) private static var _lastRequestURL: URL?
+    /// Every request body seen since `reset()`, in order.
+    nonisolated(unsafe) private static var _requestBodies: [Data] = []
+    /// Every request path seen since `reset()`, in order.
+    nonisolated(unsafe) private static var _requestPaths: [String] = []
 
     static var stub: Stub {
         get { lock.lock(); defer { lock.unlock() }; return _stub }
@@ -95,11 +102,26 @@ final class StubURLProtocol: URLProtocol, @unchecked Sendable {
         lock.lock(); defer { lock.unlock() }; return _lastRequestHeaders
     }
 
+    static var lastRequestURL: URL? {
+        lock.lock(); defer { lock.unlock() }; return _lastRequestURL
+    }
+
+    static var requestPaths: [String] {
+        lock.lock(); defer { lock.unlock() }; return _requestPaths
+    }
+
+    static var requestBodies: [Data] {
+        lock.lock(); defer { lock.unlock() }; return _requestBodies
+    }
+
     static func reset() {
         lock.lock()
         _stub = .status(200, body: "{}")
         _requestCount = 0
         _lastRequestHeaders = nil
+        _lastRequestURL = nil
+        _requestBodies = []
+        _requestPaths = []
         lock.unlock()
     }
 
@@ -110,9 +132,23 @@ final class StubURLProtocol: URLProtocol, @unchecked Sendable {
     override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
 
     override func startLoading() {
+        var body = request.httpBody ?? Data()
+        if body.isEmpty, let stream = request.httpBodyStream {
+            stream.open()
+            defer { stream.close() }
+            var buffer = [UInt8](repeating: 0, count: 4096)
+            while stream.hasBytesAvailable {
+                let count = stream.read(&buffer, maxLength: buffer.count)
+                if count <= 0 { break }
+                body.append(buffer, count: count)
+            }
+        }
         StubURLProtocol.lock.lock()
+        StubURLProtocol._requestBodies.append(body)
+        StubURLProtocol._requestPaths.append(request.url?.path ?? "")
         StubURLProtocol._requestCount += 1
         StubURLProtocol._lastRequestHeaders = request.allHTTPHeaderFields
+        StubURLProtocol._lastRequestURL = request.url
         let stub = StubURLProtocol._stub
         StubURLProtocol.lock.unlock()
 

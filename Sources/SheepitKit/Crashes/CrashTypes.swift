@@ -81,6 +81,10 @@ struct CrashReportPayload: Encodable, Sendable {
     /// still accept the payload during phased rollout.
     let binaryImages: [CrashBinaryImage]?
     let timestamp: String
+    /// Stable per-report id (`PendingCrashStore.Entry.id`), identical on every retry, so the
+    /// server can recognise a re-send. `crashReportIngestSchema` is a non-strict `z.object`:
+    /// an API that does not know the field strips it rather than answering 400.
+    var reportId: String? = nil
 
     enum CodingKeys: String, CodingKey {
         case platform
@@ -107,6 +111,7 @@ struct CrashReportPayload: Encodable, Sendable {
         case networkType = "network_type"
         case binaryImages = "binary_images"
         case timestamp
+        case reportId = "report_id"
     }
 }
 

@@ -80,6 +80,28 @@ public struct SheepitConfig: Sendable {
     /// and do not persist to disk, and `getOverrides()` reads as empty.
     public var allowFlagOverrides: Bool?
 
+    /// Hosts whose failed requests `recordRequest(method:url:status:durationMs:responseBytes:error:)`
+    /// may record as `$http_error`. Empty (the default) records nothing — the feature is opt-in.
+    /// Each entry is a bare host name (`api.example.com`), matched exactly and case-insensitively,
+    /// or `*.example.com` for every subdomain of `example.com` (not `example.com` itself; a
+    /// single-label `*.com` or `*.localhost` is refused — list the exact host). An entry with a
+    /// scheme, port or path is ignored, with a `request_telemetry.invalid_host` diagnostic. The SDK's own `apiUrl` is never recorded, even
+    /// when listed here — with no path in `apiUrl`, that is its whole host
+    /// (`request_telemetry.api_host_excluded`). Read once, when the client is created.
+    public var requestTelemetryHosts: [String]
+
+    /// What `init(bundle:)` could not use from Info.plist. Internal: `SheepitClient`'s admission
+    /// gate turns an active one into an inert client with this message. See
+    /// `SheepitConfig+InfoPlist.swift`.
+    var infoPlistIssues: [InfoPlistIssue] = []
+
+    /// Set by `init(bundle:)` when `SheepitAPIURL` is absent and `apiUrl` fell to the hosted
+    /// default; a started client logs which host that is. See `activeInfoPlistNotice`.
+    var apiURLDefaultedFromInfoPlist = false
+
+    /// Non-fatal Info.plist problems a started client logs. See `activeInfoPlistWarnings`.
+    var infoPlistWarnings: [String] = []
+
     public init(
         apiKey: String,
         environment: String = "production",
@@ -97,7 +119,8 @@ public struct SheepitConfig: Sendable {
         appVersion: String? = nil,
         onDiagnostic: DiagnosticListener? = nil,
         diagnosticBufferSize: Int = DiagnosticBus.defaultBufferSize,
-        allowFlagOverrides: Bool? = nil
+        allowFlagOverrides: Bool? = nil,
+        requestTelemetryHosts: [String] = []
     ) {
         self.apiKey = apiKey
         self.environment = environment
@@ -116,6 +139,7 @@ public struct SheepitConfig: Sendable {
         self.onDiagnostic = onDiagnostic
         self.diagnosticBufferSize = diagnosticBufferSize
         self.allowFlagOverrides = allowFlagOverrides
+        self.requestTelemetryHosts = requestTelemetryHosts
     }
 }
 
@@ -334,7 +358,7 @@ enum SDKDefaults {
     /// `publish-sdk-swift.yml` refuses to release on a mismatch. The package
     /// is deliberately on `0.x` while the API settles, and `2.0.0` is reserved
     /// for the first stable release — see the CHANGELOG's "Version policy".
-    static let sdkVersion = "0.6.0"
+    static let sdkVersion = "0.7.0"
     /// Stamped on every ingest batch (`context.sdk.name`) so the dashboard can filter /
     /// triage by which SDK sent a given event. Follows the monorepo directory-name
     /// convention (`sdk-js`, `sdk-server`, `sdk-swift`) and is pinned by
@@ -368,6 +392,9 @@ enum SDKDefaults {
     static let configMaxAge: TimeInterval = 24 * 60 * 60
     static let offlineQueueMax = 500
     static let eventNameMaxLength = 200
+    /// `screen(_:)`'s name cap: the crash context's `screen_name[256]` C buffer less its NUL
+    /// terminator. Also inside the crash endpoint's `screen_name` max(256).
+    static let screenNameMaxUTF8Bytes = 255
     /// `ingestContextSchema.app.version` / `.build` — UTF-16 units, as zod counts them.
     static let appVersionMaxLength = 64
     /// `ingestContextSchema.user.id` and `deviceIdentifySchema.user_id`, UTF-16 units.
@@ -379,13 +406,43 @@ enum SDKDefaults {
         let exponent = Double(min(max(failures, 1), 10) - 1)
         return min(300, 5 * pow(2, exponent))
     }
-    /// How long `start()` withholds a RETRY after a terminal (401/403/422) registration
+    /// How long `start()` withholds a RETRY after a terminal (401/403) registration
     /// failure, before treating the device as eligible to try again. Matches
     /// `configMaxAge`'s once-a-day cadence — long enough that a permanently revoked key
     /// does not hammer the endpoint on every cold start, short enough that a fix shipped
-    /// in a later build (or capacity freed server-side) is picked up within a day rather
-    /// than never.
+    /// in a later build is picked up within a day rather than never.
     static let deviceRegistrationTerminalBackoff: TimeInterval = 24 * 60 * 60
+    /// How long `start()` withholds a retry after a 422 (`RegistrationOutcome.capReached` —
+    /// the environment's `MAX_DEVICES_PER_ENVIRONMENT` ceiling), before trying again.
+    /// Client-trust hardening (2026-09-29): deliberately SHORTER than
+    /// `deviceRegistrationTerminalBackoff` — unlike a revoked key, this device did nothing
+    /// wrong, the ceiling is an environment-wide number an operator can raise at any time, and
+    /// hosted's default (100,000/environment) is high enough that a device landing on it is
+    /// plausibly close to being under it again soon. A whole day is an excessive wait for
+    /// something that isn't this device's fault.
+    static let deviceRegistrationCapBackoff: TimeInterval = 60 * 60
+    /// How many COUNTED upload attempts a queued crash report gets before it is dropped — at
+    /// most one per launch. Only a 5xx counts (`CrashReporter.spendsAttempt`): offline,
+    /// timeouts, 401/402/403/404 and 429 do not. So this bound is for a report the server keeps
+    /// failing on — and for a poison report that crashes the app while being read or sent,
+    /// which is counted before either.
+    static let crashUploadMaxAttempts = 5
+    /// How long a queued crash report stays eligible, from the launch that first found it. The
+    /// ONLY per-report bound on failures that do not count as attempts (offline, 401/403/404,
+    /// 402 daily cap, 429): a capped report is re-sent after the UTC-midnight reset, a device
+    /// offline over a long weekend still reports, and a misconfigured proxy has a week to be
+    /// fixed. Past a week the crash is stale for release-health purposes.
+    static let crashUploadMaxAge: TimeInterval = 7 * 24 * 60 * 60
+    /// Most crash reports queued on disk at once (~320 KB each). Enforced when a new crash is
+    /// adopted, by dropping the oldest (`dropped_queue_full`); not by the attempt count, since
+    /// uncounted failures let reports accumulate.
+    static let crashPendingMaxReports = 5
+    /// No crash this SDK queues can predate this (2026-01-01 UTC, before 0.7.0 existed). A clock
+    /// reading earlier is wrong — typically a boot before NTP settles, reading the epoch — and
+    /// age is not judged against it.
+    static let crashClockFloor = Date(timeIntervalSince1970: 1_767_225_600)
+    /// How far past `now` a first-seen time may be before it is treated as a skewed clock.
+    static let crashClockFutureTolerance: TimeInterval = 24 * 60 * 60
 }
 
 /// Persistence keys. `gt_*` since the LaunchPad → GoaTech rename, matching

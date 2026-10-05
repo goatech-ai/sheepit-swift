@@ -23,12 +23,16 @@ final class ConfigResetRaceTests: XCTestCase {
         super.setUp()
         Self.clearConfigStorage()
         AttributionCaptureProtocol.reset()
+        TeardownFlushes.install()
     }
 
-    override func tearDown() {
+    /// Awaits every destroyed client's fire-and-forget final flush before the shared stub and
+    /// storage are reset, so it cannot land in the next test (`TeardownFlushes`).
+    override func tearDown() async throws {
+        await TeardownFlushes.drain(context: name)
         Self.clearConfigStorage()
         AttributionCaptureProtocol.reset()
-        super.tearDown()
+        try await super.tearDown()
     }
 
     private func waitUntil(timeout: TimeInterval = 5, _ condition: () -> Bool) async -> Bool {

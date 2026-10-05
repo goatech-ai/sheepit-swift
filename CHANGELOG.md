@@ -27,6 +27,240 @@ package uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 > resolves `>=1.0.0 <2.0.0`, so **a consumer pinned to `1.0.x` will never
 > receive a `0.x` release.** They are frozen until they re-pin to `0.x`.
 
+## [Unreleased]
+
+## [0.7.0] - 2026-10-05
+
+### Added
+
+- **`recordRequest(method:url:status:durationMs:responseBytes:error:)`** — reports a FAILED
+  first-party HTTP request as a `$http_error` event, the event the web SDK's
+  `autoCaptureHttpErrors` already sends. Records only a status of 400 or above, or `status: nil`
+  (no response; pass the reason as `error` — a status of `0` or below means the same) — a success
+  is a cheap no-op — and only for hosts
+  listed in the new **`SheepitConfig.requestTelemetryHosts`** (default empty, so it is opt-in;
+  exact host, case-insensitive, or `*.example.com` for subdomains — a single-label `*.com` is
+  refused; unusable entries are reported once as `request_telemetry.invalid_host`). The SDK's own
+  `apiUrl` is never recorded, even when listed — with no path in `apiUrl` that is its whole host,
+  reported once as `request_telemetry.api_host_excluded` (serve the SDK under a path such as
+  `/_sheepit` to avoid it). Sends `url` (scheme, host, non-default port and path — never the query, fragment or
+  userinfo), `host`, `path`, `method`, `status` (`0` for a network failure, as on the web),
+  `latency_ms`, `kind` (`http_error` | `network_failure`), `origin: "app"`, `response_bytes`, and
+  for an error `error_name`, `error_message` (built as `captureError`'s `error_description`, never
+  from `localizedDescription` directly), `error_domain`, `error_code` and `aborted`. Never headers or
+  bodies; **the path is sent verbatim**, so keep secrets out of paths. The same method + host + path +
+  status is sent at most once per 60 s (`suppressed_count`), and at most 30 per rolling 60 s
+  (`dropped_count`), on a limiter separate from `captureError`'s. Adds an `http` breadcrumb. A
+  call from inside `onEvent` during another `recordRequest` on the same thread is dropped
+  (`request_telemetry.reentrant_dropped`). See "Network request failures" in the README.
+- **`SheepitConfig(bundle:)`** — builds the configuration from a bundle's Info.plist
+  (`SheepitAPIKey` required; `SheepitAPIURL` and `SheepitEnvironment` optional), so the key and
+  URL can come from per-configuration `.xcconfig` files. `SheepitAPIURL` accepts a bare host
+  (`sheepit.example.com/_sheepit`; `https://` is prepended), because an xcconfig reads `//` as a
+  comment; a full URL is used as written. A URL cut off at `//` (`https:`) is reported as exactly
+  that. A key that is missing, empty or an unexpanded `$(…)` produces an inert client whose
+  `status().rejectionReason` names the key and the fix; it never crashes the app. An empty or
+  unexpanded `SheepitAPIURL` does **not** fall back to the hosted API — only an absent key does.
+  A key name that differs only in case, whitespace or punctuation (`SheepitAPIUrl`,
+  `SHEEPIT_API_URL`) with the exact name missing is a misconfiguration for `SheepitAPIKey` and
+  `SheepitAPIURL`, and a warning (`config.info_plist_warning`, environment stays `"production"`)
+  for `SheepitEnvironment`. One pair of surrounding quotes is stripped from each value. The
+  Info.plist problem is also printed to the Xcode console as an unredacted `[Sheepit]` warning; no
+  Info.plist message repeats a configured value. When `SheepitAPIURL` is absent, the
+  started client logs the hosted host it uses and emits a `config.hosted_default_api_url` info
+  diagnostic. App extensions read their own bundle and need their own keys. See "Configure with
+  xcconfig" in the README.
+- **`screen(_:properties:)`** — tracks a `$screen` event whose `screen` property is the name you
+  pass (plus your `properties`), and sets the crash context's screen in the same call, so a crash
+  report names the screen the user was on. Call it from your own navigation code; nothing is
+  tracked automatically. The name is trimmed and capped at 255 UTF-8 bytes on a character
+  boundary; a `screen` key in `properties` is overwritten; an empty name is dropped with a
+  `transport.invalid_screen_name` diagnostic — including a name that is empty only after the
+  cap (one character wider than 255 bytes). U+0000 is removed, so the event and the crash
+  context always agree. `setScreen(_:)` still sends no event; it now applies the same
+  normalization, so it no longer cuts a multi-byte character in half. See "Screens" in the
+  README.
+- **`captureError(_:error:attributes:)`** — reports a handled (non-fatal) error as a `$error`
+  event with `origin: "app"` and `type: "handled"`, through the same path as `track()`, so it
+  carries the same session, device, user, app version and experiment assignments — the platform
+  and OS too, in the event context (there is no `platform` property, so a `platform` attribute
+  passes through as given). Sends `message`, and with an `error:` also `error_type` (module-qualified), `error_description`,
+  `error_domain` and `error_code`. `error_description` for an `NSError` (and `URLError`,
+  `CocoaError`, `POSIXError`, …) is `"<domain> <code>: <text>"`. With a non-empty `userInfo`
+  Foundation is never asked — the text is the `userInfo` description or failure-reason value only
+  when it is a string — since a self-containing value, a non-string value or a non-string key
+  there can crash the app. With an empty one, a POSIX error's text is `strerror_r`'s; any other
+  error gets Foundation's `localizedDescription` only when its class overrides neither
+  `localizedDescription` nor `localizedFailureReason` AND its domain is `NSCocoaErrorDomain` or has
+  no `userInfoValueProvider` registered (a provider runs inside `localizedDescription` and can
+  crash the app; Foundation refuses a replacement provider only on `NSCocoaErrorDomain`, measured
+  on macOS), else no text — so `NSOSStatusErrorDomain` and `NSMachErrorDomain` errors, where
+  Foundation registers its own provider, report only `"<domain> <code>"`. `userInfo` is read only through CoreFoundation and never printed. An
+  `NSObject`-rooted error class always reports its type name (its `description` is never
+  called). For a Swift
+  error it is the error's own `description` when its type has one (used verbatim), and otherwise Swift's default shape (`declined(code: 51)`) from a
+  bounded walk that never describes a class instance or Foundation collection. Your `attributes`
+  go under their own keys; one that collides with a reserved key is stored as `attr_<key>`. Every
+  string is cut to 500 characters and 2 KB, keys to 64 characters; at most 50 attributes, 200
+  values and ~8 KB of attributes in total — past that the rest are dropped and
+  `attributes_truncated: true` is set, which keeps the largest possible event near 18 KB, under
+  the server's 32 KB per-event limit. A value JSON cannot carry (`Date`, `URL`, a `NaN`, …) is
+  sent as text instead of `null`; an opaque object as a `<TypeName>` placeholder. The same error
+  is sent at most once per 60 seconds (repeats ride on the next one as `suppressed_count`) and at
+  most 30 errors per rolling 60 seconds (`dropped_count`), on the device's uptime clock (awake
+  time), so a date change cannot stall either window. Adds an `error` crash breadcrumb carrying the message. A call
+  from inside `onEvent` during another `captureError` on the same thread is dropped
+  (`error_capture.reentrant_dropped`), not recursed. The SDK sends exactly what it is given —
+  redact URLs, tokens and PII first. Handled errors stay visible in error tracking but do not affect release health; the server reports them separately (#1189). See "Errors" in the README (#1173).
+
+### Removed
+
+- 🔴 **BREAKING: the `traits` parameter of `identify()` is gone.**
+  `identify(userId:traits:)` no longer exists; the method is `identify(userId:)`. Any call site
+  passing traits **will not compile** until you remove the argument.
+
+  **Why a break and not a silent no-op.** The values were merged into the device row's
+  `attributes` column on the server, where they were targetable — and where they survived both
+  `reset()` and a GDPR erase, so an app passing `email` or `name` left it behind after a person
+  asked to be forgotten. Accepting a parameter and discarding it would have left every existing
+  call site looking correct while doing nothing; the compiler is the only channel that reaches
+  every upgrader at the exact line that needs to change. `@sheepit-ai/sdk-js` has never sent
+  them, so the two SDKs now agree about what goes on the wire.
+
+  **What to do instead.** Event properties cannot be targeted — flag and experiment rules only
+  resolve `user_group` membership, the built-in context fields (`user_role`, `country`,
+  `user_locale`, `platform`), and device `attributes.*`; event properties never reach the rule
+  evaluator. Track the value for dashboards and experiment/release metrics:
+
+  ```swift
+  - sheepit.identify(userId: "user_123", traits: ["plan": "pro"])
+  + sheepit.identify(userId: "user_123")
+  + sheepit.track("plan_selected", properties: ["plan": "pro"])
+  ```
+
+  To keep targeting on this value, add the user to a group instead
+  (`POST /v1/groups/:id/members`, then target `user_group`), or call
+  `POST /v1/devices/:deviceId/identify` directly with `attributes` — the SDK no longer does this,
+  but the raw endpoint still accepts it if you accept the trade-off this whole section exists to
+  avoid: the value survives `reset()` and is not cleared by GDPR end-user erase.
+
+  The local trait store went with the parameter: `ContextManager.userTraits` and
+  `updateUserTraits` are removed (both were internal — no public API change beyond `identify`),
+  and the `identity.traits_not_uploaded` diagnostic that a pre-release build briefly emitted
+  never ships.
+
+  **Upgrading from 0.6.0 — read this, it is not what you would guess.** New traits stop reaching
+  the server, but ⚠️ **whatever 0.6.0 already uploaded stays on the device row and keeps matching
+  targeting rules.** The identify route preserves existing attributes on every path, and this SDK
+  no longer sends anything that would overwrite them — so those values are now frozen rather than
+  gone, on that device, including for a different user who later logs in on it. Before this
+  change a repeated `identify()` at least overwrote the value with a fresh one; that
+  self-correction is gone too. ⚠️ **No END-USER erase path clears them** — deleting an end user
+  through `DELETE /v1/end-users/:id` revokes their sessions and tombstones the record, and does
+  not touch the device row. Clearing the column is a manual server-side operation today, with no
+  self-service API and no tooling that targets a live end user; if you need it done, open a
+  support request and we will scope it with you.
+
+  If you targeted a flag or experiment on a trait you passed to `identify()`, expect it to keep
+  matching on devices that ran 0.6.0 and to stop matching on fresh installs — which is the worst
+  of both worlds. An event property won't fix it: rule conditions never see event properties (see
+  "What to do instead" above). Re-target on `user_group` or a direct `attributes` call instead.
+
+### Changed
+
+- The `identity.identify_noop` diagnostic message changed from
+  `"identify() called with the current userId — traits merged only"` to
+  `"identify() called with the current userId — no POST"`. If you match on that string, update
+  it; the `code` is unchanged.
+
+  🔴 **Pin `exact:` this version.** SPM's `from:` would carry you across this break without a
+  decision.
+
+- The 400-retry that re-sent an identity without its traits is gone with them, along with the
+  `identity.identify_traits_rejected` diagnostic: no POST carries traits, so no 400 can be
+  caused by one.
+- **The SDK's own internal `$error` events now carry `origin: "sdk"` and
+  `type: "sdk_internal"`**, so they can be told apart from a host app's `captureError` events
+  (`origin: "app"`, `type: "handled"`). Every other property, `source` included, is unchanged
+  (#1173).
+- **Upgrading clears a pending device-registration backoff.** A backoff (after a 429 or 402
+  from `/v1/devices/register`) is stamped with the SDK version that set it, so the first launch
+  on 0.7.0 retries registration once even if the old backoff had not expired. By design: a new
+  version may handle the response differently.
+
+### Fixed
+
+- **A crash report whose upload failed is now kept for the next launch.** It was lost every
+  time: the report was uploaded from the live crash file, and installing the crash handler right
+  afterwards truncates and zeroes that file, so the "keep it for retry" path kept nothing. Any
+  failed upload — offline, a 5xx, a 429, the daily cap's 402, a proxy's or firewall's 403 — lost
+  the crash. The report is now moved to a retry queue (Application Support, excluded from backup —
+  not Caches, which iOS purges) before the handler is installed, and uploaded from there, with a
+  stable `report_id` that is the same on every retry.
+  - A 400, 413 or 422 drops it at once (the old code meant to drop on a 4xx, but checked for an
+    error type nothing throws).
+  - Only a 5xx counts as an attempt; after 5 counted attempts the report is dropped. Everything
+    else retryable is bounded by age alone — 7 days from the launch that found it — and by the
+    queue cap: offline and timeouts (the server never saw it), 402 (daily cap) and 429 (the
+    server said "later"), and 401/403/404. The last three usually mean a key, proxy or firewall
+    in front of the API is refusing every report, not this one — so a crash waits for that to be
+    fixed instead of spending its budget against it.
+  - One HTTP attempt per report per launch: the queue is the retry mechanism, so the client's
+    in-process retry ladder (`retryAttempts`) no longer multiplies crash uploads.
+  - At most 5 reports are queued; a new crash evicts the oldest (only once it is safely queued).
+    A report stamped under a wrong clock is re-stamped first, so it is not always the one evicted.
+  - Queued reports are uploaded even while crash-loop protection has disabled the handler. With
+    `crashes: CrashConfig(enabled: false)`, each launch still drops queued reports past 7 days or
+    5 counted attempts (it sends nothing); a client rejected at `create` touches nothing.
+  - A crash that is retried counts once toward crash-loop protection, not once per retry.
+  - A report found while the device clock is wrong — before 2026 (a boot before the clock syncs
+    reads 1970) or more than a day ahead — is re-stamped at the next launch whose clock reads 2026
+    or later, and a clock reading before 2026 never ages a report out. A clock running fast cannot
+    be told from a correct one: a forward jump of more than 7 days ages queued reports out early.
+  - When XCTest is loaded in the process (unit tests, including ones hosted in your app), the
+    retry queue lives in a temporary directory unique to that run, so tests never upload or
+    clean up a real queue. The live crash file is not moved: the check is "XCTest is loaded",
+    not "this is a test run", and moving it would silently stop crash capture in any process
+    where that check is wrong. The cost of the check being wrong is only that failed uploads are
+    not retried on the next launch.
+  - Each decision emits a `transport.crash_upload` diagnostic with `data["outcome"]` =
+    `uploaded`, `retained_for_retry`, `dropped_non_retryable`, `dropped_retry_exhausted`,
+    `dropped_queue_full`, `dropped_unreadable` or `dropped_unretainable`.
+
+  ⚠️ **A report can reach the server more than once** — once per launch whose upload was stored
+  but whose response was lost (a timeout), until one launch gets an answer or the report ages
+  out. Every copy carries the same `report_id`; the API does not deduplicate on it yet. Before
+  this fix that case lost the crash instead.
+
+- **`apiUrl` with a path and trailing slashes.** An `apiUrl` that carries a path, such as a
+  same-origin proxy at `https://app.example.com/_sheepit`, keeps it on every request
+  (`…/_sheepit/v1/ingest`). Trailing slashes are now stripped, so `…/_sheepit//` no longer sends
+  to `…/_sheepit//v1/ingest`.
+
+- **Device registration no longer treats a 429 or a 402 the same as a network error, and no
+  longer waits a flat 24h on a 422.** Previously all three fell into (or shared the backoff of)
+  a generic bucket with no ceiling that matched the failure:
+  - **429 (rate limited)** used to retry every ≤60s with no jitter, ignoring the server's own
+    `Retry-After`. It now backs off up to an hour with full jitter, honoring `Retry-After` when
+    the server asks for longer (`HTTPClient`'s existing IMF-fixdate-aware parser).
+  - **402 (daily registration cap)** used to retry every ≤60s too — hammering an endpoint that
+    only resets at UTC midnight. It now shares 422's up-to-an-hour, jittered backoff
+    (`RegistrationOutcome.capReached`).
+  - **422 (environment device cap)** kept its shorter (1h, vs. a revoked key's 24h) backoff
+    window, but that window had no jitter — every device capped at the same moment retried in
+    lockstep. It now jitters too.
+  - **The registration retry loop no longer gives up until the next cold start** on a
+    transient/402/422/429 outcome at LAUNCH — previously `case .transientFailure: break` meant
+    a device with no network at launch had no device id (so no flags, no config) until the app
+    was relaunched, even if connectivity returned a second later. The launch path now retries
+    in-session, the same shape the logout-rotation path already had.
+  - **That in-session retry no longer blocks the auto-flush queue for its own duration.**
+    `registrationGate` (which `identify()` and the periodic flush both await) was fed the SAME
+    `Task` the retry loop recursed inside, so a transient/402/422/429 chain — up to an hour for
+    the latter two — held every flush hostage the whole time, not just for the first attempt.
+    Each retry now runs as its own `Task`, so the gate settles after one attempt, exactly as it
+    did before in-session retry existed; the retry chain keeps going in the background.
+
 ## [0.6.0] - 2026-09-22
 
 ### Upgrading from 0.5.0

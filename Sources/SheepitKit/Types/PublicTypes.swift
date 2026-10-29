@@ -50,15 +50,14 @@ public struct SheepitConfig: Sendable {
     /// (Audit E-002, 2026-04-25.)
     public var allowSecretKeyInClient: Bool
 
-    /// Audit L-005 / X2-001: explicit version string baked in by the host
-    /// app at build time. Stamped on every event as `app_version` so the
-    /// ingest path's release-resolver can attribute events to a Release
-    /// row. Defaults to nil → SDK falls back to
-    /// Bundle.main.CFBundleShortVersionString, which is the human-facing
-    /// marketing version (e.g. "1.0.0") and rarely matches a Release row's
-    /// commit-SHA-derived version. For TestFlight + App Store builds the
-    /// host should pass the GIT commit SHA (or build pipeline tag) here so
-    /// iOS events flow into the same release-intelligence loop as web.
+    /// The app version sent as `app_version` on events, crash reports, performance
+    /// metrics and device registration. Defaults to nil → `CFBundleShortVersionString`
+    /// (e.g. "1.4.0"), which is what `sheepit ci release --version` registers for an
+    /// Apple build, so most apps leave this unset.
+    ///
+    /// Set it only when your pipeline registers releases under a different version
+    /// string, and then to exactly that string: the API matches a release on platform,
+    /// version and build (`CFBundleVersion`) together. Bounded to 63 bytes of UTF-8.
     public var appVersion: String?
 
     /// Live diagnostics subscriber, wired to the SDK's `DiagnosticBus`
@@ -279,6 +278,8 @@ public struct SDKStatus: Sendable {
     public let offlineQueueDepth: Int
     public let lastFlushAt: Date?
     public let deviceId: String?
+    /// The app's own label: the id last passed to `identify()`, kept on the device. It is NOT what
+    /// flags are evaluated for — that is `identity.serverUser`, what the server's device row holds.
     public let userId: String?
     public let flagCount: Int
     public let experimentCount: Int
@@ -287,6 +288,53 @@ public struct SDKStatus: Sendable {
     /// alone cannot tell you that: a refused client and a `destroy()`ed one both report
     /// `false`. Assert this is nil at launch to catch a misconfigured key.
     public let rejectionReason: String?
+    /// What the server this client talks to (its apiUrl, environment and key) knows about this
+    /// device. nil for a client whose key was refused (it never talks to a server) or that was
+    /// destroyed.
+    public let identity: Identity?
+
+    /// The server's side of identity, which `userId` cannot show: a user the app identified is not
+    /// necessarily bound on the server (a POST still in flight, failed, or rejected).
+    public struct Identity: Sendable, Equatable {
+        /// The user the server's device row holds, as far as the SDK knows.
+        public enum ServerUser: Sendable, Equatable {
+            /// The SDK does not know what the row holds: an identify POST is in flight or failed, or
+            /// nothing has told it. This is also the lasting state of an anonymous install whose
+            /// stored device id the server accepted as is (only a newly minted id is known to hold
+            /// no user). Flags then evaluate for whatever the row holds.
+            case unknown
+            /// The row is known to hold no user (a newly minted device, or after `reset()`): flags
+            /// evaluate for the device alone.
+            case anonymous
+            /// The row holds this user: flags evaluate for them.
+            case user(String)
+        }
+
+        /// The last identify POST the server refused for good. Cleared by the next one it accepts.
+        public struct IdentifyRejection: Sendable, Equatable {
+            public let userId: String
+            /// The HTTP status of the refusal (a 4xx, or 404 on a just-registered device).
+            public let statusCode: Int?
+
+            public init(userId: String, statusCode: Int?) {
+                self.userId = userId
+                self.statusCode = statusCode
+            }
+        }
+
+        public let serverUser: ServerUser
+        /// Whether THIS apiUrl, environment and key registered the device id the SDK uses now. False
+        /// after another scope's `reset()` moved the shared id to a fresh device, until this scope
+        /// registers it on its next launch.
+        public let deviceRegistered: Bool
+        public let lastIdentifyRejection: IdentifyRejection?
+
+        public init(serverUser: ServerUser, deviceRegistered: Bool, lastIdentifyRejection: IdentifyRejection? = nil) {
+            self.serverUser = serverUser
+            self.deviceRegistered = deviceRegistered
+            self.lastIdentifyRejection = lastIdentifyRejection
+        }
+    }
 
     /// Explicit because Swift synthesises only an INTERNAL memberwise
     /// initializer for a struct that declares none. Without it a customer
@@ -303,7 +351,8 @@ public struct SDKStatus: Sendable {
         flagCount: Int,
         experimentCount: Int,
         sdkVersion: String,
-        rejectionReason: String? = nil
+        rejectionReason: String? = nil,
+        identity: Identity? = nil
     ) {
         self.initialized = initialized
         self.online = online
@@ -316,6 +365,7 @@ public struct SDKStatus: Sendable {
         self.experimentCount = experimentCount
         self.sdkVersion = sdkVersion
         self.rejectionReason = rejectionReason
+        self.identity = identity
     }
 }
 
@@ -358,7 +408,7 @@ enum SDKDefaults {
     /// `publish-sdk-swift.yml` refuses to release on a mismatch. The package
     /// is deliberately on `0.x` while the API settles, and `2.0.0` is reserved
     /// for the first stable release — see the CHANGELOG's "Version policy".
-    static let sdkVersion = "0.7.0"
+    static let sdkVersion = "0.8.0"
     /// Stamped on every ingest batch (`context.sdk.name`) so the dashboard can filter /
     /// triage by which SDK sent a given event. Follows the monorepo directory-name
     /// convention (`sdk-js`, `sdk-server`, `sdk-swift`) and is pinned by
@@ -478,11 +528,14 @@ enum StorageKeys {
     static let sessionLastSeen = "gt_session_last_seen"
     static let experimentAssignments = "gt_exp_assignments"
     /// Set only after a SUCCESSFUL `POST /v1/devices/register` round trip — not merely
-    /// once a device id has been minted locally. See `SheepitClient.start()`'s guard.
+    /// once a device id has been minted locally. See `SheepitClient.start()`'s guard. Holds the
+    /// device id it registered, per scope (`StorageScope`): the id is shared, so registered means
+    /// "this slot names the current id".
     static let deviceRegistered = "gt_device_registered"
-    /// The device id an identify POST was last SENT for (written before the request, so an
-    /// unanswered POST counts). While set, `reset()` treats the device as possibly bound and
-    /// rotates it (`DeviceRotation`); a rotation clears it.
+    /// The device ids recent identify POSTs were SENT for (written before the request, so an
+    /// unanswered POST counts; format in `BindMarker`). While it holds the current id, `reset()`
+    /// treats the device as possibly bound and rotates it (`DeviceRotation`). NOT scoped: it
+    /// describes the shared device, so a bind under any key makes `reset()` under every key rotate.
     static let deviceBindAttempted = "gt_device_bind_attempted"
     /// Epoch-seconds string. Set only after a TERMINAL registration failure (400/401/403/422 —
     /// see `RegistrationOutcome`), never after success or a transient failure. Deliberately

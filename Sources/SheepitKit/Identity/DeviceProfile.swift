@@ -18,15 +18,102 @@ enum DeviceProfile {
         return "tvOS"
         #elseif os(watchOS)
         return "watchOS"
+        #elseif os(visionOS)
+        return "visionOS"
         #elseif os(iOS)
         #if targetEnvironment(macCatalyst)
         // A Catalyst binary compiles under `os(iOS)` but runs as a Mac app.
         return "macOS"
         #else
+        // An iPhone/iPad binary in "Designed for iPad" mode on an Apple-silicon Mac runs on
+        // macOS with idiom `.pad`; without this check it filed as iPadOS while `platform`
+        // (see `platform` below) says `macos`.
+        if ProcessInfo.processInfo.isiOSAppOnMac { return "macOS" }
         return UIDevice.current.userInterfaceIdiom == .pad ? "iPadOS" : "iOS"
         #endif
         #else
         return "unknown"
+        #endif
+    }
+
+    /// The `platform` every SheepitKit payload carries: events (`context.device.platform`),
+    /// device registration, crash reports, performance batches and `$error` properties.
+    /// Computed once — the device does not change under a running process.
+    ///
+    /// It names the DEVICE the app runs on (founder decision, 2026-10-21): an iPad reports
+    /// `ipados` and a Mac `macos`, even when the binary is the iPhone/iPad build. It was a
+    /// hardcoded `"ios"` at five call sites before, so every Apple device filed as iOS.
+    /// 🔴 The value is part of the API's derived application id (`derived-identity.ts`), so a
+    /// universal app's iPad telemetry derives under `ipados` and needs its own
+    /// `sheepit ci release --platform ipados`; and `/v1/config` serves `ios`-targeted flags to
+    /// `ipados` devices (`flag-platform-filter.ts`), so the upgrade does not drop iPad flags.
+    /// Every value must be a member of `PLATFORM_VALUES`
+    /// (`packages/shared/src/schemas/platform.ts`): any other value is refused by all four
+    /// ingest endpoints.
+    static let platform: String = wirePlatform(for: currentRuntime())
+
+    /// What `wirePlatform(for:)` needs to know about the running process. Separate from the
+    /// `#if` reads in `currentRuntime()` so every branch is testable from the macOS test host.
+    enum Runtime: Equatable {
+        case macOS
+        /// A Catalyst binary: compiled under `os(iOS)`, running as a Mac app.
+        case macCatalyst
+        case tvOS
+        case watchOS
+        case visionOS
+        /// A UIKit iPhone/iPad binary. `onMac` = "Designed for iPad" on an Apple-silicon Mac.
+        case uiKit(idiom: Idiom, onMac: Bool)
+
+        enum Idiom: Equatable { case phone, pad, mac, other }
+    }
+
+    static func wirePlatform(for runtime: Runtime) -> String {
+        switch runtime {
+        case .macOS, .macCatalyst:
+            return "macos"
+        case .tvOS:
+            return "tvos"
+        case .watchOS:
+            return "watchos"
+        case .visionOS:
+            // No `visionos` platform exists on the server (the canonical 8 stop at watchos),
+            // and what runs there is the iPad binary or its sibling build. Closest member.
+            return "ipados"
+        case .uiKit(idiom: _, onMac: true):
+            return "macos"
+        case .uiKit(idiom: .pad, onMac: false):
+            return "ipados"
+        case .uiKit(idiom: .mac, onMac: false):
+            return "macos"
+        case .uiKit(idiom: .phone, onMac: false), .uiKit(idiom: .other, onMac: false):
+            // `.other` is CarPlay or an idiom newer than this SDK: the binary is an iOS app,
+            // and `ios` keeps it inside the iOS flag family rather than guessing.
+            return "ios"
+        }
+    }
+
+    private static func currentRuntime() -> Runtime {
+        #if os(macOS)
+        return .macOS
+        #elseif os(tvOS)
+        return .tvOS
+        #elseif os(watchOS)
+        return .watchOS
+        #elseif os(visionOS)
+        return .visionOS
+        #elseif targetEnvironment(macCatalyst)
+        return .macCatalyst
+        #elseif os(iOS)
+        let idiom: Runtime.Idiom
+        switch UIDevice.current.userInterfaceIdiom {
+        case .phone: idiom = .phone
+        case .pad: idiom = .pad
+        case .mac: idiom = .mac
+        default: idiom = .other
+        }
+        return .uiKit(idiom: idiom, onMac: ProcessInfo.processInfo.isiOSAppOnMac)
+        #else
+        return .uiKit(idiom: .other, onMac: false)
         #endif
     }
 
@@ -102,6 +189,60 @@ enum DeviceProfile {
         Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String
     }
 
+    /// The app version every stream sends: `SheepitConfig.appVersion` when the host set it,
+    /// else `CFBundleShortVersionString`. Events, crash reports, performance batches and
+    /// device registration all call this, so one build carries one version everywhere.
+    ///
+    /// 🔴 Before 2026-10-21 only events honoured the override; crashes, perf and registration
+    /// always sent the bundle version. The API derives a build id from platform + version +
+    /// build (`derived-identity.ts`), so a host that set `appVersion` had its sessions on one
+    /// build and its crashes on another.
+    ///
+    /// Bounded twice, because the streams have two limits: 64 UTF-16 units on every API schema
+    /// (`SDKDefaults.appVersionMaxLength`), and 63 UTF-8 bytes in the crash handler's C buffer
+    /// (`SheepitCrashContext.app_version[64]`). Bounding only to the wire limit would let a
+    /// long non-ASCII version reach the crash report shorter than on events: two builds again.
+    static func wireAppVersion(override: String?) -> String? {
+        (hostOverride(override) ?? appVersion()).map { boundedForAllStreams($0) }
+    }
+
+    /// An empty `SheepitConfig.appVersion` counts as unset. Sent as-is it matched no release on
+    /// any stream (the API derives no build from an empty version), silently.
+    static func hostOverride(_ value: String?) -> String? {
+        guard let value, !value.isEmpty else { return nil }
+        return value
+    }
+
+    /// `CFBundleVersion`, bounded like `wireAppVersion(override:)` and for the same reason
+    /// (`build_number[64]` in the crash context).
+    static func wireBuildNumber() -> String? {
+        buildNumber().map { boundedForAllStreams($0) }
+    }
+
+    /// Size of the crash context's `app_version` / `build_number` C arrays, minus the NUL.
+    static let crashContextStringMaxUTF8 = 63
+
+    /// Internal for `TrackSnapshot`, which caches the bundle read but must bound identically.
+    static func boundedForAllStreams(_ value: String) -> String {
+        boundedUTF8(bounded(value, SDKDefaults.appVersionMaxLength), crashContextStringMaxUTF8)
+    }
+
+    /// Truncates to at most `maxBytes` UTF-8 bytes on whole `Character`s — the unit a C
+    /// `char[]` holds. A byte-wise `memcpy` cut can split a multi-byte character and leave
+    /// invalid UTF-8, which `String(cString:)` repairs into U+FFFD on the next launch.
+    static func boundedUTF8(_ value: String, _ maxBytes: Int) -> String {
+        if value.utf8.count <= maxBytes { return value }
+        var out = ""
+        var used = 0
+        for character in value {
+            let width = String(character).utf8.count
+            if used + width > maxBytes { break }
+            out.append(character)
+            used += width
+        }
+        return out
+    }
+
     /// `max(16)` on both `deviceRegisterSchema.locale` and `ingestContextSchema.device.locale`.
     static let localeMaxLength = 16
 
@@ -172,6 +313,7 @@ enum DeviceProfile {
         // Pro (idiom `.vision`) and a CarPlay scene both filed as phones. An unknown
         // idiom must say so — a wrong bucket is worse than an absent one, because it is
         // indistinguishable from real phone traffic in a breakdown.
+        if ProcessInfo.processInfo.isiOSAppOnMac { return "desktop" }
         switch UIDevice.current.userInterfaceIdiom {
         case .phone: return "phone"
         case .pad: return "tablet"

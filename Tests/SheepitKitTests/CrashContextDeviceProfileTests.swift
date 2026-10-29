@@ -34,8 +34,10 @@ final class CrashContextDeviceProfileTests: XCTestCase {
             ),
             context: ContextManager(storage: InMemoryStorage()),
             config: CrashConfig(enabled: true),
+            appVersionOverride: "7.4.0-override",
             storage: InMemoryStorage(),
-            log: Logger(debug: false)
+            log: Logger(debug: false),
+            appState: AppForegroundState(launchedInBackground: false, tracksAppState: true)
         )
         reporter.updateContext()
 
@@ -58,12 +60,16 @@ final class CrashContextDeviceProfileTests: XCTestCase {
             "a report with both magic values set must be read back"
         )
 
+        // 🔴 PR12: the host's `SheepitConfig.appVersion` reaches the crash report. Before it,
+        // crashes always sent `CFBundleShortVersionString` while events sent the override, so
+        // the API derived two builds for one binary and the crash never met its sessions.
+        XCTAssertEqual(payload.appVersion, "7.4.0-override")
+        XCTAssertEqual(payload.platform, DeviceProfile.platform)
         // Compared against DeviceProfile's own live values rather than hardcoded
         // non-empty/non-nil expectations — `Bundle.main` inside an XCTest host may or may
-        // not carry a CFBundleShortVersionString, so the only environment-independent
-        // assertion is "whatever DeviceProfile computed is what came back."
-        XCTAssertEqual(payload.appVersion, DeviceProfile.appVersion() ?? "")
-        XCTAssertEqual(payload.buildNumber, DeviceProfile.buildNumber())
+        // not carry a CFBundleVersion, so the only environment-independent assertion is
+        // "whatever DeviceProfile computed is what came back."
+        XCTAssertEqual(payload.buildNumber, DeviceProfile.wireBuildNumber())
         XCTAssertEqual(payload.osVersion, DeviceProfile.osVersion())
         XCTAssertEqual(payload.deviceModel, DeviceProfile.deviceModel())
 

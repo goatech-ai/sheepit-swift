@@ -246,7 +246,7 @@ final class ForegroundSessionCheckTests: XCTestCase {
         observer.onForeground = {
             context.rolloverIfExpired()
             if context.takeNewSessionFlag() {
-                await announced.record(context.sessionId)
+                await announced.record(context.sessionId ?? "")
             }
         }
 
@@ -281,7 +281,7 @@ final class ForegroundSessionCheckTests: XCTestCase {
         observer.onForeground = {
             context.rolloverIfExpired()
             if context.takeNewSessionFlag() {
-                await announced.record(context.sessionId)
+                await announced.record(context.sessionId ?? "")
             }
         }
 

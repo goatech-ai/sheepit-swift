@@ -17,23 +17,23 @@ Web and backend get flags and experiments from the Sheepit SDKs, and native apps
 
 ## Install
 
-Sheepit is developed in the Sheepit monorepo (`packages/sdk-swift`) and published to the public mirror repository [`goatech-ai/sheepit-swift`](https://github.com/goatech-ai/sheepit-swift), which is what Swift Package Manager resolves against. Every release tag on the mirror is a bare semver version (`0.7.0`), mirrored from the monorepo by CI.
+Sheepit is developed in the Sheepit monorepo (`packages/sdk-swift`) and published to the public mirror repository [`goatech-ai/sheepit-swift`](https://github.com/goatech-ai/sheepit-swift), which is what Swift Package Manager resolves against. Every release tag on the mirror is a bare semver version (`0.8.0`), mirrored from the monorepo by CI.
 
 ### Xcode
 
-**File → Add Package Dependencies…** → enter `https://github.com/goatech-ai/sheepit-swift.git` → choose **Exact Version** and enter `0.7.0`.
+**File → Add Package Dependencies…** → enter `https://github.com/goatech-ai/sheepit-swift.git` → choose **Exact Version** and enter `0.8.0`.
 
-> 🔴 **Choose "Exact Version" `0.7.0`. Do not accept Xcode's default "Up to Next Major", and do not use `from:`.**
-> The mirror also carries tags `1.0.0` and `1.0.1`. They are **older** code than `0.7.0` and
+> 🔴 **Choose "Exact Version" `0.8.0`. Do not accept Xcode's default "Up to Next Major", and do not use `from:`.**
+> The mirror also carries tags `1.0.0` and `1.0.1`. They are **older** code than `0.8.0` and
 > export a different product name (`SheepitSDK`, not `SheepitKit`). Semver ranks them higher,
 > so Xcode pre-fills its default rule from `1.0.1` and resolves the wrong release. Pin
-> `exact: "0.7.0"` and upgrade deliberately. See the CHANGELOG's "Version policy".
+> `exact: "0.8.0"` and upgrade deliberately. See the CHANGELOG's "Version policy".
 
 ### Package.swift
 
 ```swift
 dependencies: [
-  .package(url: "https://github.com/goatech-ai/sheepit-swift.git", exact: "0.7.0"),
+  .package(url: "https://github.com/goatech-ai/sheepit-swift.git", exact: "0.8.0"),
 ]
 ```
 
@@ -131,7 +131,7 @@ SheepitKit evaluates nothing locally. It fetches `GET /v1/config`, which returns
 
 - Configuration is polled every `configRefreshInterval`, **300 seconds by default**. A flag change or kill switch can therefore take up to about five minutes to reach a running app; lower `configRefreshInterval` if you need faster propagation.
 - The first `flag` read per flag and the first `experiment` read per experiment emit `$flag_exposure` / `$experiment_exposure`. `inspect(_:default:)` never emits exposure.
-- Events from macOS, tvOS, and watchOS currently report `platform: "ios"`; the OS name is recorded separately on the device.
+- Every payload reports the device the app runs on as `platform`: `ios` (iPhone), `ipados` (iPad, and Vision Pro), `macos` (a Mac app, a Catalyst app, or an iPhone/iPad app running on an Apple-silicon Mac), `tvos` or `watchos`. A flag targeted at `ios` also reaches `ipados` devices; `macos`, `tvos` and `watchos` receive only flags targeted at them or at every platform.
 
 ## Configuration
 
@@ -158,7 +158,7 @@ SheepitKit evaluates nothing locally. It fetches `GET /v1/config`, which returns
 | `allowSecretKeyInClient` | `Bool`                                          | `false` (tests only)                  |
 | `requestTelemetryHosts`  | `[String]`                                      | `[]` (records no requests)            |
 
-Pass your git SHA or build tag as `appVersion` so events attribute to the right release; the marketing version rarely matches a release record.
+Leave `appVersion` unset unless your CI registers releases with a different version string. Whatever you choose, it must equal the `--version` your pipeline passes to `sheepit ci release`, because events, crash reports, performance metrics and device registration all send it, and a release matches on platform, version and build together. Register each build under every platform it runs on: a universal app is `--platform ios` and `--platform ipados`.
 
 ### Configure with xcconfig
 
@@ -216,7 +216,7 @@ App extensions and widgets read their own bundle, not the app's. Each extension 
 
 ```swift
 var config = SheepitConfig(bundle: .main)
-config.appVersion = "<git sha>" // any other property can still be set here
+config.debug = true // any other property can still be set here
 let sheepit = SheepitClient.create(config: config)
 ```
 
@@ -247,6 +247,7 @@ TestFlight and the App Store ship the same binary, so the URL compiled into the 
 | `captureError(_:error:attributes:)`                                 | Report a handled (non-fatal) error as a `$error` event             |
 | `recordRequest(method:url:status:durationMs:responseBytes:error:)`  | Report a failed first-party HTTP request as a `$http_error` event  |
 | `addBreadcrumb(category:message:)` / `setScreen(_:)`                | Context attached to crash reports                                  |
+| `submitFeedback(message:type:email:attributes:screenshots:) async`  | Send in-app feedback with up to 3 screenshots (see below)          |
 | `startSpan(_:attributes:)` / `endSpan(_:)` / `markFirstFrame()`     | Performance spans (when `performance.enabled`)                     |
 | `FlagValue`                                                         | Enum: `.bool`, `.string`, `.int`, `.double`, `.json`               |
 | `overrideFlag(_:value:)` / `clearOverride(_:)` / `clearOverrides()` | Set/clear debug flag overrides                                     |
@@ -254,7 +255,7 @@ TestFlight and the App Store ship the same binary, so the URL compiled into the 
 | `inspect(_:default:)`                                               | Non-exposing diagnostic read — `SheepitFlagInspection` (dev menu)  |
 | `knownFlagKeys()`                                                   | Sorted union of remote-valued + overridden flag keys               |
 | `flagChanges()`                                                     | `AsyncStream<Void>` — fires on config apply / override set / clear |
-| `status()`                                                          | Queue depths, connectivity, `lastFlushAt`, device / user id        |
+| `status()`                                                          | Queues, `lastFlushAt`, device / user id, `identity` (server side)  |
 | `diagnostics()` / `getRecentDiagnostics()`                          | Live and buffered internal SDK events                              |
 | `SheepitConfig`                                                     | Configuration, including optional `crashes` and `performance`      |
 
@@ -379,6 +380,8 @@ The SDK maintains a session automatically. You do not need to call `track()` at 
 - `$session_start` is emitted automatically when a launch opens a new session, and again when the app returns to the foreground after the idle window elapsed while it was suspended. It carries one property, `is_first_session` — `true` only for the device's very first session ever, so the install cohort is queryable without joining back to `$app_install`. Everything else (session id, device context) already rides on every event.
 - The session id is persisted, so relaunching within the window continues the same session rather than starting a new one.
 - `reset()` rotates the session id (as on web) but does **not** emit `$session_start` — a logout is not a new session.
+- **Sessions start only in the foreground** (UIKit platforms: iPhone, iPad, Apple TV, Vision Pro, Mac Catalyst; since 0.8.0). When iOS launches your app with no UI — a silent push, a background refresh task — no session begins. An event tracked in the background joins the current session only while it is live, does not extend it, and otherwise carries no session id. The first time the app comes to the foreground, the session opens and `$session_start` fires once.
+- Every event carries **`app_state`**: `"foreground"` or `"background"` (UIKit platforms). If you pass your own `app_state` property, yours is kept.
 
 Nothing to configure, and nothing to call.
 
@@ -416,7 +419,7 @@ do {
 }
 ```
 
-It sends a `$error` event through the same path as `track()`, so it carries the same session, device, user, app version and experiment assignments as every other event — the platform and OS included, in the event context (the context's `platform` is currently always `"ios"`, even on macOS, tvOS and watchOS — the OS name is recorded separately; a known gap, queued); there is no separate `platform` property, so a `platform` key in your `attributes` is kept as it is — and it adds an `error` breadcrumb with the message, so a crash later in the session shows it.
+It sends a `$error` event through the same path as `track()`, so it carries the same session, device, user, app version and experiment assignments as every other event — the platform and OS included, in the event context; there is no separate `platform` property, so a `platform` key in your `attributes` is kept as it is — and it adds an `error` breadcrumb with the message, so a crash later in the session shows it.
 
 | Property               | Value                                                                                                                                                                             |
 | ---------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -524,6 +527,109 @@ Limits:
 
 To chart them, filter `$http_error` by `origin = app` (the web SDK's rows carry no `origin`), and break down by `path` or `status`. The built-in "HTTP errors by status" widgets already include them.
 
+### In-app feedback
+
+`submitFeedback` sends what your app's user wrote, with up to 3 screenshots, to the dashboard's Feedback inbox. It is `async` and returns what happened:
+
+<!-- typecheck: compiled by scripts/typecheck-ios.sh -->
+
+```swift
+import SheepitKit
+
+func sendBugReport(sheepit: SheepitClient, pngData: Data) async {
+  let screenshots = SheepitFeedbackScreenshot(data: pngData).map { [$0] } ?? []
+  let result = await sheepit.submitFeedback(
+    message: "The export button does nothing",
+    type: .bug,                      // .bug, .feature or .general (the default)
+    email: "user@example.com",       // only if your user gave it to you
+    attributes: ["plan": "pro", "seats": 3, "beta": true],
+    screenshots: screenshots
+  )
+  switch result {
+  case .sent(let id): print("stored as", id)
+  case .queued: print("saved on the device; the SDK retries it")
+  case .rejected(let reason): print("not sent:", reason)
+  }
+}
+```
+
+**The SDK never captures the screen.** Pass an image your app made: encoded PNG or JPEG bytes (`SheepitFeedbackScreenshot(data:)`, checked by their first bytes), or a `UIImage` / `NSImage` (`SheepitFeedbackScreenshot(image:)`), which the SDK flattens onto white and encodes as a JPEG of at most 1 MiB, stepping quality down and then size (at most 4096 px on its longest side). The image initializers are synchronous; for a large image, call them off the main thread.
+
+**What is attached automatically:** the device id, session id and identified user (`identify(userId:)`), app version and build, platform, OS version, device model, locale, the last screen named with `screen(_:)` / `setScreen(_:)`, and the SDK name and version. Nothing else: `email` is only what you pass.
+
+**Checked on the device, before any request** — a failure returns `.rejected` and nothing is sent or saved: `message` 1–5000 characters after trimming (`.emptyMessage`, `.messageTooLong`), with no U+0000 (`.invalidMessage`: the server cannot store it); `email` a valid address of at most 256 characters (`.invalidEmail`); at most 20 `attributes` (`.tooManyAttributes`), keys of 1–64 `A-Z a-z 0-9 _ . -` other than the reserved tenancy keys, strings up to 256 characters without U+0000, finite numbers (`.invalidAttribute(key:)`); at most 3 screenshots (`.tooManyScreenshots`), each at most 1 MiB and 16384 px a side (`.screenshotTooLarge(index:)`, `.invalidScreenshot(index:)`); the encoded text payload at most 16 KiB (`.payloadTooLarge`).
+
+**Delivery.** One request at a time: a call made while another request (or a retry) is out waits for it. Offline, a timeout, 408, 429 or a 5xx saves the feedback on the device and returns `.queued`; it is retried after the server's `Retry-After` (1 second to 1 hour), or with backoff from 5 seconds doubling to 5 minutes; the wait is saved, so a relaunch inside it waits too. Any other 4xx is final: `.rejected(.server(statusCode:code:))`, with the API's error code (`VALIDATION_ERROR`, `KEY_TYPE_NOT_ALLOWED`, …). The queue keeps at most 10 items (the oldest is dropped first) for at most 7 days, in Application Support, excluded from backup, with `completeUntilFirstUserAuthentication` file protection on iOS, tvOS, watchOS and visionOS, separately for each `apiUrl`, environment and key. **`reset()` deletes it under every key**, since it holds the logged-out user's words; `destroy()` keeps it for the next client. Items saved under a key, environment or `apiUrl` the app no longer uses are deleted at a later start once all of them are over 7 days old. A destroyed or rejected client returns `.rejected(.clientUnavailable)`. The server allows 5 submissions per device per hour, 20 per IP and 50 per environment; past those, feedback waits in the queue. Every outcome emits a `transport.feedback_upload` diagnostic whose `data["outcome"]` is `sent`, `sent_from_queue`, `queued`, `rejected`, `not_queued`, `retained_for_retry`, `dropped_rejected`, `dropped_expired`, `dropped_queue_full`, `dropped_unreadable` or `invalid` (with `data["reason"]` naming the rule, never the attribute key).
+
+The package's privacy manifest declares the message (`OtherUserContent`), the email address and the screenshots (`PhotosorVideos`) as collected for app functionality, linked to the user, not used for tracking.
+
+A feedback sheet in SwiftUI. Render the screenshot before you present the sheet, so it shows the screen the user was on:
+
+<!-- typecheck: compiled by scripts/typecheck-ios.sh -->
+
+```swift
+import SheepitKit
+import SwiftUI
+import UIKit
+
+struct FeedbackSheet: View {
+  let sheepit: SheepitClient?
+  /// Rendered by your app before presenting, e.g. with `UIGraphicsImageRenderer`.
+  let screenshot: UIImage?
+
+  @Environment(\.dismiss) private var dismiss
+  @State private var message = ""
+  @State private var type = SheepitFeedbackType.bug
+  @State private var attachScreenshot = true
+  @State private var sending = false
+  @State private var failure: String?
+
+  var body: some View {
+    NavigationStack {
+      Form {
+        Picker("Type", selection: $type) {
+          Text("Bug").tag(SheepitFeedbackType.bug)
+          Text("Idea").tag(SheepitFeedbackType.feature)
+          Text("Other").tag(SheepitFeedbackType.general)
+        }
+        TextField("What happened?", text: $message, axis: .vertical)
+          .lineLimit(4...10)
+        if screenshot != nil {
+          Toggle("Attach a screenshot", isOn: $attachScreenshot)
+        }
+        if let failure {
+          Text(failure).foregroundStyle(.red)
+        }
+      }
+      .navigationTitle("Send feedback")
+      .toolbar {
+        ToolbarItem(placement: .cancellationAction) {
+          Button("Cancel") { dismiss() }
+        }
+        ToolbarItem(placement: .confirmationAction) {
+          Button("Send") { Task { await send() } }
+            .disabled(sending || message.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+        }
+      }
+    }
+  }
+
+  private func send() async {
+    guard let sheepit else { return }
+    sending = true
+    defer { sending = false }
+    let image = attachScreenshot ? screenshot : nil
+    let screenshots = image.flatMap { SheepitFeedbackScreenshot(image: $0) }.map { [$0] } ?? []
+    switch await sheepit.submitFeedback(message: message, type: type, screenshots: screenshots) {
+    case .sent, .queued:
+      dismiss()
+    case .rejected(let reason):
+      failure = "Could not send your feedback (\(reason))."
+    }
+  }
+}
+```
+
 ### Install and update
 
 `$app_install` fires exactly once, on a genuinely fresh install — never again, and never on an existing install merely upgrading to a version of this SDK that ships the feature. `$app_update` fires whenever the app's version changes since the last launch, carrying `previous_version` / `current_version`. Both are driven by one storage key, so an app that has been installed for months does not report a fake install the day it upgrades.
@@ -544,6 +650,8 @@ if let reason = sheepit.status().rejectionReason {
 ```
 
 An error is also logged to `os_log`, and a `lifecycle.api_key_rejected` diagnostic is emitted — subscribe with `SheepitConfig.onDiagnostic` or read `getRecentDiagnostics()`. If the key is fine, check that the device has network and that events are being flushed (`status().queueDepth`).
+
+**I called `identify()` but flags still come back at their defaults, or the user looks anonymous.** `status().userId` is only the app's own label. What flags are evaluated for is `status().identity?.serverUser`: `.user(id)` once the server bound the user, `.unknown` while the SDK cannot say (a POST in flight or failed), `.anonymous` for a row known to hold nobody. `identity?.lastIdentifyRejection` names a user the server refused and its HTTP status, and `identity?.deviceRegistered` says whether this key and environment registered the current device. Each key, environment and `apiUrl` keeps its own registration, so a Debug and a release build on different keys do not share it.
 
 **How do I get type-safe flags?** `sheepit codegen` from [@sheepit-ai/cli](https://www.npmjs.com/package/@sheepit-ai/cli) generates a Swift `Flag` enum (`String`, `CaseIterable`) when `codegen.outputs.swift` is set in `sheepit.config.json`. Reference flags by `Flag.<name>.rawValue`.
 

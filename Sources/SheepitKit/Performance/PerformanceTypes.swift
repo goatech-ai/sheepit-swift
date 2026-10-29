@@ -13,7 +13,8 @@ public struct PerformanceConfig: Sendable {
     /// Whether frame rate tracking is enabled (iOS only).
     public var frameTrackingEnabled: Bool
 
-    /// Whether network request metrics are captured.
+    /// Has no effect: the SDK captures no network timings. Kept so existing call sites compile.
+    /// For failed requests to your own backend, use `recordRequest(method:url:status:durationMs:)`.
     public var networkTrackingEnabled: Bool
 
     /// Whether memory usage tracking is enabled.
@@ -183,7 +184,8 @@ struct PerfBatchContext: Encodable, Sendable {
     let osVersion: String
     let deviceModel: String
     let userId: String?
-    let sessionId: String
+    /// `perfBatchContextSchema.session_id` is nullable; nil when no session is live (0.6-C).
+    let sessionId: String?
     let deviceId: String
     let country: String?
     let networkType: String?

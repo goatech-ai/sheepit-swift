@@ -296,13 +296,6 @@ final class PerformanceTests: XCTestCase {
         XCTAssertEqual(summary.anrCount, 0)
     }
 
-    // MARK: - NetworkMetricsCollector
-
-    func testNetworkCollectorInit() {
-        let collector = NetworkMetricsCollector { _ in }
-        XCTAssertNotNil(collector)
-    }
-
     // MARK: - ANRWatchdog
 
     func testANRWatchdogInit() {

@@ -89,7 +89,7 @@ final class ConcurrencySafetyTests: XCTestCase {
             if index.isMultiple(of: 4) {
                 manager.setEvaluatedFlags(["a": AnyCodable(true), "b": AnyCodable(index)])
             } else {
-                _ = manager.evaluate(flagKey: "a", defaultValue: .bool(false)) { _, _ in }
+                _ = manager.evaluate(flagKey: "a", defaultValue: .bool(false)) { _, _, _ in }
                 _ = manager.count()
             }
         }
@@ -129,7 +129,7 @@ final class ConcurrencySafetyTests: XCTestCase {
             if index.isMultiple(of: 4) {
                 manager.setAssignments([:], appliedUnderUserId: nil)
             } else {
-                _ = manager.resolve(experimentKey: "exp") { _, _ in }
+                _ = manager.resolve(experimentKey: "exp") { _, _, _ in }
                 _ = manager.count()
             }
         }
@@ -174,9 +174,9 @@ final class ConcurrencySafetyTests: XCTestCase {
         manager.setEvaluatedFlags(["a": AnyCodable(true), "b": AnyCodable("x")])
 
         let reentered = Box<FlagValue?>(nil)
-        _ = manager.evaluate(flagKey: "a", defaultValue: .bool(false)) { _, _ in
+        _ = manager.evaluate(flagKey: "a", defaultValue: .bool(false)) { _, _, _ in
             // A customer's onEvent closure reading another flag.
-            reentered.value = manager.evaluate(flagKey: "b", defaultValue: .bool(false)) { _, _ in }
+            reentered.value = manager.evaluate(flagKey: "b", defaultValue: .bool(false)) { _, _, _ in }
         }
 
         XCTAssertEqual(reentered.value, .string("x"), "re-entry must not deadlock")
@@ -185,7 +185,7 @@ final class ConcurrencySafetyTests: XCTestCase {
     func testExperimentExposureCallbackCanReenterTheManager() {
         let manager = ExperimentManager(storage: InMemoryStorage())
         let count = Box<Int>(-1)
-        _ = manager.resolve(experimentKey: "missing") { _, _ in
+        _ = manager.resolve(experimentKey: "missing") { _, _, _ in
             count.value = manager.count()
         }
         // Not enrolled → no exposure fires; prove the un-enrolled path

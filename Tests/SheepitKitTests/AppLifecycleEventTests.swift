@@ -164,6 +164,61 @@ final class AppInstallAndUpdateEmissionTests: XCTestCase {
         )
     }
 
+    /// PR12: `$app_update` resolves its version like every other stream (bounded to the crash
+    /// buffer's 63 UTF-8 bytes). An older SDK stored the marker unbounded, so the stored value is
+    /// bounded too before comparing; otherwise a host with a 64+ character `appVersion` would see
+    /// one spurious `$app_update` on the first launch after upgrading the SDK.
+    func testALongVersionStoredUnboundedByAnOlderSDKDoesNotFireAnUpdate() throws {
+        let long = String(repeating: "v", count: 70)
+        let defaults = UserDefaults(suiteName: suiteName)!
+        let originalDeviceId = defaults.string(forKey: StorageKeys.deviceId)
+        let originalMarker = defaults.string(forKey: StorageKeys.installedAppVersion)
+        defer {
+            if let originalDeviceId { defaults.set(originalDeviceId, forKey: StorageKeys.deviceId) }
+            else { defaults.removeObject(forKey: StorageKeys.deviceId) }
+            if let originalMarker { defaults.set(originalMarker, forKey: StorageKeys.installedAppVersion) }
+            else { defaults.removeObject(forKey: StorageKeys.installedAppVersion) }
+        }
+        defaults.set(UUID().uuidString, forKey: StorageKeys.deviceId)
+        defaults.set(long, forKey: StorageKeys.installedAppVersion)
+
+        let recorder = EventLifecycleRecorder()
+        let client = makeClient(recorder, appVersion: long)
+        defer { client.destroy() }
+
+        XCTAssertEqual(recorder.count(of: "$app_update"), 0)
+        XCTAssertEqual(
+            defaults.string(forKey: StorageKeys.installedAppVersion),
+            DeviceProfile.wireAppVersion(override: long),
+            "the marker is rewritten in the bounded form every stream sends"
+        )
+    }
+
+    /// An older SDK stored a host's `appVersion: ""` verbatim. Empty now means "unset" on every
+    /// stream, so the stored `""` is no previous version: without that, the upgrade fired one
+    /// `$app_update` with `previous_version: ""`.
+    func testAnEmptyMarkerStoredByAnOlderSDKDoesNotFireAnUpdate() throws {
+        let defaults = UserDefaults(suiteName: suiteName)!
+        let originalDeviceId = defaults.string(forKey: StorageKeys.deviceId)
+        let originalMarker = defaults.string(forKey: StorageKeys.installedAppVersion)
+        defer {
+            if let originalDeviceId { defaults.set(originalDeviceId, forKey: StorageKeys.deviceId) }
+            else { defaults.removeObject(forKey: StorageKeys.deviceId) }
+            if let originalMarker { defaults.set(originalMarker, forKey: StorageKeys.installedAppVersion) }
+            else { defaults.removeObject(forKey: StorageKeys.installedAppVersion) }
+        }
+        defaults.set(UUID().uuidString, forKey: StorageKeys.deviceId)
+        defaults.set("", forKey: StorageKeys.installedAppVersion)
+
+        let recorder = EventLifecycleRecorder()
+        let client = makeClient(recorder, appVersion: "2.0.0")
+        defer { client.destroy() }
+
+        XCTAssertEqual(recorder.count(of: "$app_update"), 0)
+        XCTAssertEqual(recorder.count(of: "$app_install"), 0)
+        XCTAssertEqual(defaults.string(forKey: StorageKeys.installedAppVersion), "2.0.0")
+    }
+
     /// The regression that matters (decision 7): an install that already has a device id
     /// must write the marker and emit NOTHING — not `$app_install`, and not `$app_update`
     /// either, since there is nothing yet to diff against.

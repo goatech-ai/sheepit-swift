@@ -27,7 +27,185 @@ package uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 > resolves `>=1.0.0 <2.0.0`, so **a consumer pinned to `1.0.x` will never
 > receive a `0.x` release.** They are frozen until they re-pin to `0.x`.
 
-## [Unreleased]
+## [0.8.0] - 2026-10-28
+
+### Upgrading from 0.7.0
+
+- **Pin `exact: "0.8.0"`.** On `0.x` a minor may break you, and SPM's "Up to Next Major" does not
+  stop at the next `0.x` minor.
+- 🔴 **Self-hosted installs: upgrade the server first** if you ship a tvOS or watchOS app: an older
+  server refuses those platforms on every endpoint (see Changed).
+- **`platform` now names the device** (`ipados`, `macos`, `tvos`, `watchos` as well as `ios`), which
+  changes which flags, Rules and releases match iPad, Mac, Apple TV and Apple Watch traffic. Read
+  the checklist under Changed before upgrading.
+- **Sessions start only in the foreground**, and every event carries `app_state`. A strict event
+  schema that declares `app_state` with another type rejects those events.
+- **Exposure and identify behaviour match sdk-js 0.9.0** (see Fixed): exposure counts drop after
+  the upgrade, and a failed bind is reported as `$identify_failed`.
+- Rolling back to 0.7.0 or earlier drops events still queued offline (see Changed).
+- **Server state is now kept per apiUrl, environment and key** (see Fixed): on the first launch
+  after upgrading, every install re-registers and re-identifies once.
+- **In-app feedback** (`submitFeedback`, see Added) needs a server with `POST /v1/feedback/sdk`:
+  hosted Sheepit, or BYOC 0.6.0 or later. The privacy manifest gains `OtherUserContent`,
+  `EmailAddress` and `PhotosorVideos`; update your App Store privacy answers.
+
+### Added
+
+- **`SDKStatus.identity`**: what the server this client talks to knows about the device.
+  `serverUser` (`.unknown`, `.anonymous` or `.user(id)`) is the user flags are evaluated for;
+  `userId` stays the app's own label, which can name a user the server never bound. `.unknown`
+  means the SDK cannot say what the row holds, which is also the lasting state of an anonymous
+  install whose stored device id the server accepted. `deviceRegistered` says whether this apiUrl,
+  environment and key registered the current device id, and `lastIdentifyRejection` carries the
+  refused user and HTTP status. `SDKStatus.init` takes it as a defaulted parameter.
+
+- **In-app feedback: `submitFeedback(message:type:email:attributes:screenshots:) async -> SheepitFeedbackResult`**
+  (`@discardableResult`), to the dashboard's Feedback inbox (`POST /v1/feedback/sdk`, which needs a
+  server with that route). New public types: `SheepitFeedbackType` (`.bug`, `.feature`, `.general`),
+  `SheepitFeedbackAttributeValue` (string, int, double, bool; written as literals),
+  `SheepitFeedbackScreenshot` (`init?(data:)` for PNG/JPEG bytes, `init?(image: UIImage)`, and
+  `init?(image: NSImage)` on macOS, which encode a JPEG of at most 1 MiB), `SheepitFeedbackResult`
+  (`.sent(id:)`, `.queued`, `.rejected(_:)`) and `SheepitFeedbackRejection`. The server's limits are
+  checked on the device first. Device, session, user, app version and build, OS, model, locale,
+  screen and SDK version are attached automatically; the SDK never captures the screen. Feedback
+  that cannot be delivered (offline, 408, 429, 5xx) is kept on disk per `apiUrl`, environment and
+  key, at most 10 items for 7 days, and retried one request at a time honouring `Retry-After`, also
+  across relaunches. `reset()` deletes it under every key; a queue under a key or environment no
+  longer used is deleted at a later start once it is all over 7 days old. U+0000 in the message,
+  email or an attribute is rejected (`.invalidMessage`, `.invalidEmail`, `.invalidAttribute(key:)`).
+  Outcomes emit `transport.feedback_upload` diagnostics. The privacy manifest now declares
+  `OtherUserContent`, `EmailAddress` and `PhotosorVideos` (app functionality, linked, not tracking).
+
+### Changed
+
+- 🔴 **`platform` now names the device the app runs on**, on every payload (events, device
+  registration, crash reports, performance batches): `ios` (iPhone), `ipados` (iPad, and Vision
+  Pro), `macos` (a Mac or Catalyst app, or an iPhone/iPad app on an Apple-silicon Mac), `tvos`,
+  `watchos`. It was `ios` everywhere before. What to do before upgrading:
+  - **Self-hosted installs: upgrade the server first.** An older server refuses `tvos` and
+    `watchos` on every endpoint, so a tvOS or watchOS app on this SDK would lose every event batch
+    and register no device until it is upgraded (registration retries within a day after that).
+  - **Flags:** an `ios` target still reaches iPads. Mac, Apple TV and Apple Watch apps now receive
+    only flags targeted at `macos` / `tvos` / `watchos` or at every platform; add those platforms
+    to their flags first, or the app falls back to its compiled-in defaults.
+  - **Rules** that compare `platform` match exactly: `platform = ios` no longer matches an iPad.
+  - **Releases:** register each build under every platform it runs on (a universal app:
+    `sheepit ci release --platform ios` and `--platform ipados`), or the iPad sessions and
+    crashes attach to no release.
+  - **Charts:** iPad and Mac traffic moves out of `ios` from the upgrade on. Stored rows are not
+    rewritten, so a series filtered on `platform = ios` drops the iPad share at that point.
+- **One app version on every stream.** `SheepitConfig.appVersion`, when set, is now sent on crash
+  reports, performance metrics and device registration too, not only on events. Before this a
+  host that set it had its sessions on one build and its crashes on another. All streams bound it
+  to 63 bytes of UTF-8 (the crash report's limit) on whole characters, and an empty string now
+  counts as unset. `$app_update` resolves its versions the same way.
+- `os_name` reports `visionOS` on Vision Pro (it was `unknown`), and `macOS` / device type
+  `desktop` for an iPhone/iPad app running on a Mac, matching `platform`.
+- **Sessions start only in the foreground** (UIKit platforms: iPhone, iPad, Apple TV, Vision Pro, Mac Catalyst). iOS launches an app with no UI for a
+  silent (`content-available`) or VoIP push and for a `BGAppRefreshTask`. Such a launch used to
+  mint and announce a session, and every background `track()` extended one, so sessions began
+  with nobody looking and per-session rates were biased. Now, in the background, nothing mints,
+  announces or extends a session. A background event joins the stored session only while it is
+  live (30 minutes), and otherwise carries **no session id**. The first foreground opens the
+  session and emits `$session_start` exactly once. AppKit macOS and watchOS are unchanged. A
+  foreground launch opens its session at its first foreground, as before, but a `track()` made
+  between `initialize()` in `didFinishLaunching` and that foreground (about 20 ms, measured on the
+  simulator) carries `app_state=background` and, on a first launch, no session id.
+- **Every event carries `app_state`** (`"foreground"` or `"background"`) as an event property on
+  UIKit platforms. A property of the same name passed to `track()` is kept as you passed it.
+  Background events and session-less events need no API change: an event with no session is sent
+  without `session.id`, which the server stores as NULL.
+  - `reset()` in the background drops the session and mints none; the next foreground opens one.
+  - If you call `initialize()` off the main thread, the SDK cannot read the app state and assumes
+    foreground, as before.
+  - If you declared a strict event schema with an `app_state` property of another type, or an
+    enum without `foreground` and `background`, those events will be rejected.
+  - Rolling back to 0.7.0 or earlier drops events still queued offline: older versions cannot
+    read an event saved without a session.
+
+- **`PerformanceConfig.networkTrackingEnabled` has no effect**, and the privacy manifest no longer
+  mentions network timings. The collector behind it was never attached to any `URLSession`, so it
+  never reported anything; it is deleted, because wiring it as written would have sent full URLs,
+  query strings included. The property stays so existing code compiles.
+
+### Fixed
+
+- **Performance monitoring pauses uploads when the server reports a daily limit or rate limit**
+  (HTTP 402 / 429) instead of retrying, and **drops the metrics collected while paused** (until
+  the next 00:00 UTC for a 402, until `Retry-After` for a 429). It sends one batch at a time.
+- **Crash reports carry the real `is_foreground`.** The field was reserved in the crash context
+  and sent on every report, but nothing wrote it, so every crash said `is_foreground: false`. It
+  now follows the app state events carry as `app_state`, and changes on each transition into and
+  out of the background, so a crash after backgrounding reports `false`. Where the app state is
+  not tracked (macOS, watchOS) the app counts as foreground, as the session logic already does,
+  so those crashes now report `true`. Crashes from earlier versions still say `false`, so a
+  comparison across this upgrade sees a step change.
+- The crash context now follows the session. It was written only when the crash handler was
+  installed and when the device id changed, so a crash after a session rollover was filed under
+  the previous session.
+- Internal capabilities decoding recognizes `ingest_body_key`; older APIs omit it and decode as nil. The Swift transport continues using header authentication.
+- **`$flag_exposure` no longer re-fires on every config refresh.** Each refresh reset the dedup,
+  so every flag the app read was exposed again after every `/v1/config`. It now fires once per
+  flag value: again only when a refresh changes the value, when a key the server stopped sending
+  comes back, or after `identify()` to another user or `reset()`. Same fix as sdk-js 0.9.0.
+- **`$experiment_exposure` fires for a new arm.** The dedup was per experiment, so a subject moved
+  to another arm was never exposed to it, which diluted the readout and hid the move from
+  sample-ratio checks. It now fires again whenever the arm changes.
+- Both events carry `exposure_reason`: `first`, or `value_changed` / `variant_changed`. A changed
+  exposure also emits the `flag.exposure_value_changed` / `experiment.exposure_variant_changed`
+  diagnostic.
+- The SDK no longer writes the per-experiment "sticky" variant to UserDefaults
+  (`gt_exp_assignments`). Nothing ever read it. The client removes what an older version left the
+  first time it starts.
+- **`identify()` recovers when the server does not know the device.** A 404 from
+  `/v1/devices/:id/identify` (the device row was purged or erased, or the id belongs to another
+  environment) was a final rejection: the user stayed unbound and flags evaluated anonymously,
+  with nothing reported. The SDK now registers a fresh device once and binds the user to it. It
+  keeps the old id until the new one exists, and registers nothing while registration is backing
+  off. Transient failures (network, timeout, 408, 429, 5xx) now retry inside the same call after
+  1 s, 2 s and 4 s, honouring the server's `Retry-After` up to 5 s, in place of the HTTP client's
+  1 s and 5 s retries of a 5xx. A bind that still fails sends `$identify_failed` (`outcome`:
+  `rejected`, `not_found` or `exhausted`, with `attempts` and `status`) and the
+  `identity.identify_failed` diagnostic, which replaces `identity.identify_post_rejected`. A bind
+  that recovers emits `identity.identify_recovered`. Same behaviour as sdk-js 0.9.0.
+- 🔴 **Server state is kept per apiUrl, environment and key.** Registration, the server-held user,
+  the cached config, the registration backoff and the offline queue were stored under fixed keys,
+  so two builds sharing a bundle id (Debug on one key or environment, TestFlight on another) read
+  each other's. In 0.7.0 the second build skipped registration, its identify POST got a 404, and
+  the install stayed anonymous for good. Each scope now has its own slots, under the same
+  `key:<hash>` scheme as sdk-js; the device id, anonymous id and the app's user id stay shared, so
+  a new scope registers the same device and binds the stored user with no 404. A scope counts as
+  registered only for the device id it registered, so after a `reset()` under another key rotates
+  the shared id, this scope registers the new one. The bind marker is shared too: an identify under
+  any key makes `reset()` under every key move to a fresh device, and one key's rotation no longer
+  erases that marker for a client still running under another. On the first
+  launch after upgrading, the unscoped server state is discarded once (the install re-registers
+  and re-identifies; the same environment just upserts its row) and the unscoped offline queue is
+  adopted into the current scope, skipping events already there. The `identity.scope_adopted`
+  diagnostic reports both.
+- `identify()` with the current user now sends a POST when the server is not known to hold that
+  user (a relaunch after an unanswered POST, or a new scope). It stays a no-op while the server holds
+  them, and sends nothing (`identity.identify_noop` with a `reason`) after the server rejected them
+  (`rejected`), while registration is backed off (`backoff`), or after their retries ran out
+  (`recently_exhausted`) until the next automatic retry: the next config refresh or the next
+  offline-to-online reconnect.
+- **`reset()` rotates a device any recent identify was sent for, across keys and launches.** The
+  shared bind marker held one device id and every identify overwrote it, so when another key's client
+  bound a replacement device, a `reset()` under the first key (in a later launch, before its own
+  identify went out) kept a device that may still hold the logged-out user. The marker now keeps the
+  last 32 device ids. A marker written by 0.6.0–0.7.0 is read as one of them. Downgrading to
+  0.6.0–0.7.x reads the new list as a device id that matches nothing, so a logout there keeps the
+  device until that version's next identify writes the marker again.
+- **`reset()` no longer keeps a device an identify racing it then binds.** `reset()` decided
+  whether to rotate before it fenced off identify POSTs, so an identify that marked its device and
+  sent in between bound the logged-out user to the device the logout kept, and the next user was
+  evaluated with that user's targeting. `reset()` now stops identify POSTs before it decides, and
+  each identify attempt marks its device before its last check, so a racing POST is either never
+  sent or its device rotates.
+
+- A malformed `apiUrl` in the single-slash form (`https:/user:password@host`) no longer echoes its
+  userinfo into `status().rejectionReason`, the `lifecycle.api_key_rejected` diagnostic and the log.
+  Only the `//` form was redacted.
 
 ## [0.7.0] - 2026-10-05
 

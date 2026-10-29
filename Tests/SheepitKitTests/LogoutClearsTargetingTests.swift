@@ -20,7 +20,7 @@ final class LogoutClearsTargetingTests: XCTestCase {
         guard let defaults = UserDefaults(suiteName: "ai.goatech.sdk") else { return }
         for key in [StorageKeys.sdkConfig, StorageKeys.sdkConfigCachedAt,
                     StorageKeys.sdkConfigFetchedUnder, StorageKeys.serverHeldUser] {
-            defaults.removeObject(forKey: key)
+            SharedSDKStorage.remove(key, from: defaults)
         }
     }
 
@@ -93,10 +93,10 @@ final class LogoutClearsTargetingTests: XCTestCase {
     func testSheepitClientResetRemovesTheCachedConfigFromDisk() throws {
         let suite = "ai.goatech.sdk"
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
-        defaults.set(Data("{}".utf8), forKey: StorageKeys.sdkConfig)
-        defaults.set(String(Date().timeIntervalSince1970), forKey: StorageKeys.sdkConfigCachedAt)
+        defaults.set(Data("{}".utf8), forKey: SharedSDKStorage.slot(StorageKeys.sdkConfig))
+        defaults.set(String(Date().timeIntervalSince1970), forKey: SharedSDKStorage.slot(StorageKeys.sdkConfigCachedAt))
         XCTAssertNotNil(
-            defaults.data(forKey: StorageKeys.sdkConfig),
+            defaults.data(forKey: SharedSDKStorage.slot(StorageKeys.sdkConfig)),
             "precondition: the cache must be seeded")
 
         let client = SheepitClient.createForTesting(
@@ -112,9 +112,9 @@ final class LogoutClearsTargetingTests: XCTestCase {
         client.reset()
 
         XCTAssertNil(
-            defaults.data(forKey: StorageKeys.sdkConfig),
+            defaults.data(forKey: SharedSDKStorage.slot(StorageKeys.sdkConfig)),
             "reset() must remove the cached config synchronously, not in a detached Task")
-        XCTAssertNil(defaults.string(forKey: StorageKeys.sdkConfigCachedAt))
+        XCTAssertNil(defaults.string(forKey: SharedSDKStorage.slot(StorageKeys.sdkConfigCachedAt)))
     }
 
     /// 🔴 `reset()` must call `clearForLogout()`, not `clearAssignments()`.

@@ -7,7 +7,9 @@ struct EnrichedEvent: Codable, Sendable {
     let eventProperties: [String: AnyCodable]?
     let deviceId: String
     let anonymousId: String
-    let sessionId: String
+    /// Nil for an event tracked in the background with no live session (0.6-C). Decode-safe
+    /// for a queue persisted by an older SDK, which always wrote a string.
+    let sessionId: String?
     let userId: String?
     let platform: String
     let sdkVersion: String
@@ -40,7 +42,7 @@ struct EnrichedEvent: Codable, Sendable {
         eventProperties: [String: AnyCodable]?,
         deviceId: String,
         anonymousId: String,
-        sessionId: String,
+        sessionId: String?,
         userId: String?,
         platform: String,
         sdkVersion: String,
@@ -110,17 +112,18 @@ struct TrackSnapshot: Codable, Sendable, Equatable {
 
     /// Snapshot the running app and device for an event being tracked now.
     ///
-    /// - Parameter appVersion: `SheepitConfig.appVersion`. Audit L-005: a release-binding
-    ///   host sets it to a commit SHA / build tag so events resolve to a `Release` row, so
-    ///   it wins over `CFBundleShortVersionString`.
+    /// - Parameter appVersion: `SheepitConfig.appVersion`, which wins over
+    ///   `CFBundleShortVersionString` here exactly as in `DeviceProfile.wireAppVersion(override:)`,
+    ///   the resolver crashes, perf and registration use — one build, one version.
     static func capture(appVersion: String?) -> TrackSnapshot {
         let invariant = processInvariant
-        // Bounded to `ingestContextSchema.app.version`/`build` (max 64): a host passing a
-        // long release tag would otherwise lose every event it tracks.
-        let bound = SDKDefaults.appVersionMaxLength
+        // Bounded like every other stream (`DeviceProfile.boundedForAllStreams`): 64 UTF-16
+        // units for `ingestContextSchema.app.version`/`build`, and the crash buffer's 63 UTF-8
+        // bytes so a crash carries the same string.
         return TrackSnapshot(
-            appVersion: (appVersion ?? invariant.appVersion).map { DeviceProfile.bounded($0, bound) },
-            appBuild: invariant.appBuild.map { DeviceProfile.bounded($0, bound) },
+            appVersion: (DeviceProfile.hostOverride(appVersion) ?? invariant.appVersion)
+                .map { DeviceProfile.boundedForAllStreams($0) },
+            appBuild: invariant.appBuild.map { DeviceProfile.boundedForAllStreams($0) },
             appNamespace: invariant.appNamespace,
             buildChannel: invariant.buildChannel,
             deviceModel: invariant.deviceModel,

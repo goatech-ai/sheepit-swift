@@ -13,7 +13,8 @@
 #      green while the lane never compiled the tests at all.
 #
 #   2. `typecheck-ios.sh`. `swift test` compiles the macOS host, so everything
-#      behind `#if canImport(UIKit)` is NOT compiled by it. Until this script
+#      behind `#if canImport(UIKit)` is NOT compiled by it. It also passes
+#      -warnings-as-errors, so a type-check warning there is fatal too. Until this script
 #      existed, that typecheck ran only in `publish-sdk-swift.yml` — at tag
 #      time, AFTER merge — so a PR could be fully green with a broken UIKit
 #      branch and only break the release.

@@ -75,8 +75,10 @@ final class CrashUploadRetentionTests: XCTestCase {
             ),
             context: ContextManager(storage: InMemoryStorage()),
             config: CrashConfig(enabled: enabled),
+            appVersionOverride: nil,
             storage: storage,
             log: Logger(debug: false),
+            appState: AppForegroundState(launchedInBackground: false, tracksAppState: true),
             crashDirectory: dir,
             diagnostics: bus,
             now: now
@@ -475,8 +477,10 @@ final class PendingCrashStoreLocationTests: XCTestCase {
             ),
             context: ContextManager(storage: InMemoryStorage()),
             config: CrashConfig(enabled: true),
+            appVersionOverride: nil,
             storage: InMemoryStorage(),
             log: Logger(debug: false),
+            appState: AppForegroundState(launchedInBackground: false, tracksAppState: true),
             pendingDirectory: FileManager.default.temporaryDirectory
                 .appendingPathComponent("sheepit-live-pin-\(UUID().uuidString)", isDirectory: true)
         )

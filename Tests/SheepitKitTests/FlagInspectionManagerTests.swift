@@ -85,7 +85,7 @@ final class FlagInspectionManagerTests: XCTestCase {
         _ = manager.inspect(flagKey: "show_banner", defaultValue: .bool(false))
 
         var exposureCount = 0
-        _ = manager.evaluate(flagKey: "show_banner", defaultValue: .bool(false)) { _, _ in exposureCount += 1 }
+        _ = manager.evaluate(flagKey: "show_banner", defaultValue: .bool(false)) { _, _, _ in exposureCount += 1 }
         XCTAssertEqual(exposureCount, 1, "evaluate() must still treat this as the first exposure")
     }
 

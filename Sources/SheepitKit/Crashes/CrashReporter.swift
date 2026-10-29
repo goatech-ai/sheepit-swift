@@ -18,8 +18,12 @@ actor CrashReporter {
     private let http: HTTPClient
     private let context: ContextManager
     private let config: CrashConfig
+    /// `SheepitConfig.appVersion`; see `DeviceProfile.wireAppVersion(override:)`.
+    private let appVersionOverride: String?
     private let storage: StorageProvider
     private let log: Logger
+    /// Mirrored into the crash context's `is_foreground`; see `setForeground(_:)`.
+    private let appState: AppForegroundState
 
     /// Internal for a test pin; see `productionLiveDirectory()`.
     nonisolated let crashFilePath: String
@@ -34,8 +38,10 @@ actor CrashReporter {
         http: HTTPClient,
         context: ContextManager,
         config: CrashConfig,
+        appVersionOverride: String?,
         storage: StorageProvider,
         log: Logger,
+        appState: AppForegroundState,
         crashDirectory: URL? = nil,
         pendingDirectory: URL? = nil,
         diagnostics: DiagnosticBus? = nil,
@@ -44,6 +50,7 @@ actor CrashReporter {
         self.http = http
         self.context = context
         self.config = config
+        self.appVersionOverride = appVersionOverride
         self.storage = storage
         self.log = log
 
@@ -57,6 +64,7 @@ actor CrashReporter {
         )
         self.diagnostics = diagnostics
         self.now = now
+        self.appState = appState
     }
 
     /// `<Caches>/ai.goatech.sdk/crashes`, holding `current.crash`. Unchanged since 0.x, so a
@@ -93,6 +101,15 @@ actor CrashReporter {
             // Install handlers for the current session
             install()
 
+            // Every transition reaches the crash context as it happens, not at the next
+            // `updateContext()`: otherwise a crash after backgrounding shipped a stale `true`.
+            // Only when THIS reporter mapped the context, so a failed install (another reporter
+            // already holds the process-global mapping) never mirrors into it. `[weak self]`
+            // because this reporter holds `appState` strongly.
+            if isInstalled {
+                appState.setOnChange { [weak self] isForeground in self?.setForeground(isForeground) }
+            }
+
             // Update crash context with current state
             updateContext()
 
@@ -119,6 +136,9 @@ actor CrashReporter {
     /// Stop the crash reporter and uninstall handlers.
     func stop() {
         successfulLaunchTask?.cancel()
+        // Before `uninstall()` unmaps the context: this waits out a transition mid-store, and
+        // no later one can write to the unmapped page.
+        appState.setOnChange(nil)
         uninstall()
     }
 
@@ -377,11 +397,17 @@ actor CrashReporter {
 
         writeString(context.userId ?? "", to: &ctx.pointee.user_id)
         writeString(context.deviceId, to: &ctx.pointee.device_id)
-        writeString(context.sessionId, to: &ctx.pointee.session_id)
-        writeString(DeviceProfile.appVersion() ?? "", to: &ctx.pointee.app_version)
-        writeString(DeviceProfile.buildNumber() ?? "", to: &ctx.pointee.build_number)
+        // "" when no session is live (0.6-C); `CrashReportReader` reads "" back as nil.
+        writeString(context.sessionId ?? "", to: &ctx.pointee.session_id)
+        // The same version and build events and perf send, so a crash lands on the build its
+        // sessions did. Before 2026-10-21 this ignored `SheepitConfig.appVersion`.
+        writeString(DeviceProfile.wireAppVersion(override: appVersionOverride) ?? "", to: &ctx.pointee.app_version)
+        writeString(DeviceProfile.wireBuildNumber() ?? "", to: &ctx.pointee.build_number)
         writeString(DeviceProfile.osVersion(), to: &ctx.pointee.os_version)
         writeString(DeviceProfile.deviceModel(), to: &ctx.pointee.device_model)
+        // Under the state's lock, so a transition cannot land between the read and the store.
+        // Before 2026-10-27 nothing wrote it, and every crash shipped `is_foreground: false`.
+        appState.withCurrentValue { ctx.pointee.is_foreground = $0 }
 
         ctx.pointee.magic = UInt32(SHEEPIT_CRASH_CONTEXT_MAGIC)
     }
@@ -390,6 +416,14 @@ actor CrashReporter {
     nonisolated func setScreen(_ name: String) {
         guard let ctx = sheepit_get_crash_context() else { return }
         writeString(name, to: &ctx.pointee.screen_name)
+    }
+
+    /// Update the foreground state in the crash context. A plain one-byte store into the mapped
+    /// struct, which the signal handler never writes and the next launch reads back. Called by
+    /// `AppForegroundState` on every transition, under its lock.
+    nonisolated func setForeground(_ isForeground: Bool) {
+        guard let ctx = sheepit_get_crash_context() else { return }
+        ctx.pointee.is_foreground = isForeground
     }
 
     /// Update feature flag state in the crash context.
@@ -415,12 +449,13 @@ actor CrashReporter {
 
     // MARK: - Helpers
 
-    /// Write a Swift string into a C fixed-size char array.
+    /// Write a Swift string into a C fixed-size char array, cut on a whole character: a
+    /// byte-wise cut could split a multi-byte character and read back as U+FFFD.
     private nonisolated func writeString<T>(_ string: String, to dest: inout T) {
         withUnsafeMutablePointer(to: &dest) { ptr in
             let size = MemoryLayout<T>.size
             ptr.withMemoryRebound(to: CChar.self, capacity: size) { cstr in
-                string.withCString { src in
+                DeviceProfile.boundedUTF8(string, size - 1).withCString { src in
                     let len = min(strlen(src), size - 1)
                     memcpy(cstr, src, len)
                     cstr[len] = 0

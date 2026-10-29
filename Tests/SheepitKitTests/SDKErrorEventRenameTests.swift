@@ -68,7 +68,7 @@ final class SDKErrorEventRenameTests: XCTestCase {
         XCTAssertEqual(props["origin"] as? String, "sdk")
         XCTAssertEqual(props["type"] as? String, "sdk_internal")
         XCTAssertEqual(props["source"] as? String, "crashes")
-        XCTAssertEqual(props["platform"] as? String, "ios")
+        XCTAssertEqual(props["platform"] as? String, DeviceProfile.platform)
         XCTAssertEqual(props["endpoint"] as? String, "/v1/crashes/report")
         XCTAssertEqual(props["status_code"] as? Int, 503)
     }

@@ -16,4 +16,5 @@ public enum SDKEndpoints {
     public static let ingestCapabilities = "/v1/ingest/capabilities"
     public static let crashReport = "/v1/crashes/report"
     public static let perfIngest = "/v1/performance/ingest"
+    public static let feedbackSubmit = "/v1/feedback/sdk"
 }

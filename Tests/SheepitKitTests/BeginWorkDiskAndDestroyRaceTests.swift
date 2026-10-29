@@ -38,27 +38,34 @@ final class BeginWorkDiskAndDestroyRaceTests: XCTestCase {
     /// persist — a NEW session id: the mutation this test needs to be able to observe. A live
     /// (non-expired) session read back unchanged would pass whether or not the write happened,
     /// exactly the round-2 finding S2 vacuous-test trap.
+    ///
+    /// Also covers the per-scope upgrade (`StorageScope.adoptLegacyState`): seeded unscoped server
+    /// state and an offline queue must still be there, and this config's slots still empty, after a
+    /// candidate that never began work. The upgrade belongs to `beginWork()`.
     func testConstructedButUnpublishedCandidateMakesNoPersistentWrites() {
         let defaults = UserDefaults(suiteName: "ai.goatech.sdk")!
-        func snapshot() -> [String?] {
-            [
-                defaults.string(forKey: StorageKeys.deviceId),
-                defaults.string(forKey: StorageKeys.sessionId),
-                defaults.string(forKey: StorageKeys.sessionLastSeen),
-                defaults.string(forKey: StorageKeys.anonymousId),
-            ]
+        let config = makeConfig()
+        let watched = [StorageKeys.deviceId, StorageKeys.sessionId, StorageKeys.sessionLastSeen, StorageKeys.anonymousId]
+            + StorageScope.scopedKeys.sorted()
+            + StorageScope.scopedKeys.sorted().map { SharedSDKStorage.key($0, for: config) }
+        func snapshot() -> [String] {
+            watched.map { "\($0)=\(String(describing: defaults.object(forKey: $0)))" }
         }
         let originalSessionId = defaults.string(forKey: StorageKeys.sessionId)
         let originalLastSeen = defaults.string(forKey: StorageKeys.sessionLastSeen)
         defer {
             defaults.set(originalSessionId, forKey: StorageKeys.sessionId)
             defaults.set(originalLastSeen, forKey: StorageKeys.sessionLastSeen)
+            for key in StorageScope.scopedKeys { SharedSDKStorage.remove(key, from: defaults) }
         }
         defaults.set("session-fixed-mf3-1", forKey: StorageKeys.sessionId)
         defaults.set("1000000.0", forKey: StorageKeys.sessionLastSeen)
+        for key in StorageScope.scopedKeys { SharedSDKStorage.remove(key, from: defaults) }
+        defaults.set("1", forKey: StorageKeys.deviceRegistered)
+        defaults.set(Data("[]".utf8), forKey: StorageKeys.offlineQueue)
 
         let before = snapshot()
-        let candidate = SheepitClient.constructOnlyForTesting(config: makeConfig())
+        let candidate = SheepitClient.constructOnlyForTesting(config: config)
         XCTAssertNil(candidate.inertReason, "this candidate must be legitimately live-shaped, not inert.")
         XCTAssertEqual(
             before, snapshot(),

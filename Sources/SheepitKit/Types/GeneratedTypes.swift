@@ -455,18 +455,23 @@ struct ApiErrorDetail: Decodable, Sendable {
 // MARK: - Ingest capability negotiation (GET /v1/ingest/capabilities)
 
 struct RuntimeCapabilitiesResponse: Decodable, Sendable {
+    // Older APIs omit this additive capability; absence must decode as nil.
+    let ingestBodyKey: Bool?
     let runtimeAttributionVersion: Int
     let maxRuntimeContextBytes: Int
     let perEventAnalyticsContext: Bool
     let perMetricPerformanceContext: Bool
     let runtimeReleaseMembership: Bool
     let runtimeCaptureDeclaration: Bool?
+    let ingestValidateOnly: Bool?
     enum CodingKeys: String, CodingKey {
+        case ingestBodyKey = "ingest_body_key"
         case runtimeAttributionVersion = "runtime_attribution_version"
         case maxRuntimeContextBytes = "max_runtime_context_bytes"
         case perEventAnalyticsContext = "per_event_analytics_context"
         case perMetricPerformanceContext = "per_metric_performance_context"
         case runtimeReleaseMembership = "runtime_release_membership"
         case runtimeCaptureDeclaration = "runtime_capture_declaration"
+        case ingestValidateOnly = "ingest_validate_only"
     }
 }

@@ -54,7 +54,7 @@ final class FlagValueJSONTests: XCTestCase {
         manager.setEvaluatedFlags(decoded)
 
         var exposures: [(String, FlagValue)] = []
-        let value = manager.evaluate(flagKey: "home_theme", defaultValue: .bool(false)) { key, val in
+        let value = manager.evaluate(flagKey: "home_theme", defaultValue: .bool(false)) { key, val, _ in
             exposures.append((key, val))
         }
 

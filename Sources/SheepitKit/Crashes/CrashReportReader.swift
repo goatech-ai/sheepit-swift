@@ -40,7 +40,8 @@ enum CrashReportReader {
         let binaryImages = convertBinaryImages(reportPtr)
 
         return CrashReportPayload(
-            platform: "ios",
+            // The device uploading is the device that crashed: the report is read on its next launch.
+            platform: DeviceProfile.platform,
             appVersion: tupleString(ctx.app_version),
             buildNumber: emptyToNil(tupleString(ctx.build_number)),
             osVersion: emptyToNil(tupleString(ctx.os_version)),

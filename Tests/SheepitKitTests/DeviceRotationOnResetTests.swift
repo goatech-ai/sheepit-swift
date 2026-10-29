@@ -25,7 +25,7 @@ final class DeviceRotationOnResetTests: XCTestCase {
                     StorageKeys.deviceRegistrationBackoffSDKVersion,
                     StorageKeys.deviceId, StorageKeys.deviceRegistered,
                     StorageKeys.deviceBindAttempted] {
-            defaults.removeObject(forKey: key)
+            SharedSDKStorage.remove(key, from: defaults)
         }
     }
 
@@ -34,9 +34,7 @@ final class DeviceRotationOnResetTests: XCTestCase {
         Self.clearStorage()
         AttributionCaptureProtocol.reset()
         // A device registered on an earlier launch, so `start()` registers nothing.
-        let defaults = UserDefaults(suiteName: Self.suite)
-        defaults?.set(Self.oldDevice, forKey: StorageKeys.deviceId)
-        defaults?.set("1", forKey: StorageKeys.deviceRegistered)
+        SharedSDKStorage.markRegistered(Self.oldDevice)
         AttributionCaptureProtocol.registerDeviceId = Self.newDevice
         TeardownFlushes.install()
     }
@@ -130,7 +128,7 @@ final class DeviceRotationOnResetTests: XCTestCase {
 
     func testResetOfAnAnonymousDeviceKeepsItAndRegistersNothing() async {
         UserDefaults(suiteName: Self.suite)?.set(
-            try? JSONEncoder().encode(ServerHeldUser.known(nil)), forKey: StorageKeys.serverHeldUser)
+            try? JSONEncoder().encode(ServerHeldUser.known(nil)), forKey: SharedSDKStorage.slot(StorageKeys.serverHeldUser))
         let client = makeClient()
         defer { client.destroy() }
         let seen = await waitUntil { AttributionCaptureProtocol.configRequestCount >= 1 }
@@ -149,7 +147,7 @@ final class DeviceRotationOnResetTests: XCTestCase {
     /// A registration that timed out client-side can still have landed, and the identify that
     /// follows then binds that row — while `deviceRegistered` was never set.
     func testAnIdentifyAfterAnUnconfirmedRegistrationStillRotatesOnReset() async {
-        UserDefaults(suiteName: Self.suite)?.removeObject(forKey: StorageKeys.deviceRegistered)
+        SharedSDKStorage.remove(StorageKeys.deviceRegistered, from: UserDefaults(suiteName: Self.suite))
         AttributionCaptureProtocol.failNextRegisterRequests(1) // launch registration: no answer
         let client = makeClient()
         defer { client.destroy() }
@@ -167,8 +165,8 @@ final class DeviceRotationOnResetTests: XCTestCase {
     /// put the abandoned device back in use.
     func testALaunchRegistrationAnsweredAfterTheRotationIsDiscarded() async {
         let defaults = UserDefaults(suiteName: Self.suite)
-        defaults?.removeObject(forKey: StorageKeys.deviceRegistered)
-        defaults?.set(Self.oldDevice, forKey: StorageKeys.deviceBindAttempted) // a previous launch identified
+        SharedSDKStorage.remove(StorageKeys.deviceRegistered, from: defaults)
+        SharedSDKStorage.markBindAttempted(Self.oldDevice) // a previous launch identified
         AttributionCaptureProtocol.echoRegisteredDeviceId = true
         AttributionCaptureProtocol.holdRegister = true
         let client = makeClient()
@@ -343,8 +341,8 @@ final class DeviceRotationOnResetTests: XCTestCase {
     /// the current device: it must not back off registration for it.
     func testALaunchRejectionAnsweredAfterTheRotationWritesNoBackoff() async {
         let defaults = UserDefaults(suiteName: Self.suite)
-        defaults?.removeObject(forKey: StorageKeys.deviceRegistered)
-        defaults?.set(Self.oldDevice, forKey: StorageKeys.deviceBindAttempted)
+        SharedSDKStorage.remove(StorageKeys.deviceRegistered, from: defaults)
+        SharedSDKStorage.markBindAttempted(Self.oldDevice)
         AttributionCaptureProtocol.failNextRegisterRequests(
             1, status: 400, body: DeviceRegistrationPayloadTests.validationErrorBody)
         AttributionCaptureProtocol.holdRegister = true
@@ -364,7 +362,7 @@ final class DeviceRotationOnResetTests: XCTestCase {
         AttributionCaptureProtocol.releaseHeldRegister(index: 0) // the launch request's 400
         try? await Task.sleep(for: .milliseconds(200))
 
-        XCTAssertNil(defaults?.string(forKey: StorageKeys.deviceRegistrationBackoffUntil))
+        XCTAssertNil(defaults?.string(forKey: SharedSDKStorage.slot(StorageKeys.deviceRegistrationBackoffUntil)))
         XCTAssertFalse(client.getRecentDiagnostics().contains {
             $0.code == "identity.device_registration_terminal_failure"
         })

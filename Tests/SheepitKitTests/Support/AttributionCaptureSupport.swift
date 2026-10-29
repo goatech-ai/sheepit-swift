@@ -45,16 +45,24 @@ final class LockedBox<Value>: @unchecked Sendable {
 ///   - `/v1/devices/register`: the minted `registerDeviceId`, or `{}` (unreadable) when unset;
 ///     held until `releaseHeldRegister()` while `holdRegister` is set; a 500 for the next
 ///     `failNextRegisterRequests` requests. Bodies are recorded.
-///   - `/v1/devices/:id/identify`: the reply set for that user — a status, a lost response, or
-///     held until `releaseHeldIdentify()` — and 200 otherwise. Keyed by user, so a retry of the
+///   - `/v1/devices/:id/identify`: the reply set for that user — a status, the API's 404
+///     `NOT_FOUND`, a lost response, held until `releaseHeldIdentify()`, or a sequence of those —
+///     and 200 otherwise. Keyed by user, so a retry of the
 ///     same request gets the same answer.
 ///   - `/v1/ingest`: a 202 that accounts for every event; bodies are recorded.
+///   - `modelEnvironmentRows`: device rows are per `X-Environment`, like the real table. A register
+///     creates the row in its environment; an identify for a device with no row there is the API's
+///     404 `NOT_FOUND`, whatever reply is set for the user.
 ///   - anything else: 200 `{}`.
 final class AttributionCaptureProtocol: URLProtocol, @unchecked Sendable {
-    enum IdentifyReply {
+    indirect enum IdentifyReply {
         case status(Int)
+        /// 404 with the API's `NOT_FOUND` envelope: the server has no row for the device.
+        case notFound
         case lost
         case hold
+        /// Each request takes the next reply; the last one answers every request after it.
+        case sequence([IdentifyReply])
     }
 
     private struct State {
@@ -66,7 +74,7 @@ final class AttributionCaptureProtocol: URLProtocol, @unchecked Sendable {
         var configHook: (@Sendable () -> Void)?
         var honorIfNoneMatch = true
         var identifyReplies: [String: IdentifyReply] = [:]
-        var heldIdentify: [(Int) -> Void] = []
+        var heldIdentify: [(Int, String) -> Void] = []
         var identifyUserIds: [String] = []
         var registerDeviceId: String?
         var failConfigRequests = 0
@@ -81,6 +89,10 @@ final class AttributionCaptureProtocol: URLProtocol, @unchecked Sendable {
         var failRegisterStatus = 500
         var failRegisterBody = #"{"error":{"code":"INTERNAL","message":"stub"}}"#
         var echoRegisteredDeviceId = false
+        var modelEnvironmentRows = false
+        var rows: Set<String> = []
+        var registerEnvironments: [String] = []
+        var identifyNotFound = 0
     }
 
     private static let lock = NSLock()
@@ -142,6 +154,15 @@ final class AttributionCaptureProtocol: URLProtocol, @unchecked Sendable {
         set { with { $0.echoRegisteredDeviceId = newValue } }
     }
 
+    static var modelEnvironmentRows: Bool {
+        get { with { $0.modelEnvironmentRows } }
+        set { with { $0.modelEnvironmentRows = newValue } }
+    }
+    /// The `X-Environment` of each register request, in order.
+    static var registerEnvironments: [String] { with { $0.registerEnvironments } }
+    /// Identify requests answered 404 because the device had no row in that environment.
+    static var identifyNotFoundCount: Int { with { $0.identifyNotFound } }
+
     /// Answers only the `index`-th register request still held (in arrival order).
     static func releaseHeldRegister(index: Int) {
         let held = with { state -> (() -> Void)? in
@@ -170,19 +191,38 @@ final class AttributionCaptureProtocol: URLProtocol, @unchecked Sendable {
     /// Answers every held identify request with `status`, and every later one for a still-held
     /// user too.
     static func releaseHeldIdentify(status: Int = 200) {
-        let held = with { state -> [(Int) -> Void] in
+        let held = with { state -> [(Int, String) -> Void] in
             for (userId, reply) in state.identifyReplies {
                 if case .hold = reply { state.identifyReplies[userId] = .status(status) }
             }
             defer { state.heldIdentify = [] }
             return state.heldIdentify
         }
-        held.forEach { $0(status) }
+        held.forEach { $0(status, #"{"data":{}}"#) }
+    }
+
+    /// Answers every held identify request with the API's 404 `NOT_FOUND`. Leaves the reply set for
+    /// each user alone, so a test sets what the next request gets first.
+    static func releaseHeldIdentifyAsNotFound() {
+        let held = with { state -> [(Int, String) -> Void] in
+            defer { state.heldIdentify = [] }
+            return state.heldIdentify
+        }
+        held.forEach { $0(404, #"{"error":{"code":"NOT_FOUND","message":"Device not found."}}"#) }
     }
 
     /// The last sent copy of the event with this name, across every captured request.
     static func event(named name: String) -> [String: Any]? {
         with { $0.ingestBodies }.flatMap(batch).last { $0["event"] as? String == name }
+    }
+
+    /// `event(named:)` for one user (`context.user.id`). Suites share the on-disk offline queue, so an
+    /// earlier test's event can reach this test's stub; a unique user id tells them apart.
+    static func event(named name: String, userId: String) -> [String: Any]? {
+        with { $0.ingestBodies }.flatMap(batch).last {
+            let user = ($0["context"] as? [String: Any])?["user"] as? [String: Any]
+            return $0["event"] as? String == name && user?["id"] as? String == userId
+        }
     }
 
     private static func batch(_ body: Data) -> [[String: Any]] {
@@ -209,6 +249,7 @@ final class AttributionCaptureProtocol: URLProtocol, @unchecked Sendable {
             }
         }
         let path = request.url?.path ?? ""
+        let environment = request.value(forHTTPHeaderField: "X-Environment") ?? ""
         let ifNoneMatch = request.value(forHTTPHeaderField: "If-None-Match")
 
         if path.hasSuffix(SDKEndpoints.config) {
@@ -243,6 +284,7 @@ final class AttributionCaptureProtocol: URLProtocol, @unchecked Sendable {
             let echoed = Self.echoRegisteredDeviceId ? registerBody["device_id"] as? String : nil
             let answer = {
                 if let minted = echoed ?? Self.registerDeviceId {
+                    Self.with { _ = $0.rows.insert("\(environment)|\(minted)") }
                     self.respond(201, #"{"data":{"device_id":"\#(minted)","anonymous_id":"anon","flag_assignments":{},"#
                         + #""experiment_assignments":{},"config":{"flush_interval_ms":5000,"flush_size":20}}}"#)
                 } else {
@@ -251,6 +293,7 @@ final class AttributionCaptureProtocol: URLProtocol, @unchecked Sendable {
             }
             let failure = Self.with { state -> (Int, String)? in
                 state.registerBodies.append(registerBody)
+                state.registerEnvironments.append(environment)
                 guard state.failRegisterRequests > 0 else { return nil }
                 state.failRegisterRequests -= 1
                 state.registerRequests += 1
@@ -283,15 +326,29 @@ final class AttributionCaptureProtocol: URLProtocol, @unchecked Sendable {
                 state.identifyUserIds.append(userId)
                 state.identifyDeviceIds.append(deviceInPath)
                 state.identifyAttributes.append(attributes)
-                return state.identifyReplies[userId] ?? .status(200)
+                if state.modelEnvironmentRows, !state.rows.contains("\(environment)|\(deviceInPath)") {
+                    state.identifyNotFound += 1
+                    return .notFound
+                }
+                let reply = state.identifyReplies[userId] ?? .status(200)
+                guard case .sequence(var replies) = reply, let next = replies.first else { return reply }
+                if replies.count > 1 {
+                    replies.removeFirst()
+                    state.identifyReplies[userId] = .sequence(replies)
+                }
+                return next
             }
             switch reply {
             case .status(let status):
                 respond(status, #"{"data":{}}"#)
+            case .notFound:
+                respond(404, #"{"error":{"code":"NOT_FOUND","message":"Device not found."}}"#)
+            case .sequence:
+                respond(500, #"{"error":{"code":"INTERNAL","message":"nested sequence"}}"#)
             case .lost:
                 client?.urlProtocol(self, didFailWithError: URLError(.networkConnectionLost))
             case .hold:
-                Self.with { $0.heldIdentify.append { status in self.respond(status, #"{"data":{}}"#) } }
+                Self.with { $0.heldIdentify.append { status, body in self.respond(status, body) } }
             }
         } else if path.hasSuffix(SDKEndpoints.ingest) {
             let count = Self.batch(body).count

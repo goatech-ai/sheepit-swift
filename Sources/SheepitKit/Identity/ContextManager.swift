@@ -20,7 +20,10 @@ final class ContextManager: @unchecked Sendable {
 
     private var _deviceId: String
     private var _anonymousId: String
-    private var _sessionId: String
+    /// Nil only in a process launched in the background whose stored session had expired
+    /// (0.6-C): no session exists until the app first comes to the foreground, and
+    /// `rolloverIfExpired()` mints one then.
+    private var _sessionId: String?
     private var _userId: String?
     /// What the server's device row holds (`ServerHeldUser`). `/v1/config` buckets on the row, so
     /// this — not `_userId` — is what a fetched config is labelled with.
@@ -80,7 +83,9 @@ final class ContextManager: @unchecked Sendable {
         return _anonymousId
     }
 
-    var sessionId: String {
+    /// The session id held in memory, live or not. Events read `eventContext().sessionId`
+    /// instead, which is nil once the session has aged out.
+    var sessionId: String? {
         lock.lock()
         defer { lock.unlock() }
         return _sessionId
@@ -110,10 +115,15 @@ final class ContextManager: @unchecked Sendable {
     ///   for the inert case). Reads still happen regardless of `persistOnInit`: a loser's (or
     ///   an inert client's) `status()` still needs a `deviceId`/`userId` to report, just not
     ///   one it wrote anywhere.
+    /// - Parameter launchedInBackground: the process started with no UI (a silent push, a
+    ///   background refresh task; see `AppForegroundState`). A live stored session is resumed
+    ///   as usual; an expired or missing one is NOT replaced, so nothing is minted, persisted
+    ///   or announced until the app comes to the foreground.
     init(
         storage: StorageProvider,
         now: @escaping @Sendable () -> Date = { Date() },
-        persistOnInit: Bool = true
+        persistOnInit: Bool = true,
+        launchedInBackground: Bool = false
     ) {
         self.storage = storage
         self.now = now
@@ -142,6 +152,13 @@ final class ContextManager: @unchecked Sendable {
             self._sessionId = storedSessionId
             self.sessionLastSeen = storedLastSeen ?? now()
             // Resuming an existing session — nothing to announce.
+            self._isNewSession = false
+        } else if launchedInBackground {
+            // Nobody is looking, so no session begins (0.6-C). `distantPast` makes the first
+            // foreground's `rolloverIfExpired()` mint and flag one, exactly as an expired
+            // session would.
+            self._sessionId = nil
+            self.sessionLastSeen = .distantPast
             self._isNewSession = false
         } else {
             self._sessionId = UUID().uuidString
@@ -191,6 +208,17 @@ final class ContextManager: @unchecked Sendable {
         storage.set(id, forKey: StorageKeys.deviceId)
     }
 
+    /// `setDeviceId(id)` only while the device is still `expected`, in one critical section: a
+    /// logout rotation's `setDeviceId` cannot land between the check and the write.
+    func replaceDeviceId(_ expected: String, with id: String) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        guard _deviceId == expected else { return false }
+        _deviceId = id
+        storage.set(id, forKey: StorageKeys.deviceId)
+        return true
+    }
+
     // MARK: - Session
 
     /// Records activity on the current session. **Bump-only — it never
@@ -212,26 +240,33 @@ final class ContextManager: @unchecked Sendable {
     func touchSession() {
         lock.lock()
         defer { lock.unlock() }
+        guard let sessionId = _sessionId else { return }
         let timestamp = now()
         sessionLastSeen = timestamp
-        storage.set(_sessionId, forKey: StorageKeys.sessionId)
+        storage.set(sessionId, forKey: StorageKeys.sessionId)
         storage.set(String(timestamp.timeIntervalSince1970), forKey: StorageKeys.sessionLastSeen)
     }
 
     /// Mint a new session if the idle window has elapsed, flagging that
     /// `$session_start` is owed. Idempotent within a live session, so it is
     /// safe to call on every `track()` as well as on app foreground.
-    func rolloverIfExpired() {
+    /// - Returns: whether a session was minted, so the caller can refresh what holds a copy of
+    ///   the id (the crash context).
+    @discardableResult
+    func rolloverIfExpired() -> Bool {
         lock.lock()
         defer { lock.unlock() }
         let timestamp = now()
+        // A background launch leaves no session and a `distantPast` last-seen, so this mints
+        // one on the first foreground with no separate nil check (0.6-C).
         guard timestamp.timeIntervalSince(sessionLastSeen) > SDKDefaults.sessionTimeoutSeconds else {
-            return
+            return false
         }
         _sessionId = UUID().uuidString
         sessionLastSeen = timestamp
         _isNewSession = true
         persistIds()
+        return true
     }
 
     /// Returns whether a `$session_start` is owed, clearing the flag so the
@@ -313,7 +348,11 @@ final class ContextManager: @unchecked Sendable {
         }
     }
 
-    func resetIdentity() {
+    /// - Parameter mintSession: false in the background (0.6-C). The old session is dropped, in
+    ///   memory and on disk, so the next user never joins it, and no new one is minted: a
+    ///   session minted here is never announced, so the first foreground would find it live and
+    ///   no `$session_start` would ever fire for it. The first foreground mints one instead.
+    func resetIdentity(mintSession: Bool = true) {
         lock.lock()
         defer { lock.unlock() }
         _userId = nil
@@ -321,8 +360,15 @@ final class ContextManager: @unchecked Sendable {
         // that row may hold a user, `SheepitClient.reset()` switches to a fresh device
         // (`DeviceRotation`), which sets the label for the new row.
         _anonymousId = UUID().uuidString
-        _sessionId = UUID().uuidString
-        sessionLastSeen = now()
+        if mintSession {
+            _sessionId = UUID().uuidString
+            sessionLastSeen = now()
+        } else {
+            _sessionId = nil
+            sessionLastSeen = .distantPast
+            storage.removeObject(forKey: StorageKeys.sessionId)
+            storage.removeObject(forKey: StorageKeys.sessionLastSeen)
+        }
         // Deliberately does NOT set `_isNewSession`. `reset()` mints a new
         // session id on the web too (`context.ts:162`), and the JS SDK does
         // not emit `$session_start` for it either — the emit lives only on
@@ -334,15 +380,19 @@ final class ContextManager: @unchecked Sendable {
 
     // MARK: - Context for Events
 
+    /// `sessionId` is nil once the session has aged out. In the foreground `track()` rolls
+    /// over first, so it is always live there; in the background (0.6-C) nothing rolls over or
+    /// extends it, so a background event joins the stored session only while it is live.
     func eventContext() -> EventContextSnapshot {
         lock.lock()
         defer { lock.unlock() }
+        let live = now().timeIntervalSince(sessionLastSeen) <= SDKDefaults.sessionTimeoutSeconds
         return EventContextSnapshot(
             deviceId: _deviceId,
             anonymousId: _anonymousId,
-            sessionId: _sessionId,
+            sessionId: live ? _sessionId : nil,
             userId: _userId,
-            platform: "ios",
+            platform: DeviceProfile.platform,
             // The same BCP-47 tag registration sends; see `DeviceProfile.wireLocaleTag`.
             locale: DeviceProfile.wireLocaleTag(.current)
                 ?? DeviceProfile.bounded(Locale.current.identifier, DeviceProfile.localeMaxLength),
@@ -356,7 +406,10 @@ final class ContextManager: @unchecked Sendable {
     private func persistIds() {
         storage.set(_deviceId, forKey: StorageKeys.deviceId)
         storage.set(_anonymousId, forKey: StorageKeys.anonymousId)
-        storage.set(_sessionId, forKey: StorageKeys.sessionId)
+        // No session (a background launch, 0.6-C): leave the stored, expired one as it is
+        // rather than writing a `distantPast` last-seen over it.
+        guard let sessionId = _sessionId else { return }
+        storage.set(sessionId, forKey: StorageKeys.sessionId)
         storage.set(String(sessionLastSeen.timeIntervalSince1970), forKey: StorageKeys.sessionLastSeen)
     }
 
@@ -374,7 +427,8 @@ final class ContextManager: @unchecked Sendable {
 struct EventContextSnapshot: Sendable {
     let deviceId: String
     let anonymousId: String
-    let sessionId: String
+    /// Nil when there is no live session (0.6-C); the wire then carries no `session.id`.
+    let sessionId: String?
     let userId: String?
     let platform: String
     let locale: String

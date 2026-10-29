@@ -165,7 +165,9 @@ final class SleepIntervalSanitizationTests: XCTestCase {
         )
         perfConfig.flushInterval = .nan // bypasses PerformanceConfig.init's clamp
 
-        let monitor = PerformanceMonitor(http: http, context: context, config: perfConfig, log: Logger(debug: false))
+        let monitor = PerformanceMonitor(
+            http: http, context: context, config: perfConfig, appVersionOverride: nil, log: Logger(debug: false)
+        )
         await monitor.start()
         try? await Task.sleep(for: .milliseconds(200))
         // Reaching here is the proof — the unfixed code traps inside the flush Task.

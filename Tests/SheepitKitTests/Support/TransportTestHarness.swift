@@ -88,6 +88,8 @@ final class StubURLProtocol: URLProtocol, @unchecked Sendable {
     nonisolated(unsafe) private static var _requestBodies: [Data] = []
     /// Every request path seen since `reset()`, in order.
     nonisolated(unsafe) private static var _requestPaths: [String] = []
+    /// Seconds to hold every response, to make an in-flight request observable. 0 = immediate.
+    nonisolated(unsafe) static var responseDelay: TimeInterval = 0
 
     static var stub: Stub {
         get { lock.lock(); defer { lock.unlock() }; return _stub }
@@ -122,6 +124,7 @@ final class StubURLProtocol: URLProtocol, @unchecked Sendable {
         _lastRequestURL = nil
         _requestBodies = []
         _requestPaths = []
+        responseDelay = 0
         lock.unlock()
     }
 
@@ -150,8 +153,17 @@ final class StubURLProtocol: URLProtocol, @unchecked Sendable {
         StubURLProtocol._lastRequestHeaders = request.allHTTPHeaderFields
         StubURLProtocol._lastRequestURL = request.url
         let stub = StubURLProtocol._stub
+        let delay = StubURLProtocol.responseDelay
         StubURLProtocol.lock.unlock()
 
+        if delay > 0 {
+            DispatchQueue.global().asyncAfter(deadline: .now() + delay) { self.respond(with: stub) }
+        } else {
+            respond(with: stub)
+        }
+    }
+
+    private func respond(with stub: Stub) {
         switch stub {
         case .failure(let error):
             client?.urlProtocol(self, didFailWithError: error)

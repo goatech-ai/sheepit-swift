@@ -411,7 +411,9 @@ final class IngestResponseAndRetryTests: XCTestCase {
 
     func testAnOverlongAppVersionIsBoundedAtCaptureAndOnTheWire() {
         let long = String(repeating: "v", count: 100)
-        XCTAssertEqual(TrackSnapshot.capture(appVersion: long).appVersion?.utf16.count, 64)
+        // 63, not the wire's 64: capture bounds to the crash buffer too, so a crash report carries
+        // the same version as the event (`DeviceProfile.boundedForAllStreams`, PR12).
+        XCTAssertEqual(TrackSnapshot.capture(appVersion: long).appVersion?.utf16.count, 63)
 
         // A queue written before the capture bound existed.
         let legacy = TrackSnapshot(

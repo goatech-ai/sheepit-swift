@@ -72,13 +72,55 @@ actor HTTPClient {
 
     // MARK: - Public API
 
+    /// - Parameter maxAttempts: overrides `config.retryAttempts` for this call (see `postRaw`).
     func post<T: Decodable & Sendable>(
         path: String,
         body: some Encodable & Sendable,
-        extraHeaders: [String: String] = [:]
+        extraHeaders: [String: String] = [:],
+        maxAttempts: Int? = nil
     ) async throws -> T {
-        let data = try await performRequest("POST", path: path, body: body, extraHeaders: extraHeaders)
+        let data = try await performRequest(
+            "POST", path: path, body: body, extraHeaders: extraHeaders, maxAttempts: maxAttempts
+        )
         return try JSONDecoder().decode(ApiDataResponse<T>.self, from: data).data
+    }
+
+    /// One POST attempt whose response comes back whatever its status, like `getRaw`: for a caller
+    /// that reads the error body or `Retry-After` and retries on its own schedule (the identify
+    /// ladder). Throws only when nothing came back: a network error or timeout, cancellation, or
+    /// `RequestPreconditionFailed` when `sendIf` no longer holds.
+    func postOnceRaw(
+        path: String,
+        body: some Encodable & Sendable,
+        sendIf: (@Sendable () -> Bool)? = nil
+    ) async throws -> (Data, HTTPURLResponse) {
+        try Task.checkCancellation()
+        if let sendIf, !sendIf() { throw RequestPreconditionFailed() }
+        var request = URLRequest(url: baseURL.appendingPathComponent(path))
+        request.httpMethod = "POST"
+        applyHeaders(to: &request, extraHeaders: [:])
+        request.httpBody = try JSONEncoder().encode(AnyEncodableWrapper(body))
+        let (data, response) = try await session.data(for: request)
+        guard let httpResponse = response as? HTTPURLResponse else {
+            throw SDKError.invalidResponse
+        }
+        return (data, httpResponse)
+    }
+
+    /// One POST of an already-encoded body (`FeedbackSender`'s multipart form), whose response
+    /// comes back whatever its status. `contentType` replaces the default JSON one. Throws only when
+    /// nothing came back: a network error or timeout, or cancellation.
+    func postMultipartOnce(path: String, body: Data, contentType: String) async throws -> (Data, HTTPURLResponse) {
+        try Task.checkCancellation()
+        var request = URLRequest(url: baseURL.appendingPathComponent(path))
+        request.httpMethod = "POST"
+        applyHeaders(to: &request, extraHeaders: ["Content-Type": contentType])
+        request.httpBody = body
+        let (data, response) = try await session.data(for: request)
+        guard let httpResponse = response as? HTTPURLResponse else {
+            throw SDKError.invalidResponse
+        }
+        return (data, httpResponse)
     }
 
     /// - Parameter sendIf: checked before EVERY attempt, the first and each retry after a 5xx or

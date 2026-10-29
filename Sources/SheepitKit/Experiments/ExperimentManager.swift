@@ -1,10 +1,17 @@
 import Foundation
 
+/// Why an exposure fired: the first read of the experiment, or a read after its arm changed.
+enum ExperimentExposureReason: String, Sendable {
+    case first
+    case variantChanged = "variant_changed"
+}
+
 /// Experiments are bucketed server-side. `/v1/config` returns
 /// `experiments: { experimentKey: { variant_key, payload, … } }` — one entry
 /// per experiment the device is enrolled in. The SDK caches the
-/// assignment, emits a single exposure per session, surfaces the
-/// variant, and snapshots every active assignment onto each tracked event.
+/// assignment, emits an exposure when an arm is first shown and again whenever
+/// the arm changes, surfaces the variant, and snapshots every active assignment
+/// onto each tracked event.
 ///
 /// No client-side bucketing. No traffic gates. All of that happens on the
 /// server so every platform agrees on the assignment for a given device.
@@ -22,18 +29,28 @@ final class ExperimentManager: @unchecked Sendable {
     /// Whether the current assignment set has already reported `experiment.identity_changed`.
     /// Bounds that diagnostic to one per applied set rather than one per event.
     private var identityChangeReported = false
-    /// Persisted per-session: remembers which variant we last surfaced.
-    private var stickyAssignments: [String: String] = [:]
-    private var exposed = Set<String>()
+    /// experiment key → the variant its exposure was recorded for. Keyed per ARM:
+    /// keyed per experiment, a subject moved to another arm was never exposed to
+    /// it, which diluted the readout and hid the move from SRM.
+    private var exposed: [String: String] = [:]
     private let storage: StorageProvider
     private let diagnostics: DiagnosticBus?
 
     init(storage: StorageProvider, diagnostics: DiagnosticBus? = nil) {
         self.storage = storage
         self.diagnostics = diagnostics
-        lock.lock()
-        defer { lock.unlock() }
-        loadStickyAssignments()
+    }
+
+    /// SheepitKit ≤ 0.7.0 persisted a per-experiment "sticky" variant that nothing ever read;
+    /// this SDK does not write it, and drops what an older one left.
+    ///
+    /// 🔴 Not in `init`: every `create()` candidate constructs this manager, including an inert
+    /// client and a losing `initialize()` candidate, and neither may write to disk (findings
+    /// E-001, MF3-1). `beginWork()` calls this, which only the published client runs.
+    func dropLegacyStickyMap() {
+        if storage.data(forKey: StorageKeys.experimentAssignments) != nil {
+            storage.removeObject(forKey: StorageKeys.experimentAssignments)
+        }
     }
 
     /// - Parameter appliedUnder: the identity the config was fetched under. Required, not
@@ -44,6 +61,9 @@ final class ExperimentManager: @unchecked Sendable {
         self.assignments = assignments
         appliedIdentity = appliedUnder
         identityChangeReported = false
+        // An experiment the server stopped sending is forgotten, so if the subject is
+        // enrolled again its next read is a first exposure.
+        exposed = exposed.filter { assignments[$0.key] != nil }
     }
 
     /// `setAssignments(_:appliedUnder: .fetchedUnder(appliedUnderUserId))`.
@@ -123,7 +143,7 @@ final class ExperimentManager: @unchecked Sendable {
     /// the device is not enrolled.
     func resolve(
         experimentKey: String,
-        onExposure: (String, String) -> Void
+        onExposure: (String, String, ExperimentExposureReason) -> Void
     ) -> SheepitExperimentResult {
         lock.lock()
 
@@ -133,18 +153,14 @@ final class ExperimentManager: @unchecked Sendable {
         }
 
         let variantKey = assignment.variantKey
-
-        if stickyAssignments[experimentKey] != variantKey {
-            stickyAssignments[experimentKey] = variantKey
-            saveStickyAssignments()
-        }
-
-        let isFirstExposure = exposed.insert(experimentKey).inserted
+        let seen = exposed[experimentKey]
+        let reason: ExperimentExposureReason? = seen == variantKey ? nil : (seen == nil ? .first : .variantChanged)
+        if reason != nil { exposed[experimentKey] = variantKey }
         lock.unlock()
 
         // Outside the lock — see the note on this type.
-        if isFirstExposure {
-            onExposure(experimentKey, variantKey)
+        if let reason {
+            onExposure(experimentKey, variantKey, reason)
         }
 
         // Audit E-008 — pass through `[String: AnyCodable]` directly
@@ -156,7 +172,8 @@ final class ExperimentManager: @unchecked Sendable {
         return SheepitExperimentResult(variant: variantKey, payload: payload)
     }
 
-    /// Drop the STICKY map. Used by `identify()` when the user id changes.
+    /// Forget which arms were exposed, so the new user's reads fire again. Used by
+    /// `identify()` when the user id changes.
     ///
     /// 🔴 Deliberately leaves `assignments` — the server's current bucketing —
     /// in place. `identify()` does not itself produce a new assignment; the next
@@ -184,7 +201,7 @@ final class ExperimentManager: @unchecked Sendable {
         // 🔴 ONE acquisition, not two. Releasing between clearing `assignments`
         // and calling `clearAssignments()` left a window in which ConfigSync's
         // callback thread could repopulate `assignments` via `setAssignments`,
-        // after which only the sticky map got wiped — the logged-out user's
+        // after which only the exposures got wiped — the logged-out user's
         // variant surviving a clear that appeared to succeed. `lock` is a
         // non-recursive NSLock, so the shared body is factored out rather than
         // re-entered.
@@ -199,21 +216,6 @@ final class ExperimentManager: @unchecked Sendable {
     /// Shared body of `clearAssignments()` / `clearForLogout()`.
     /// 🔴 Callers MUST hold `lock`.
     private func clearLocked() {
-        stickyAssignments.removeAll()
         exposed.removeAll()
-        storage.removeObject(forKey: StorageKeys.experimentAssignments)
-    }
-
-    // MARK: - Private (callers must hold `lock`)
-
-    private func loadStickyAssignments() {
-        guard let data = storage.data(forKey: StorageKeys.experimentAssignments),
-              let loaded = try? JSONDecoder().decode([String: String].self, from: data) else { return }
-        stickyAssignments = loaded
-    }
-
-    private func saveStickyAssignments() {
-        guard let data = try? JSONEncoder().encode(stickyAssignments) else { return }
-        storage.set(data, forKey: StorageKeys.experimentAssignments)
     }
 }

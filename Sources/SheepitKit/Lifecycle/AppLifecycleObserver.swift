@@ -37,6 +37,9 @@ final class AppLifecycleObserver: @unchecked Sendable {
     private let diagnostics: DiagnosticBus?
     private let backgroundTaskHost: @Sendable () -> BackgroundTaskHost
     private var observers: [NSObjectProtocol] = []
+    /// Foreground or background, written by the notifications below and read by `track()`
+    /// (0.6-C). See `AppForegroundState` for the premises.
+    let appState: AppForegroundState
 
     /// Runs when the app returns to the foreground: flush whatever the
     /// previous session left queued, then roll the session over and announce
@@ -51,9 +54,12 @@ final class AppLifecycleObserver: @unchecked Sendable {
     init(
         log: Logger,
         diagnostics: DiagnosticBus?,
+        // Defaulted for the observer-only tests; `SheepitClient` always passes its own.
+        appState: AppForegroundState = AppForegroundState(launchedInBackground: false, tracksAppState: false),
         backgroundTaskHost: (@Sendable () -> BackgroundTaskHost)? = nil,
         onBackground: @escaping @Sendable () async -> Void
     ) {
+        self.appState = appState
         self.log = log
         self.diagnostics = diagnostics
         self.backgroundTaskHost = backgroundTaskHost ?? {
@@ -73,6 +79,7 @@ final class AppLifecycleObserver: @unchecked Sendable {
             object: nil,
             queue: .main
         ) { [weak self] _ in
+            self?.appDidEnterBackground()
             self?.handleDidEnterBackground()
         }
         observers.append(token)
@@ -84,13 +91,55 @@ final class AppLifecycleObserver: @unchecked Sendable {
         ) { [weak self] _ in
             // No background-execution window needed: the app is coming back
             // to life, not suspending, so the ordinary flush loop is about to
-            // resume on its own.
+            // resume on its own. The state flips here, synchronously, so a `track()` racing
+            // the Task below already counts as foreground.
+            self?.appState.markForeground()
             Task { [weak self] in await self?.performForegroundCheck() }
         }
         observers.append(foregroundToken)
 
+        // The second foreground signal (0.6-C). It acts only while the state still says
+        // background, i.e. when `willEnterForeground` never arrived for this transition, which
+        // Firebase saw after a background launch. Every other activation is a no-op here.
+        let activeToken = NotificationCenter.default.addObserver(
+            forName: UIApplication.didBecomeActiveNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            guard let self, self.appState.markForeground() else { return }
+            Task { [weak self] in await self?.performForegroundCheck() }
+        }
+        observers.append(activeToken)
+
+        // The notifications above report transitions after this point. If the app is already
+        // active while the state says background (a `.background` read at construction, then an
+        // activation before this registration), no notification would ever correct it, and the
+        // process would run with no session until its next foreground.
+        if Thread.isMainThread, UIApplication.shared.applicationState == .active, appState.markForeground() {
+            Task { [weak self] in await self?.performForegroundCheck() }
+        }
+
         log.debug("Lifecycle observer registered (background flush, foreground session check)")
         #endif
+    }
+
+    /// What `didEnterBackgroundNotification` does to the state, before its flush.
+    func appDidEnterBackground() {
+        appState.markBackground()
+    }
+
+    /// What `willEnterForegroundNotification` triggers, as one call the macOS test host can
+    /// drive: the state flips, then the session check runs.
+    func appWillEnterForeground() async {
+        appState.markForeground()
+        await performForegroundCheck()
+    }
+
+    /// What `didBecomeActiveNotification` triggers: the session check, only when this is the
+    /// app's first foreground since the state last said background.
+    func appDidBecomeActive() async {
+        guard appState.markForeground() else { return }
+        await performForegroundCheck()
     }
 
     /// The work the foreground notification triggers, factored out for the

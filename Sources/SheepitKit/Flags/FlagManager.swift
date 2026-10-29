@@ -1,9 +1,16 @@
 import Foundation
 
+/// Why an exposure fired: the first read of the flag, or a read after its value changed.
+enum FlagExposureReason: String, Sendable {
+    case first
+    case valueChanged = "value_changed"
+}
+
 /// Applies evaluated Flag values received from `/v1/config` and surfaces
 /// them to calling code via `evaluate(...)`. Mirrors
 /// `packages/sdk-js/src/flags.ts` — all evaluation is server-side; the
-/// SDK only caches the result and tracks exposure once per session.
+/// SDK only caches the result and tracks exposure once per flag VALUE: a
+/// refresh that returns the same value is not a new exposure, a changed value is.
 /// All mutable state is lock-guarded: `setEvaluatedFlags` runs on
 /// ConfigSync's async callback while `evaluate` / `count` run on whatever
 /// thread the host app calls `flag()` from. ThreadSanitizer reports the
@@ -18,7 +25,10 @@ final class FlagManager: @unchecked Sendable {
     private let lock = NSLock()
     private var flagValues: [String: AnyCodable] = [:]
     private var debugOverrides: [String: FlagValue] = [:]
-    private var exposed = Set<String>()
+    /// flag key → the value its exposure was recorded for.
+    private var exposed: [String: FlagValue] = [:]
+    /// Exposed keys whose value has changed since: their next read re-fires.
+    private var stale = Set<String>()
     /// Resolved once at init from `SheepitConfig.allowFlagOverrides ?? config.debug`
     /// and never changed again — see `SheepitClient.init`. `overrideFlag` (the
     /// WRITE path) no-ops and does not persist while this is false, and
@@ -40,7 +50,22 @@ final class FlagManager: @unchecked Sendable {
     func setEvaluatedFlags(_ flags: [String: AnyCodable]) {
         lock.lock()
         self.flagValues = flags
-        self.exposed.removeAll()
+        // 🔴 Do NOT clear the dedup here. This used to, from when config was fetched
+        // once per session; with polling every apply re-fired `$flag_exposure` for
+        // every flag read, every refresh. Compare instead. A key the server stopped
+        // sending is forgotten, so if it comes back its next read is a first exposure.
+        for (key, seen) in exposed {
+            guard let raw = flags[key] else {
+                exposed.removeValue(forKey: key)
+                stale.remove(key)
+                continue
+            }
+            if FlagValue.from(raw.value) == seen {
+                stale.remove(key)
+            } else {
+                stale.insert(key)
+            }
+        }
         lock.unlock()
         notifyChange()
     }
@@ -127,11 +152,11 @@ final class FlagManager: @unchecked Sendable {
     }
 
     /// Evaluate a flag. Returns the resolved value or the default.
-    /// Fires onExposure callback once per session per flag.
+    /// Fires `onExposure` on the first read of a value, and once more after a refresh changes it.
     func evaluate(
         flagKey: String,
         defaultValue: FlagValue,
-        onExposure: (String, FlagValue) -> Void
+        onExposure: (String, FlagValue, FlagExposureReason) -> Void
     ) -> FlagValue {
         lock.lock()
 
@@ -147,12 +172,18 @@ final class FlagManager: @unchecked Sendable {
         }
 
         let value = FlagValue.from(raw.value)
-        let isFirstExposure = exposed.insert(flagKey).inserted
+        let reason: FlagExposureReason?
+        if stale.remove(flagKey) != nil {
+            reason = .valueChanged
+        } else {
+            reason = exposed[flagKey] == nil ? .first : nil
+        }
+        if reason != nil { exposed[flagKey] = value }
         lock.unlock()
 
         // Outside the lock — see the note on this type.
-        if isFirstExposure {
-            onExposure(flagKey, value)
+        if let reason {
+            onExposure(flagKey, value, reason)
         }
         return value
     }
@@ -200,10 +231,12 @@ final class FlagManager: @unchecked Sendable {
         return keys.sorted()
     }
 
+    /// Forget which values were exposed, so each next read fires again. Called when the identity changes.
     func clearExposed() {
         lock.lock()
         defer { lock.unlock() }
         exposed.removeAll()
+        stale.removeAll()
     }
 
     /// Forget the evaluated values. Called on `reset()` (logout).
@@ -216,6 +249,7 @@ final class FlagManager: @unchecked Sendable {
         lock.lock()
         flagValues.removeAll()
         exposed.removeAll()
+        stale.removeAll()
         lock.unlock()
         // 🔴 Every other mutator notifies; this one did not. A SwiftUI view
         // awaiting `changes()` would keep rendering the logged-out user's

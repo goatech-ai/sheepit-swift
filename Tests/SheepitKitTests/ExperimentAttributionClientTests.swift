@@ -19,7 +19,7 @@ final class ExperimentAttributionClientTests: XCTestCase {
                     // A persisted identity makes every later client in the process re-POST it at
                     // launch, which keeps config work in flight into other suites' tests.
                     StorageKeys.identity] {
-            defaults.removeObject(forKey: key)
+            SharedSDKStorage.remove(key, from: defaults)
         }
     }
 
@@ -52,7 +52,9 @@ final class ExperimentAttributionClientTests: XCTestCase {
         return try JSONDecoder().decode(SDKExperimentAssignment.self, from: Data(json.utf8))
     }
 
-    private func makeClient(retryAttempts: Int = 1) -> SheepitClient {
+    /// `identifyRetryDelays`: the identify ladder's waits; `[]` (the default here) sends each identify
+    /// POST once, which is what these attribution cases script against.
+    private func makeClient(identifyRetryDelays: [TimeInterval] = []) -> SheepitClient {
         SheepitClient.createForTesting(
             config: SheepitConfig(
                 apiKey: "lp_pub_tst_" + String(repeating: "a", count: 64),
@@ -60,13 +62,14 @@ final class ExperimentAttributionClientTests: XCTestCase {
                 flushInterval: 3600,
                 flushSize: 1000,
                 configRefreshInterval: 3600,
-                retryAttempts: retryAttempts,
+                retryAttempts: 1,
                 // 🔴 A client with crash reporting on installs real signal handlers into the test
                 // process, which then dies with signal 11 in whichever test runs next.
                 crashes: CrashConfig(enabled: false)
             ),
             now: { Date() },
-            urlProtocolClasses: [AttributionCaptureProtocol.self]
+            urlProtocolClasses: [AttributionCaptureProtocol.self],
+            identifyRetryDelays: identifyRetryDelays
         )
     }
 
@@ -447,7 +450,7 @@ final class ExperimentAttributionClientTests: XCTestCase {
     /// A destroyed client's identify POST must not retry later and move the server's row after a
     /// newer client recorded what it holds.
     func testDestroyStopsAnIdentifyPostDuringItsRetryBackoff() async throws {
-        let client = makeClient(retryAttempts: 3)
+        let client = makeClient(identifyRetryDelays: IdentifyLadder.retryDelays)
         await waitForStartupFetch()
         let user = "user-retry-\(UUID().uuidString)"
         AttributionCaptureProtocol.setIdentifyReply(.status(500), for: user)
@@ -457,7 +460,7 @@ final class ExperimentAttributionClientTests: XCTestCase {
         let firstAttempt = await waitUntil { attempts() == 1 }
         XCTAssertTrue(firstAttempt, "precondition: the first attempt failed and a retry is backing off")
         client.destroy()
-        try await Task.sleep(for: .seconds(SDKDefaults.retryBackoff[0] + 1))
+        try await Task.sleep(for: .seconds(IdentifyLadder.retryDelays[0] * 1.5 + 1))
 
         XCTAssertEqual(attempts(), 1, "no attempt may be sent after destroy()")
     }
@@ -555,9 +558,9 @@ final class ExperimentAttributionClientTests: XCTestCase {
     /// previous user, the next config was bucketed for them, and these events had to be marked.
     func testResetRotatesToAFreshDeviceWhoseAnonymousEventsAreAttributed() async throws {
         let defaults = try XCTUnwrap(UserDefaults(suiteName: Self.suite))
-        defaults.set("1", forKey: StorageKeys.deviceRegistered)
+        SharedSDKStorage.markRegistered()
         defer {
-            defaults.removeObject(forKey: StorageKeys.deviceRegistered)
+            SharedSDKStorage.remove(StorageKeys.deviceRegistered, from: defaults)
             defaults.removeObject(forKey: StorageKeys.deviceId)
         }
         let minted = "dev_\(UUID().uuidString)"
@@ -595,9 +598,9 @@ final class ExperimentAttributionClientTests: XCTestCase {
         let defaults = try XCTUnwrap(UserDefaults(suiteName: Self.suite))
         for key in [StorageKeys.deviceId, StorageKeys.deviceRegistered,
                     StorageKeys.deviceRegistrationBackoffUntil, StorageKeys.identity] {
-            defaults.removeObject(forKey: key)
+            SharedSDKStorage.remove(key, from: defaults)
         }
-        defaults.set(try JSONEncoder().encode(ServerHeldUser.known("previous-row-user")), forKey: StorageKeys.serverHeldUser)
+        defaults.set(try JSONEncoder().encode(ServerHeldUser.known("previous-row-user")), forKey: SharedSDKStorage.slot(StorageKeys.serverHeldUser))
         let minted = "dev_\(UUID().uuidString)"
         AttributionCaptureProtocol.registerDeviceId = minted
 
@@ -618,7 +621,7 @@ final class ExperimentAttributionClientTests: XCTestCase {
         previous.identify(userId: userB)
         await previous.awaitIdentityPostForTesting()
         previous.destroy()
-        defaults.set(try JSONEncoder().encode(ServerHeldUser.unknown), forKey: StorageKeys.serverHeldUser)
+        defaults.set(try JSONEncoder().encode(ServerHeldUser.unknown), forKey: SharedSDKStorage.slot(StorageKeys.serverHeldUser))
         AttributionCaptureProtocol.reset()
 
         let relaunched = makeClient()
@@ -628,7 +631,7 @@ final class ExperimentAttributionClientTests: XCTestCase {
         XCTAssertEqual(relaunched.context.serverHeldUser.user, .known(userB))
 
         defaults.removeObject(forKey: StorageKeys.identity)
-        defaults.set(try JSONEncoder().encode(ServerHeldUser.unknown), forKey: StorageKeys.serverHeldUser)
+        defaults.set(try JSONEncoder().encode(ServerHeldUser.unknown), forKey: SharedSDKStorage.slot(StorageKeys.serverHeldUser))
         AttributionCaptureProtocol.reset()
         let anonymous = makeClient()
         defer { anonymous.destroy() }
@@ -667,7 +670,7 @@ final class ExperimentAttributionClientTests: XCTestCase {
         previous.identify(userId: userB)
         await previous.awaitIdentityPostForTesting()
         previous.destroy()
-        let label = defaults.data(forKey: StorageKeys.sdkConfigFetchedUnder)
+        let label = defaults.data(forKey: SharedSDKStorage.slot(StorageKeys.sdkConfigFetchedUnder))
             .flatMap { try? JSONDecoder().decode(ServerHeldUser.self, from: $0) }
         XCTAssertEqual(label, .known(userB), "precondition: the cached body is labelled B")
 

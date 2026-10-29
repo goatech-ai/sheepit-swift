@@ -22,8 +22,8 @@ final class DeviceRegistrationTests: XCTestCase {
     private func clearDeviceStorage() {
         guard let defaults = UserDefaults(suiteName: suiteName) else { return }
         defaults.removeObject(forKey: StorageKeys.deviceId)
-        defaults.removeObject(forKey: StorageKeys.deviceRegistered)
-        defaults.removeObject(forKey: StorageKeys.deviceRegistrationBackoffUntil)
+        SharedSDKStorage.remove(StorageKeys.deviceRegistered, from: defaults)
+        SharedSDKStorage.remove(StorageKeys.deviceRegistrationBackoffUntil, from: defaults)
         defaults.removeObject(forKey: StorageKeys.sessionId)
         defaults.removeObject(forKey: StorageKeys.sessionLastSeen)
         // A prior run of `testSuccessfulRegistrationAdoptsTheServerIdAndIdentifyAwaitsIt`
@@ -119,7 +119,7 @@ final class DeviceRegistrationTests: XCTestCase {
     // MARK: - 2. Already-registered storage skips it
 
     func testAnAlreadyRegisteredDeviceDoesNotRegisterAgain() async {
-        UserDefaults(suiteName: suiteName)?.set("1", forKey: StorageKeys.deviceRegistered)
+        SharedSDKStorage.markRegistered()
         RegistrationStubURLProtocol.setResponder { _, _ in .status(200, body: self.configSuccessBody) }
 
         let client = SheepitClient.createForTesting(
@@ -362,7 +362,7 @@ final class DeviceRegistrationTests: XCTestCase {
         first.destroy()
 
         XCTAssertNil(
-            UserDefaults(suiteName: suiteName)?.string(forKey: StorageKeys.deviceRegistered),
+            UserDefaults(suiteName: suiteName)?.string(forKey: SharedSDKStorage.slot(StorageKeys.deviceRegistered)),
             """
             The naive fix (guard on whether an id was minted) breaks exactly this case: the \
             locally-minted id is persisted regardless of whether the network round trip \
@@ -393,9 +393,8 @@ final class DeviceRegistrationTests: XCTestCase {
             2,
             "the second launch must retry registration since the first attempt never succeeded"
         )
-        XCTAssertEqual(
-            UserDefaults(suiteName: suiteName)?.string(forKey: StorageKeys.deviceRegistered),
-            "1",
+        XCTAssertTrue(
+            SharedSDKStorage.isRegistered(),
             "the second, successful attempt must set the flag"
         )
     }
@@ -503,8 +502,7 @@ final class DeviceRegistrationTests: XCTestCase {
     /// first auto-flush at all. Uses a tight timeout (well under the suite's usual 3s) as a
     /// coarse proxy for "not deferred."
     func testAnAlreadyRegisteredDevicesAutoFlushIsNeverDeferred() async {
-        UserDefaults(suiteName: suiteName)?.set("dev_existing", forKey: StorageKeys.deviceId)
-        UserDefaults(suiteName: suiteName)?.set("1", forKey: StorageKeys.deviceRegistered)
+        SharedSDKStorage.markRegistered("dev_existing")
         RegistrationStubURLProtocol.setResponder { method, path in
             if method == "POST", path == SDKEndpoints.ingest {
                 return .status(200, body: #"{"data":{"accepted":1}}"#)
@@ -575,13 +573,13 @@ final class DeviceRegistrationTests: XCTestCase {
         try? await Task.sleep(for: .milliseconds(50))
 
         XCTAssertNil(
-            UserDefaults(suiteName: suiteName)?.string(forKey: StorageKeys.deviceRegistered),
+            UserDefaults(suiteName: suiteName)?.string(forKey: SharedSDKStorage.slot(StorageKeys.deviceRegistered)),
             "a terminal failure must never be recorded as a success"
         )
 
         guard
             let raw = UserDefaults(suiteName: suiteName)?.string(
-                forKey: StorageKeys.deviceRegistrationBackoffUntil
+                forKey: SharedSDKStorage.slot(StorageKeys.deviceRegistrationBackoffUntil)
             ),
             let until = TimeInterval(raw)
         else {
@@ -664,7 +662,7 @@ final class DeviceRegistrationTests: XCTestCase {
         // raced that write and failed ~20% of runs.
         await waitUntil {
             UserDefaults(suiteName: self.suiteName)?
-                .string(forKey: StorageKeys.deviceRegistrationBackoffUntil) != nil
+                .string(forKey: SharedSDKStorage.slot(StorageKeys.deviceRegistrationBackoffUntil)) != nil
         }
         first.destroy()
 
@@ -687,8 +685,7 @@ final class DeviceRegistrationTests: XCTestCase {
         // is sent, while `gt_device_registered` is written only once the 200 comes back
         // and is processed, so asserting on it right after a count-based wait is a race.
         await waitUntil {
-            UserDefaults(suiteName: self.suiteName)?
-                .string(forKey: StorageKeys.deviceRegistered) == "1"
+            SharedSDKStorage.isRegistered()
         }
 
         XCTAssertEqual(
@@ -696,9 +693,8 @@ final class DeviceRegistrationTests: XCTestCase {
             2,
             "a launch after the backoff window elapses must retry"
         )
-        XCTAssertEqual(
-            UserDefaults(suiteName: suiteName)?.string(forKey: StorageKeys.deviceRegistered),
-            "1",
+        XCTAssertTrue(
+            SharedSDKStorage.isRegistered(),
             "a retry that now succeeds must be recorded as such"
         )
     }
@@ -734,13 +730,13 @@ final class DeviceRegistrationTests: XCTestCase {
         try? await Task.sleep(for: .milliseconds(50))
 
         XCTAssertNil(
-            UserDefaults(suiteName: suiteName)?.string(forKey: StorageKeys.deviceRegistered),
+            UserDefaults(suiteName: suiteName)?.string(forKey: SharedSDKStorage.slot(StorageKeys.deviceRegistered)),
             "a capped registration must never be recorded as a success"
         )
 
         guard
             let raw = UserDefaults(suiteName: suiteName)?.string(
-                forKey: StorageKeys.deviceRegistrationBackoffUntil
+                forKey: SharedSDKStorage.slot(StorageKeys.deviceRegistrationBackoffUntil)
             ),
             let until = TimeInterval(raw)
         else {
@@ -836,7 +832,7 @@ final class DeviceRegistrationTests: XCTestCase {
 
         guard
             let raw = UserDefaults(suiteName: suiteName)?.string(
-                forKey: StorageKeys.deviceRegistrationBackoffUntil
+                forKey: SharedSDKStorage.slot(StorageKeys.deviceRegistrationBackoffUntil)
             ),
             let until = TimeInterval(raw)
         else {
@@ -880,7 +876,7 @@ final class DeviceRegistrationTests: XCTestCase {
         XCTAssertNotNil(diagnostic, "429 gets its own outcome value, distinct from a 402/422")
 
         XCTAssertNil(
-            UserDefaults(suiteName: suiteName)?.string(forKey: StorageKeys.deviceRegistrationBackoffUntil),
+            UserDefaults(suiteName: suiteName)?.string(forKey: SharedSDKStorage.slot(StorageKeys.deviceRegistrationBackoffUntil)),
             "a 429 must NOT persist the cross-cold-start backoff window — only 402/422 do"
         )
     }
@@ -917,11 +913,11 @@ final class DeviceRegistrationTests: XCTestCase {
             RegistrationStubURLProtocol.requests(method: "POST", path: SDKEndpoints.deviceRegister).count >= 2
         }
         await waitUntil(timeout: 1.0) {
-            UserDefaults(suiteName: self.suiteName)?.string(forKey: StorageKeys.deviceRegistered) == "1"
+            SharedSDKStorage.isRegistered()
         }
         XCTAssertEqual(client.status().deviceId, "dev_after_cap_retry")
         XCTAssertNil(
-            UserDefaults(suiteName: suiteName)?.string(forKey: StorageKeys.deviceRegistrationBackoffUntil),
+            UserDefaults(suiteName: suiteName)?.string(forKey: SharedSDKStorage.slot(StorageKeys.deviceRegistrationBackoffUntil)),
             "a chain that eventually succeeds must clear whatever backoff the failed attempt recorded"
         )
     }

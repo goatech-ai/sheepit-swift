@@ -71,6 +71,39 @@ final class OfflineQueue: @unchecked Sendable {
         )
     }
 
+    /// What `adoptPersisted` did, for the caller to report once no lock is held.
+    struct Adoption: Equatable {
+        /// Adopted events still queued after the trim.
+        let kept: Int
+        let trimmed: Int
+        let unencodable: Int
+    }
+
+    /// Put a queue persisted under another key (the pre-0.8.0 unscoped `gt_offline_queue`,
+    /// `StorageScope.adoptLegacyState`) ahead of this one: those events are older than anything
+    /// enqueued since launch. An event already queued here is skipped: a process killed between this
+    /// save and the caller removing the old key adopts the same events again on the next launch.
+    /// Emits nothing (the caller holds a process-wide lock); undecodable data adopts nothing.
+    func adoptPersisted(_ data: Data) -> Adoption {
+        guard let decoded = try? JSONDecoder().decode([EnrichedEvent].self, from: data) else {
+            return Adoption(kept: 0, trimmed: 0, unencodable: 0)
+        }
+        lock.lock()
+        defer { lock.unlock() }
+        let present = Set(events.map(\.eventId))
+        let older = decoded.filter { !present.contains($0.eventId) }
+        guard !older.isEmpty else { return Adoption(kept: 0, trimmed: 0, unencodable: 0) }
+        events = older + events
+        var trimmed = 0
+        if events.count > maxSize {
+            trimmed = events.count - maxSize
+            events = Array(events.suffix(maxSize))
+        }
+        let unencodable = save()
+        let adoptedIds = Set(older.map(\.eventId))
+        return Adoption(kept: events.filter { adoptedIds.contains($0.eventId) }.count, trimmed: trimmed, unencodable: unencodable)
+    }
+
     func drain() -> [EnrichedEvent] {
         lock.lock()
         defer { lock.unlock() }

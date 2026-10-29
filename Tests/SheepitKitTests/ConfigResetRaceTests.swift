@@ -15,7 +15,7 @@ final class ConfigResetRaceTests: XCTestCase {
         guard let defaults = UserDefaults(suiteName: suite) else { return }
         for key in [StorageKeys.sdkConfig, StorageKeys.sdkConfigCachedAt,
                     StorageKeys.sdkConfigFetchedUnder, StorageKeys.serverHeldUser, StorageKeys.identity] {
-            defaults.removeObject(forKey: key)
+            SharedSDKStorage.remove(key, from: defaults)
         }
     }
 
@@ -118,10 +118,10 @@ final class ConfigResetRaceTests: XCTestCase {
         XCTAssertTrue(started, "precondition: the start-up fetch ran, so the cache load is behind us")
 
         client.reset()
-        defaults.set(Data("{}".utf8), forKey: StorageKeys.sdkConfig)
+        defaults.set(Data("{}".utf8), forKey: SharedSDKStorage.slot(StorageKeys.sdkConfig))
         try await Task.sleep(for: .milliseconds(300))
 
-        XCTAssertNotNil(defaults.data(forKey: StorageKeys.sdkConfig),
+        XCTAssertNotNil(defaults.data(forKey: SharedSDKStorage.slot(StorageKeys.sdkConfig)),
                         "something queued by reset() deleted a cache written after it")
     }
 
@@ -141,7 +141,7 @@ final class ConfigResetRaceTests: XCTestCase {
         client.reset()
         await inFlight.value
 
-        XCTAssertNil(defaults.data(forKey: StorageKeys.sdkConfig))
+        XCTAssertNil(defaults.data(forKey: SharedSDKStorage.slot(StorageKeys.sdkConfig)))
         XCTAssertEqual(client.status().experimentCount, 0)
     }
 }

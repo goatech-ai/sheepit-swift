@@ -53,10 +53,7 @@ struct RegistrationRejection: Sendable, Equatable {
             let json = try? JSONSerialization.jsonObject(with: Data(body.utf8)) as? [String: Any],
             let error = json["error"] as? [String: Any]
         else { return rejection }
-        if let code = error["code"] as? String, code.utf16.count <= 64,
-           code.allSatisfy({ $0.isASCII && ($0.isUppercase || $0.isNumber || $0 == "_") }) {
-            rejection.reason = code
-        }
+        rejection.reason = apiErrorCode(in: error)
         if let details = error["details"] as? [String: Any],
            let fieldErrors = details["fieldErrors"] as? [String: Any] {
             rejection.rejectedFields = fieldErrors.keys
@@ -66,6 +63,24 @@ struct RegistrationRejection: Sendable, Equatable {
                 .map { $0 }
         }
         return rejection
+    }
+
+    /// The API's `error.code` from an error envelope's `error` object, when it is one of ours
+    /// (upper-case ASCII, digits and `_`, at most 64 long); anything else is not trusted as a code.
+    static func apiErrorCode(in error: [String: Any]) -> String? {
+        guard let code = error["code"] as? String, code.utf16.count <= 64,
+              code.allSatisfy({ $0.isASCII && ($0.isUppercase || $0.isNumber || $0 == "_") })
+        else { return nil }
+        return code
+    }
+
+    /// `apiErrorCode(in:)` for a whole response body; nil when the body is not the envelope.
+    static func apiErrorCode(body: Data) -> String? {
+        guard
+            let json = try? JSONSerialization.jsonObject(with: body) as? [String: Any],
+            let error = json["error"] as? [String: Any]
+        else { return nil }
+        return apiErrorCode(in: error)
     }
 
     /// Diagnostic payload fields shared by the launch and rotation paths.
@@ -82,6 +97,8 @@ struct RegistrationRejection: Sendable, Equatable {
 actor DeviceManager {
     private let http: HTTPClient
     private let log: Logger
+    /// `SheepitConfig.appVersion`; see `DeviceProfile.wireAppVersion(override:)`.
+    private let appVersionOverride: String?
 
     /// 401 (revoked/invalid key), 403 (forbidden) — the statuses `HTTPClient` throws as
     /// `.httpError` that no amount of retrying will ever turn into success. A 400 is terminal
@@ -94,23 +111,33 @@ actor DeviceManager {
     /// `terminalStatusCodes` above. Fix round 1 (PR #1170 review): 402 joined 422 here.
     private static let capStatusCodes: Set<Int> = [402, 422]
 
-    init(http: HTTPClient, log: Logger) {
+    init(http: HTTPClient, log: Logger, appVersionOverride: String?) {
         self.http = http
         self.log = log
+        self.appVersionOverride = appVersionOverride
     }
 
     /// Register this device with the API.
-    func register(anonymousId: String, existingDeviceId: String?) async -> RegistrationOutcome {
+    ///
+    /// - Parameter maxAttempts: overrides `config.retryAttempts` (`HTTPClient.postRaw`). `1` for a
+    ///   caller that something else is waiting on (the identify ladder's replacement device).
+    func register(
+        anonymousId: String,
+        existingDeviceId: String?,
+        maxAttempts: Int? = nil
+    ) async -> RegistrationOutcome {
         let request = Self.registrationRequest(
             anonymousId: anonymousId,
             existingDeviceId: existingDeviceId,
+            appVersionOverride: appVersionOverride,
             locale: Locale.current
         )
 
         do {
             let response: DeviceRegisterResponse = try await http.post(
                 path: SDKEndpoints.deviceRegister,
-                body: request
+                body: request,
+                maxAttempts: maxAttempts
             )
             log.debug("Device registered: \(response.deviceId)")
             return .success(deviceId: response.deviceId)
@@ -153,18 +180,19 @@ actor DeviceManager {
     static func registrationRequest(
         anonymousId: String,
         existingDeviceId: String?,
+        appVersionOverride: String?,
         locale: Locale
     ) -> DeviceRegisterRequest {
         DeviceRegisterRequest(
             deviceId: existingDeviceId,
             anonymousId: anonymousId,
-            platform: "ios",
+            platform: DeviceProfile.platform,
             deviceModel: DeviceProfile.deviceModel(),
             osName: DeviceProfile.osName,
             osVersion: DeviceProfile.osVersion(),
-            // Host-supplied Info.plist strings; the schema caps both at 64.
-            appVersion: DeviceProfile.appVersion().map { DeviceProfile.bounded($0, SDKDefaults.appVersionMaxLength) },
-            buildNumber: DeviceProfile.buildNumber().map { DeviceProfile.bounded($0, SDKDefaults.appVersionMaxLength) },
+            // The same version and build events, crashes and perf send; the schema caps both at 64.
+            appVersion: DeviceProfile.wireAppVersion(override: appVersionOverride),
+            buildNumber: DeviceProfile.wireBuildNumber(),
             locale: DeviceProfile.wireLocaleTag(locale),
             // `length(2)`: a UN M.49 area ("419" on es-419 devices, "001") is sent as no country.
             country: TrackSnapshot.countryCode(locale.region?.identifier),
@@ -172,7 +200,9 @@ actor DeviceManager {
         )
     }
 
-    /// Post identity resolution to the server.
+    /// One identify request (`POST /v1/devices/:id/identify`); `IdentifyLadder` decides what to do
+    /// with the answer. Single attempt: the ladder owns every retry, so its attempt count is the
+    /// number of POSTs sent and a 503's `Retry-After` reaches it.
     ///
     /// Success is the status alone, not a decoded body: the caller only needs to know the device
     /// row now names this user, and a response-shape drift must not make a stored identity look
@@ -182,57 +212,40 @@ actor DeviceManager {
     /// 🔴 Never sends `attributes`. The SDK used to forward `identify()` traits into
     /// `device_assignments.attributes`, which GDPR erase did not clear — see D-SDK4.
     ///
-    /// - Parameter sendIf: checked before every HTTP attempt, retries included (`HTTPClient.postRaw`).
-    @discardableResult
-    func identify(
+    /// - Parameter sendIf: checked right before the request goes out.
+    /// - Returns: nil when nothing was sent (`sendIf` no longer held, or the task was cancelled);
+    ///   status 0 for a network error or timeout.
+    func identifyOnce(
         deviceId: String,
         userId: String,
         sendIf: (@Sendable () -> Bool)? = nil
-    ) async -> IdentifyOutcome {
+    ) async -> IdentifyResponse? {
         let request = DeviceIdentifyRequest(userId: userId, attributes: nil)
-
         do {
-            _ = try await http.postRaw(
+            let (data, response) = try await http.postOnceRaw(
                 path: SDKEndpoints.deviceIdentify(deviceId: deviceId),
                 body: request,
                 sendIf: sendIf
             )
-            log.debug("Identity resolved")
-            return .stored
+            let status = response.statusCode
+            if (200..<300).contains(status) {
+                log.debug("Identity resolved")
+                return IdentifyResponse(status: status, retryAfter: nil, code: nil)
+            }
+            log.warn("Identity resolve answered \(status)")
+            return IdentifyResponse(
+                status: status,
+                retryAfter: HTTPClient.parseRetryAfter(response.value(forHTTPHeaderField: "Retry-After")),
+                code: RegistrationRejection.apiErrorCode(body: data)
+            )
         } catch is RequestPreconditionFailed {
             log.debug("Identity resolve abandoned before an attempt: its precondition no longer holds")
-            return .notSent
-        } catch SDKError.badRequest {
-            log.warn("Identity resolve rejected (400)")
-            return .rejected(statusCode: 400)
-        } catch SDKError.httpError(let statusCode) where Self.isRejection(statusCode) {
-            log.warn("Identity resolve rejected (\(statusCode))")
-            return .rejected(statusCode: statusCode)
+            return nil
         } catch {
+            if error is CancellationError || Task.isCancelled { return nil }
             log.warn("Identity resolve failed: \(error.localizedDescription)")
-            return .failed
+            return IdentifyResponse(status: 0, retryAfter: nil, code: nil)
         }
     }
-
-    /// A 4xx the same request cannot turn into a 2xx by being sent again. 408 is a timeout and
-    /// 429 a rate limit (thrown as `SDKError.rateLimited`, never reaching here), so both stay
-    /// retryable.
-    private static func isRejection(_ statusCode: Int) -> Bool {
-        (400..<500).contains(statusCode) && statusCode != 408 && statusCode != 429
-    }
 }
 
-/// Outcome of `DeviceManager.identify()`.
-enum IdentifyOutcome: Sendable, Equatable {
-    /// A 2xx: the server's device row holds the posted user.
-    case stored
-    /// Network error, lost response, 5xx, 408 or 429. The row may or may not hold the user, and
-    /// sending the same request later can succeed.
-    case failed
-    /// Any other 4xx (400 invalid body, 401/403 key, 404 unknown device). Sending
-    /// the same request again gets the same answer.
-    case rejected(statusCode: Int)
-    /// The caller's `sendIf` stopped an attempt. An EARLIER attempt may have been sent (a 5xx or
-    /// network error before the retry), so the row may or may not hold the user.
-    case notSent
-}

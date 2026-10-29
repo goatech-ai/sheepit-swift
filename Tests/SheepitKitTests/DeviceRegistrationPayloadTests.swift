@@ -51,6 +51,7 @@ final class DeviceRegistrationPayloadTests: XCTestCase {
             let body = try encoded(DeviceManager.registrationRequest(
                 anonymousId: "anon-1",
                 existingDeviceId: nil,
+                appVersionOverride: nil,
                 locale: Locale(identifier: sample.identifier)
             ))
             for (field, max) in schemaMax {
@@ -70,6 +71,7 @@ final class DeviceRegistrationPayloadTests: XCTestCase {
             let body = try encoded(DeviceManager.registrationRequest(
                 anonymousId: "anon-1",
                 existingDeviceId: nil,
+                appVersionOverride: nil,
                 locale: Locale(identifier: sample.identifier)
             ))
             XCTAssertEqual(body["locale"] as? String, sample.locale, sample.identifier)
@@ -94,7 +96,7 @@ final class DeviceRegistrationPayloadTests: XCTestCase {
                     StorageKeys.deviceRegistrationBackoffUntil,
                     StorageKeys.deviceRegistrationBackoffSDKVersion, StorageKeys.sessionId,
                     StorageKeys.sessionLastSeen, StorageKeys.identity] {
-            defaults.removeObject(forKey: key)
+            SharedSDKStorage.remove(key, from: defaults)
         }
     }
 
@@ -158,9 +160,9 @@ final class DeviceRegistrationPayloadTests: XCTestCase {
             client.getRecentDiagnostics().contains { $0.code == "identity.device_registration_terminal_failure" }
         }
 
-        let raw = UserDefaults(suiteName: suiteName)?.string(forKey: StorageKeys.deviceRegistrationBackoffUntil)
+        let raw = UserDefaults(suiteName: suiteName)?.string(forKey: SharedSDKStorage.slot(StorageKeys.deviceRegistrationBackoffUntil))
         XCTAssertNotNil(raw, "a 400 re-sends the same body forever: it must back off, not retry every launch")
-        XCTAssertNil(UserDefaults(suiteName: suiteName)?.string(forKey: StorageKeys.deviceRegistered))
+        XCTAssertNil(UserDefaults(suiteName: suiteName)?.string(forKey: SharedSDKStorage.slot(StorageKeys.deviceRegistered)))
 
         let diagnostic = client.getRecentDiagnostics().first {
             $0.code == "identity.device_registration_terminal_failure"
@@ -236,7 +238,7 @@ final class DeviceRegistrationPayloadTests: XCTestCase {
         try? await Task.sleep(for: .milliseconds(100))
 
         XCTAssertNil(
-            UserDefaults(suiteName: suiteName)?.string(forKey: StorageKeys.deviceRegistrationBackoffUntil),
+            UserDefaults(suiteName: suiteName)?.string(forKey: SharedSDKStorage.slot(StorageKeys.deviceRegistrationBackoffUntil)),
             "only a VALIDATION_ERROR from the API is terminal")
         XCTAssertFalse(client.getRecentDiagnostics().contains {
             $0.code == "identity.device_registration_terminal_failure"
@@ -247,8 +249,8 @@ final class DeviceRegistrationPayloadTests: XCTestCase {
     func testABackoffWrittenByAnotherSDKVersionIsIgnored() async {
         let now = Date()
         let defaults = UserDefaults(suiteName: suiteName)
-        defaults?.set(String(now.timeIntervalSince1970 + 3600), forKey: StorageKeys.deviceRegistrationBackoffUntil)
-        defaults?.set("0.0.1", forKey: StorageKeys.deviceRegistrationBackoffSDKVersion)
+        defaults?.set(String(now.timeIntervalSince1970 + 3600), forKey: SharedSDKStorage.slot(StorageKeys.deviceRegistrationBackoffUntil))
+        defaults?.set("0.0.1", forKey: SharedSDKStorage.slot(StorageKeys.deviceRegistrationBackoffSDKVersion))
         let client = startWithRegisterReply(.status(201, body: Self.registered), now: now)
         defer { client.destroy() }
         await waitUntil { self.registerCount >= 1 }
@@ -261,8 +263,8 @@ final class DeviceRegistrationPayloadTests: XCTestCase {
         let defaults = UserDefaults(suiteName: suiteName)
         defaults?.set(
             String(now.timeIntervalSince1970 + 2 * SDKDefaults.deviceRegistrationTerminalBackoff),
-            forKey: StorageKeys.deviceRegistrationBackoffUntil)
-        defaults?.set(SDKDefaults.sdkVersion, forKey: StorageKeys.deviceRegistrationBackoffSDKVersion)
+            forKey: SharedSDKStorage.slot(StorageKeys.deviceRegistrationBackoffUntil))
+        defaults?.set(SDKDefaults.sdkVersion, forKey: SharedSDKStorage.slot(StorageKeys.deviceRegistrationBackoffSDKVersion))
         let client = startWithRegisterReply(.status(201, body: Self.registered), now: now)
         defer { client.destroy() }
         await waitUntil { self.registerCount >= 1 }
@@ -272,13 +274,13 @@ final class DeviceRegistrationPayloadTests: XCTestCase {
     func testASuccessfulRegistrationClearsTheBackoff() async {
         let now = Date()
         let defaults = UserDefaults(suiteName: suiteName)
-        defaults?.set(String(now.timeIntervalSince1970 - 1), forKey: StorageKeys.deviceRegistrationBackoffUntil)
-        defaults?.set(SDKDefaults.sdkVersion, forKey: StorageKeys.deviceRegistrationBackoffSDKVersion)
+        defaults?.set(String(now.timeIntervalSince1970 - 1), forKey: SharedSDKStorage.slot(StorageKeys.deviceRegistrationBackoffUntil))
+        defaults?.set(SDKDefaults.sdkVersion, forKey: SharedSDKStorage.slot(StorageKeys.deviceRegistrationBackoffSDKVersion))
         let client = startWithRegisterReply(.status(201, body: Self.registered), now: now)
         defer { client.destroy() }
         await waitUntil { client.status().deviceId == "dev_ok" }
         try? await Task.sleep(for: .milliseconds(50))
-        XCTAssertNil(defaults?.string(forKey: StorageKeys.deviceRegistrationBackoffUntil))
-        XCTAssertNil(defaults?.string(forKey: StorageKeys.deviceRegistrationBackoffSDKVersion))
+        XCTAssertNil(defaults?.string(forKey: SharedSDKStorage.slot(StorageKeys.deviceRegistrationBackoffUntil)))
+        XCTAssertNil(defaults?.string(forKey: SharedSDKStorage.slot(StorageKeys.deviceRegistrationBackoffSDKVersion)))
     }
 }

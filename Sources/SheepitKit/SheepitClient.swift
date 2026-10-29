@@ -289,9 +289,13 @@ public final class SheepitClient: @unchecked Sendable {
     /// `"ss@host"`. The colon is now optional, and `@` is allowed inside the match — greedy
     /// matching then backtracks to the LAST `@` in the run, which is always the one that
     /// actually separates userinfo from host.
-    private static func redactingUserinfo(from apiUrl: String) -> String {
+    ///
+    /// The third anchor, `scheme:/`, is the single-slash form (`https:/admin:s3cret@gw.corp`),
+    /// which parses with no host and so always reaches here; the run after `//` alone could not
+    /// cross its lone `/`. It is anchored at the start, so an `@` later in a path is untouched.
+    static func redactingUserinfo(from apiUrl: String) -> String {
         apiUrl.replacingOccurrences(
-            of: "(^|//)[^/\\s]*@",
+            of: "(^|//|^\\s*[A-Za-z][A-Za-z0-9+.-]*:/)[^/\\s]*@",
             with: "$1",
             options: .regularExpression
         )
@@ -379,12 +383,20 @@ public final class SheepitClient: @unchecked Sendable {
     ///   over. Always nil (production `HTTPClient` behavior) unless a test passes one.
     /// - Parameter errorCaptureUptime: test-only seam for the monotonic clock of `captureError`'s
     ///   and `recordRequest`'s limiters (each still gets its own limiter).
+    /// - Parameter appState: test-only seam for the foreground state (0.6-C). The macOS test
+    ///   host has no `UIApplication`, so `AppForegroundState.live()` never tracks state there;
+    ///   a test passes one that does, to run the iOS behaviour.
+    /// - Parameter identifyRetryDelays: `identifyRetryDelaysForTesting`, set before work begins so the
+    ///   launch identify POST already uses it.
     internal static func createForTesting(
         config: SheepitConfig,
         now: @escaping @Sendable () -> Date,
         urlProtocolClasses: [AnyClass]? = nil,
         crashPendingDirectory: URL? = nil,
-        errorCaptureUptime: (@Sendable () -> TimeInterval)? = nil
+        errorCaptureUptime: (@Sendable () -> TimeInterval)? = nil,
+        appState: AppForegroundState? = nil,
+        identifyRetryDelays: [TimeInterval]? = nil,
+        feedbackDirectory: URL? = nil
     ) -> SheepitClient {
         let reason = rejectionReason(
             for: config.apiKey,
@@ -396,8 +408,11 @@ public final class SheepitClient: @unchecked Sendable {
             now: now,
             urlProtocolClasses: urlProtocolClasses,
             crashPendingDirectory: crashPendingDirectory,
-            errorCaptureUptime: errorCaptureUptime
+            errorCaptureUptime: errorCaptureUptime,
+            appState: appState,
+            feedbackDirectory: feedbackDirectory
         )
+        inst.identifyRetryDelaysForTesting = identifyRetryDelays
         inst.beginWork()
         return inst
     }
@@ -453,6 +468,18 @@ public final class SheepitClient: @unchecked Sendable {
         beginWork()
     }
 
+    /// Test-only seam: take every event `track()` has queued, as it would go on the wire.
+    internal func drainQueuedEventsForTesting() -> [EnrichedEvent] {
+        queue.drain()
+    }
+
+    /// Test-only seam: the identify ladder's waits before each retry (`IdentifyLadder.retryDelays`),
+    /// so a test does not sit out the real 1 s, 2 s and 4 s. `[]` sends each POST once.
+    internal var identifyRetryDelaysForTesting: [TimeInterval]? {
+        get { identifyLock.lock(); defer { identifyLock.unlock() }; return _identifyRetryDelaysForTesting }
+        set { identifyLock.lock(); _identifyRetryDelaysForTesting = newValue; identifyLock.unlock() }
+    }
+
     /// Test-only seam: the wait before each retry of a failed logout rotation, so a test does not
     /// sit out the real 1 s…60 s backoff (`DeviceRotation`).
     internal var deviceRotationRetryDelayForTesting: (@Sendable (Int) -> Duration)? {
@@ -468,10 +495,15 @@ public final class SheepitClient: @unchecked Sendable {
     let inertReason: String?
     private let config: SheepitConfig
     private let log: Logger
+    /// This client's slot (`ScopedStorage`): every component reads and writes through it.
     private let storage: StorageProvider
+    /// The suite itself, for the storage migrations only (`StorageMigration`, `StorageScope`).
+    private let rawStorage: StorageProvider
     /// `internal` rather than `private` so tests can read the live session id.
     /// Not part of the public API — `@testable import` only.
     internal let context: ContextManager
+    /// Foreground or background (0.6-C); shared with `lifecycleObserver`, which writes it.
+    internal let appState: AppForegroundState
     private let queue: EventQueue
     private let offlineQueue: OfflineQueue
     private let http: HTTPClient
@@ -495,8 +527,13 @@ public final class SheepitClient: @unchecked Sendable {
     private let crashPendingStore: PendingCrashStore
     /// Internal, not private, for `SheepitClient+ErrorCapture.swift`.
     let diagnosticBus: DiagnosticBus
-    private let lifecycleObserver: AppLifecycleObserver
+    /// `internal` so tests can drive its foreground/background transitions (0.6-C).
+    internal let lifecycleObserver: AppLifecycleObserver
     private let lastFlushClock = LastFlushClock()
+    /// `submitFeedback` delivery and its on-disk retry queue (`SheepitClient+Feedback.swift`).
+    let feedbackSender: FeedbackSender
+    /// The last name given to `screen(_:)` / `setScreen(_:)`, for the feedback context.
+    let currentScreen = LockedValue<String?>(nil)
 
     private var flushTask: Task<Void, Never>?
     /// The most recent identify POST (`postIdentity`). Each one waits for its predecessor, so the
@@ -506,10 +543,18 @@ public final class SheepitClient: @unchecked Sendable {
     /// Identify POSTs queued or in flight. Guarded by `identifyLock`; `retryIdentityIfUnknown()`
     /// sends nothing while it is non-zero.
     private var pendingIdentifyPosts = 0
-    /// The user whose identify POST the API last rejected with a non-retryable 4xx
-    /// (`IdentifyOutcome.rejected`). Guarded by `identifyLock`; `retryIdentityIfUnknown()` does not
+    /// The user whose identify POST the API last rejected with a non-retryable 4xx, or answered
+    /// 404 for on a device registered to replace an unknown one (`IdentifyLadder`). Guarded by `identifyLock`; `retryIdentityIfUnknown()` does not
     /// re-send for this user, and a 2xx for any user clears it.
     private var identifyRejectedUserId: String?
+    /// The HTTP status that rejection was answered with (`SDKStatus.identity`). Guarded by `identifyLock`.
+    private var identifyRejectedStatus: Int?
+    /// The user whose identify ladder last ended `.exhausted`, until the next automatic retry trigger
+    /// (`retryIdentityIfUnknown`) or a bind. Guarded by `identifyLock`; `identifySameUser` sends
+    /// nothing for this user meanwhile, so a host calling `identify()` in a loop is not a POST loop.
+    private var identifyExhaustedUserId: String?
+    /// See `identifyRetryDelaysForTesting`. Guarded by `identifyLock`; nil in production.
+    private var _identifyRetryDelaysForTesting: [TimeInterval]?
     private let identifyLock = NSLock()
     /// Internal, not private, for `SheepitClient+ErrorCapture.swift`.
     let destroyedFlag = AtomicFlag()
@@ -583,6 +628,9 @@ public final class SheepitClient: @unchecked Sendable {
     private let deviceIdDidChange: @Sendable () -> Void
     /// Test-only: called with the device id every time `deviceIdDidChange` runs.
     let deviceIdChangeHookForTesting = LockedHook<String>()
+    /// Test-only: called with the new session id (or "" for none) every time
+    /// `sessionDidChange()` refreshes the crash context.
+    let sessionChangeHookForTesting = LockedHook<String>()
     /// The SDK's clock — same injected value `ContextManager` gets, kept here too so
     /// `deviceRegistrationBackoffActive()` can compare against it without threading a
     /// second clock through. Tests age a terminal-registration-failure backoff window with
@@ -598,9 +646,13 @@ public final class SheepitClient: @unchecked Sendable {
         now: @escaping @Sendable () -> Date = { Date() },
         urlProtocolClasses: [AnyClass]? = nil,
         crashPendingDirectory: URL? = nil,
-        errorCaptureUptime: (@Sendable () -> TimeInterval)? = nil
+        errorCaptureUptime: (@Sendable () -> TimeInterval)? = nil,
+        appState: AppForegroundState? = nil,
+        feedbackDirectory: URL? = nil
     ) {
         self.inertReason = inertReason
+        let appState = appState ?? AppForegroundState.live()
+        self.appState = appState
         self.crashPendingStore = PendingCrashStore(
             directory: crashPendingDirectory ?? PendingCrashStore.defaultDirectory()
         )
@@ -633,7 +685,9 @@ public final class SheepitClient: @unchecked Sendable {
                 message: "recordRequest() records nothing on \(excluded): it is the SDK's own apiUrl host and apiUrl has no path, so every request to it is excluded. Serve the SDK under a path prefix (e.g. https://\(excluded)/_sheepit) to record the app's own requests there"
             )
         }
-        self.storage = UserDefaultsStorage(suiteName: "ai.goatech.sdk")
+        let rawStorage = UserDefaultsStorage(suiteName: "ai.goatech.sdk")
+        self.rawStorage = rawStorage
+        self.storage = ScopedStorage(base: rawStorage, scope: StorageScope.hash(for: config))
         // Judge the key/apiUrl BEFORE touching persistent state (see `create(config:)`).
         // A rejected client must have ZERO side effects on disk — constructing these
         // unconditionally used to rotate the device/session ids that the NEXT,
@@ -643,7 +697,7 @@ public final class SheepitClient: @unchecked Sendable {
         // install looks brand new: fresh device id, lost identity, lost offline queue,
         // re-bucketed experiments — but only for a client that will actually run.
         if inertReason == nil {
-            StorageMigration.run(storage: storage)
+            StorageMigration.run(storage: rawStorage)
         }
         // `persistOnInit: false` UNCONDITIONALLY — not `inertReason == nil` — so construction
         // itself never writes to disk for ANY candidate, live or inert. `beginWork()` is what
@@ -653,11 +707,29 @@ public final class SheepitClient: @unchecked Sendable {
         // `initialize()` LOSER — fully constructed, `destroy()`ed unpublished, `beginWork()`
         // never called — still clobbered the WINNER's already-persisted session id with one
         // nobody would ever use again (2026-09 security follow-up round 4, finding MF3-1).
-        self.context = ContextManager(storage: storage, now: now, persistOnInit: false)
+        self.context = ContextManager(
+            storage: storage,
+            now: now,
+            persistOnInit: false,
+            launchedInBackground: !appState.isForeground
+        )
         self.queue = EventQueue(maxSize: config.maxQueueSize, diagnostics: bus)
         self.offlineQueue = OfflineQueue(storage: storage, diagnostics: bus)
         self.http = HTTPClient(config: config, log: log, urlProtocolClasses: urlProtocolClasses)
         self.connectivity = ConnectivityMonitor()
+        // Writes nothing until feedback is queued, so an inert or losing candidate touches no disk.
+        self.feedbackSender = FeedbackSender(
+            http: http,
+            store: PendingFeedbackStore(
+                directory: (feedbackDirectory ?? PendingFeedbackStore.defaultBaseDirectory())
+                    .appendingPathComponent(StorageScope.hash(for: config), isDirectory: true),
+                baseDirectory: feedbackDirectory ?? PendingFeedbackStore.defaultBaseDirectory()
+            ),
+            diagnostics: bus,
+            log: log,
+            appVersionOverride: config.appVersion,
+            now: now
+        )
         self.transport = Transport(
             http: http,
             queue: queue,
@@ -667,7 +739,7 @@ public final class SheepitClient: @unchecked Sendable {
             diagnostics: bus,
             lastFlushClock: lastFlushClock
         )
-        self.deviceManager = DeviceManager(http: http, log: log)
+        self.deviceManager = DeviceManager(http: http, log: log, appVersionOverride: config.appVersion)
         self.flagManager = FlagManager(diagnostics: bus)
         if inertReason == nil {
             self.flagManager.setOverridesAllowed(config.allowFlagOverrides ?? config.debug)
@@ -709,6 +781,7 @@ public final class SheepitClient: @unchecked Sendable {
                 http: http,
                 context: context,
                 config: config.performance,
+                appVersionOverride: config.appVersion,
                 log: log
             )
             self.performanceMonitor = monitor
@@ -722,8 +795,10 @@ public final class SheepitClient: @unchecked Sendable {
                 http: http,
                 context: context,
                 config: config.crashes,
+                appVersionOverride: config.appVersion,
                 storage: storage,
                 log: log,
+                appState: appState,
                 pendingDirectory: crashPendingStore.directory,
                 diagnostics: bus
             )
@@ -770,6 +845,7 @@ public final class SheepitClient: @unchecked Sendable {
         self.lifecycleObserver = AppLifecycleObserver(
             log: log,
             diagnostics: bus,
+            appState: appState,
             onBackground: {
                 await registrationGateRef.awaitSettlement()
                 await transportRef.flush()
@@ -870,15 +946,21 @@ public final class SheepitClient: @unchecked Sendable {
         // flush. Activity-triggered rather than timer-triggered, so an app left
         // idle in the foreground mints no empty sessions (matching the web,
         // where no events means no new session).
-        context.rolloverIfExpired()
-        emitSessionStartIfOwed()
-        context.touchSession()
+        //
+        // Foreground only (0.6-C). In the background nothing mints, announces or extends a
+        // session: the event joins the stored session while it is live (`eventContext()`)
+        // and otherwise carries none. macOS and watchOS are always foreground here.
+        if appState.isForeground {
+            rolloverSessionIfExpired()
+            emitSessionStartIfOwed()
+            context.touchSession()
+        }
         let ctx = context.eventContext()
 
         let event = EnrichedEvent(
             eventId: UUID().uuidString,
             eventName: name,
-            eventProperties: properties?.mapValues { AnyCodable($0) },
+            eventProperties: SheepitClient.withAppState(properties, appState.wireValue),
             deviceId: ctx.deviceId,
             anonymousId: ctx.anonymousId,
             sessionId: ctx.sessionId,
@@ -956,14 +1038,27 @@ public final class SheepitClient: @unchecked Sendable {
         return flagManager.evaluate(
             flagKey: flagKey,
             defaultValue: defaultValue,
-            onExposure: { [weak self] key, value in
-                self?.track("$flag_exposure", properties: [
+            onExposure: { [weak self] key, value, reason in
+                guard let self else { return }
+                self.track("$flag_exposure", properties: [
                     "flag_key": key,
                     // Raw value, not a case description — matches
-                    // packages/sdk-js/src/client.ts:315 and the
+                    // packages/sdk-js/src/client.ts and the
                     // `flag_value: "unknown"` event schema.
                     "flag_value": value.anyValue,
+                    // What makes a dedup regression visible server-side: repeated `first`
+                    // exposures for one device and flag within a session mean it broke again.
+                    "exposure_reason": reason.rawValue,
                 ])
+                if reason == .valueChanged {
+                    self.diagnosticBus.emit(
+                        .info,
+                        .flag,
+                        code: "flag.exposure_value_changed",
+                        message: "Flag value changed — exposure recorded again.",
+                        data: ["flag_key": AnyCodable(key)]
+                    )
+                }
             }
         )
     }
@@ -1080,11 +1175,22 @@ public final class SheepitClient: @unchecked Sendable {
     /// Get the assigned variant for an experiment.
     public func experiment(_ experimentKey: String) -> SheepitExperimentResult {
         guard !destroyedFlag.value else { return SheepitExperimentResult(variant: "control") }
-        return experimentManager.resolve(experimentKey: experimentKey) { [weak self] key, variant in
-            self?.track("$experiment_exposure", properties: [
+        return experimentManager.resolve(experimentKey: experimentKey) { [weak self] key, variant, reason in
+            guard let self else { return }
+            self.track("$experiment_exposure", properties: [
                 "experiment_key": key,
                 "variant": variant,
+                "exposure_reason": reason.rawValue,
             ])
+            if reason == .variantChanged {
+                self.diagnosticBus.emit(
+                    .info,
+                    .experiment,
+                    code: "experiment.exposure_variant_changed",
+                    message: "Experiment arm changed — exposure recorded for the new arm.",
+                    data: ["experiment_key": AnyCodable(key), "variant": AnyCodable(variant)]
+                )
+            }
         }
     }
 
@@ -1141,13 +1247,10 @@ public final class SheepitClient: @unchecked Sendable {
         let previousUserId = context.userId
 
         guard previousUserId != userId else {
-            // Same user: nothing to flush, nothing to re-bucket, no POST.
-            diagnosticBus.emit(
-                .debug,
-                .identity,
-                code: "identity.identify_noop",
-                message: "identify() called with the current userId — no POST"
-            )
+            // Same user: nothing to flush, nothing to re-bucket. A POST only if the server's row is
+            // not known to hold them: the stored id is the app's own label and survives a change of
+            // key or environment, so "same user" alone said nothing about THIS server's row.
+            identifySameUser(userId, resetToken: resetToken)
             return
         }
 
@@ -1156,7 +1259,7 @@ public final class SheepitClient: @unchecked Sendable {
 
         context.setUserId(userId)
 
-        // Clears the sticky map and exposures only. The server's assignments stay, still labelled
+        // Clears the exposures only. The server's assignments stay, still labelled
         // with the row's previous user, so events tracked until the identify POST succeeds and its
         // refetch lands carry `identity_changed` for user-bucketed experiments.
         experimentManager.clearAssignments()
@@ -1174,6 +1277,41 @@ public final class SheepitClient: @unchecked Sendable {
         // cannot say which user the server's device row holds (`ServerHeldUser`).
         context.setServerHeldUser(.unknown)
         postIdentity(userId: userId, sendIf: identifySendGuard(resetToken: resetToken))
+    }
+
+    /// `identify()` with the user the app already names. No-op while the row is known to hold them,
+    /// once their POST was rejected (sending it again gets the same answer), while registration is
+    /// backed off (the POST can only 404), or after their ladder ran out until the next automatic
+    /// retry. Otherwise one POST through the automatic guard, idle-only so it never doubles the launch
+    /// POST, and without the user-change side effects: the app's user did not change.
+    private func identifySameUser(_ userId: String, resetToken: UInt64) {
+        // The same guards as the automatic retry, plus "its ladder just ran out": `identify()` is host
+        // code and may be called on every screen, so each failure mode needs a reason not to resend.
+        let reason: String?
+        if context.serverHeldUser.user == .known(userId) {
+            reason = nil
+        } else if identifyRejected(for: userId) {
+            reason = "rejected"
+        } else if deviceRegistrationBackoffActive() {
+            reason = "backoff"
+        } else if identifyExhausted(for: userId) {
+            reason = "recently_exhausted"
+        } else {
+            postIdentity(
+                userId: userId,
+                onlyIfIdle: true,
+                sendIf: automaticIdentifySendGuard(userId: userId, resetToken: resetToken)
+            )
+            return
+        }
+        diagnosticBus.emit(
+            .debug,
+            .identity,
+            code: "identity.identify_noop",
+            message: reason.map { "identify() called with the current userId — no POST (\($0))" }
+                ?? "identify() called with the current userId — no POST",
+            data: reason.map { ["reason": AnyCodable($0)] }
+        )
     }
 
     /// POST the identity and record what the server's device row holds afterwards.
@@ -1231,34 +1369,43 @@ public final class SheepitClient: @unchecked Sendable {
             await self.registrationGate.awaitSettlement()
             guard !Task.isCancelled, !self.destroyedFlag.value else { return }
             beforeSendForTesting?()
-            // 🔴 Re-checked here, after the queue and the registration wait, not only when the
-            // POST was queued: a `reset()` in between would otherwise bind the logged-out user to
-            // the device row again. Checked once more before every HTTP attempt (`sendIf` goes into
-            // `HTTPClient`): a `reset()` during the backoff after a 5xx must stop the retry too.
-            // Only a `reset()` while an attempt is on the wire cannot be undone by the client.
-            if let sendIf, !sendIf() { return }
-            // 🔴 Unknown again as the POST goes out, not only when `identify()` was called: an
-            // earlier queued POST may have answered in between and set a known user, and from the
-            // moment this request is sent the server may commit it before any config fetch is
-            // evaluated. Moving from a known user also moves the epoch, invalidating a fetch
-            // already in flight.
-            self.context.markServerHeldUserUnknown()
-            // What the answer is about. After a logout rotation the context names another device,
-            // and this answer says nothing about that one (`DeviceRotation`).
-            let postedDeviceId = self.context.deviceId
-            // 🔴 Before the request: an unanswered POST may still be committed, and a logout must
-            // then rotate this device (`DeviceRotation.deviceMayBeBound()`).
-            self.deviceRotation.markBindAttempted(deviceId: postedDeviceId)
-            let outcome = await self.deviceManager.identify(
-                deviceId: postedDeviceId,
-                userId: userId,
-                sendIf: sendIf
-            )
+            // 🔴 `sendIf` is re-checked by the ladder before every request, after the queue and the
+            // registration wait, not only when the POST was queued: a `reset()` in between, or
+            // during the backoff after a 5xx, would otherwise bind the logged-out user to the row
+            // again. Only a `reset()` while an attempt is on the wire cannot be undone by the client.
+            let isCurrent: () -> Bool = { [weak self] in
+                guard let self, !Task.isCancelled, !self.destroyedFlag.value else { return false }
+                return sendIf?() ?? true
+            }
+            let startDeviceId = self.context.deviceId
+            let result = await IdentifyLadder.run(deviceId: startDeviceId, IdentifyLadder.Dependencies(
+                post: { [weak self, deviceManager] deviceId in
+                    // 🔴 Unknown again as each POST goes out, not only when `identify()` was called:
+                    // an earlier queued POST may have answered in between and set a known user, and
+                    // from the moment this request is sent the server may commit it before any config
+                    // fetch is evaluated. Moving from a known user also moves the epoch, invalidating
+                    // a fetch already in flight. Here, after the ladder's `isCurrent`, so an attempt that
+                    // check stops leaves the label alone (a `reset()` landing between here and
+                    // `identifyOnce`'s own `sendIf` still leaves it unknown: one extra refetch).
+                    self?.context.markServerHeldUserUnknown()
+                    return await deviceManager.identifyOnce(deviceId: deviceId, userId: userId, sendIf: sendIf)
+                },
+                reregister: { [deviceRotation] deviceId in await deviceRotation.replaceUnknown(deviceId) },
+                markBound: { [weak self] deviceId in
+                    // 🔴 Before the request: an unanswered POST may still be committed, and a logout
+                    // must then rotate this device (`DeviceRotation.deviceMayBeBound()`). And before
+                    // `isCurrent`, which `reset()` orders itself against (`IdentifyLadder`).
+                    self?.deviceRotation.markBindAttempted(deviceId: deviceId)
+                },
+                isCurrent: isCurrent,
+                sleep: { seconds in try? await Task.sleep(for: .seconds(seconds)) },
+                delays: self.identifyRetryDelaysForTesting ?? IdentifyLadder.retryDelays
+            ))
             guard !Task.isCancelled, !self.destroyedFlag.value else { return }
-            // 🔴 A POST for a device the client has since rotated away from: whatever it did, it did
+            // 🔴 An answer for a device the client has since rotated away from: whatever it did, it did
             // to the abandoned row. Recording it would label the NEW row with that user, and its
             // refetch would name the old device again.
-            guard self.context.deviceId == postedDeviceId else {
+            guard self.context.deviceId == result.deviceId else {
                 self.diagnosticBus.emit(
                     .debug,
                     .identity,
@@ -1267,27 +1414,78 @@ public final class SheepitClient: @unchecked Sendable {
                 )
                 return
             }
-            switch outcome {
-            case .stored:
+            if result.outcome.isBound {
                 // Recorded even if `sendIf` stopped holding while the answer was on the wire: the
                 // row does hold this user, and `/v1/config` resolves the user from the row, so the
                 // refetch returns what the next poll after that `reset()` returns (`ServerHeldUser`).
-                self.recordIdentifyRejection(nil)
+                self.recordIdentifyRejection(nil, status: nil)
+                self.recordIdentifyExhausted(nil)
                 self.context.setServerHeldUser(.known(userId))
+                self.reportIdentifyResult(result)
                 await self.configSync.refetchUnconditionally(deviceId: self.context.deviceId)
-            case .failed, .notSent:
-                self.context.markServerHeldUserUnknown()
-            case .rejected(let statusCode):
-                self.context.markServerHeldUserUnknown()
-                self.recordIdentifyRejection(userId)
-                self.diagnosticBus.emit(
-                    .warn,
-                    .identity,
-                    code: "identity.identify_post_rejected",
-                    message: "Identify POST rejected (\(statusCode)); not retried for this user",
-                    data: ["status_code": AnyCodable(statusCode)]
-                )
+                return
             }
+            // A failure the app has moved past is stale too: after a `reset()` the label and the
+            // device are the rotation's, and the failure says nothing about them (an answer for the
+            // rotation's placeholder, which is never registered, is a 404).
+            guard isCurrent() else { return }
+            // Nothing sent leaves the label alone: after a `reset()` it is the fresh device's.
+            if result.attempts > 0 { self.context.markServerHeldUserUnknown() }
+            // On a replacement device now, but unbound: the config held is the dead device's.
+            if result.deviceId != startDeviceId, result.outcome != .stale {
+                Task { [configSync] in await configSync.refetchUnconditionally(deviceId: result.deviceId) }
+            }
+            switch result.outcome {
+            case .rejected:
+                self.recordIdentifyRejection(userId, status: result.status)
+            case .notFound where result.deviceId != startDeviceId:
+                // A device registered a moment ago is unknown too: another try would only register
+                // another one, so this user is not retried. Without a replacement (backoff, a failed
+                // registration) the retry tick tries again.
+                self.recordIdentifyRejection(userId, status: result.status)
+            case .exhausted:
+                self.recordIdentifyExhausted(userId)
+            default:
+                break
+            }
+            self.reportIdentifyResult(result)
+        }
+    }
+
+    /// How the bind ended, for the app's diagnostics and the project's own data. `stale` reports
+    /// nothing: the app moved on, so there is nothing to fix. Web counterpart: `reportIdentifyResult`.
+    private func reportIdentifyResult(_ result: IdentifyLadder.Result) {
+        let detail: [String: AnyCodable] = [
+            "outcome": AnyCodable(result.outcome.rawValue),
+            "attempts": AnyCodable(result.attempts),
+            "status": AnyCodable(result.status),
+        ]
+        switch result.outcome {
+        case .bound, .stale:
+            return
+        case .boundAfterRetry, .boundAfterReregister:
+            diagnosticBus.emit(
+                .info,
+                .identity,
+                code: "identity.identify_recovered",
+                message: "identify() bound the user after a retry or a fresh device registration",
+                data: detail
+            )
+        case .rejected, .notFound, .exhausted:
+            // 🔴 The user stays unbound: config keeps evaluating this device anonymously. The event
+            // is what makes that visible in the project's own data, not just a console line.
+            diagnosticBus.emit(
+                .warn,
+                .identity,
+                code: "identity.identify_failed",
+                message: "identify() could not bind the user on the server — flags evaluate anonymously",
+                data: detail
+            )
+            track("$identify_failed", properties: [
+                "outcome": result.outcome.rawValue,
+                "attempts": result.attempts,
+                "status": result.status,
+            ])
         }
     }
 
@@ -1297,11 +1495,31 @@ public final class SheepitClient: @unchecked Sendable {
         identifyLock.unlock()
     }
 
-    /// Synchronous so the lock is never held across a suspension point.
-    private func recordIdentifyRejection(_ userId: String?) {
+    /// Synchronous so the lock is never held across a suspension point. `status` is the ladder's last
+    /// HTTP status; 0 (nothing answered) is stored as nil.
+    private func recordIdentifyRejection(_ userId: String?, status: Int?) {
         identifyLock.lock()
         identifyRejectedUserId = userId
+        identifyRejectedStatus = status == 0 ? nil : status
         identifyLock.unlock()
+    }
+
+    private func recordIdentifyExhausted(_ userId: String?) {
+        identifyLock.lock()
+        identifyExhaustedUserId = userId
+        identifyLock.unlock()
+    }
+
+    private func identifyExhausted(for userId: String) -> Bool {
+        identifyLock.lock()
+        defer { identifyLock.unlock() }
+        return identifyExhaustedUserId == userId
+    }
+
+    private func lastIdentifyRejection() -> SDKStatus.Identity.IdentifyRejection? {
+        identifyLock.lock()
+        defer { identifyLock.unlock() }
+        return identifyRejectedUserId.map { .init(userId: $0, statusCode: identifyRejectedStatus) }
     }
 
     private func identifyRejected(for userId: String) -> Bool {
@@ -1342,6 +1560,8 @@ public final class SheepitClient: @unchecked Sendable {
     /// non-retryable 4xx. Nor once `reset()` ran or the app names another user by the time the POST
     /// would go out (`automaticIdentifySendGuard`).
     private func retryIdentityIfUnknown(beforeSendForTesting: (@Sendable () -> Void)? = nil) {
+        // A retry trigger: from here `identify()` with the same user may send again.
+        recordIdentifyExhausted(nil)
         let resetToken = configResetGate.current
         guard !destroyedFlag.value, let userId = context.userId,
               context.serverHeldUser.user == .unknown,
@@ -1360,9 +1580,17 @@ public final class SheepitClient: @unchecked Sendable {
         guard !destroyedFlag.value else { return }
 
         Task { await flush() }
+        // 🔴 The token moves BEFORE the rotation decision is read, which stops every identify POST
+        // not yet past its guard. An identify ladder marks its device before it checks that guard
+        // (`IdentifyLadder`), so one that passed it has already marked, and the read below rotates.
+        // Read first, a ladder that marked and sent between the read and the token kept a device the
+        // POST then bound to the logged-out user. Nothing else is cleared here: the config clear
+        // still moves the token again below, after the rotation, so no fetch names the old device.
+        configResetGate.reset {}
         // Read before anything is cleared: whether a user is, or may be, on the server's row.
         let rotateDevice = deviceRotation.deviceMayBeBound()
-        context.resetIdentity()
+        context.resetIdentity(mintSession: appState.isForeground)
+        sessionDidChange()
         // 🔴 Clearing locally is not enough: `/v1/config` evaluates the SERVER's device row, which
         // stays bound to the logged-out user (there is no unbind), so the next fetch re-delivered
         // their values. A device a user may be bound to is swapped for a fresh one (`DeviceRotation`).
@@ -1411,6 +1639,9 @@ public final class SheepitClient: @unchecked Sendable {
             storage.removeObject(forKey: StorageKeys.sdkConfigCachedAt)
             storage.removeObject(forKey: StorageKeys.sdkConfigFetchedUnder)
         }
+        // Queued feedback carries the logged-out user's words, email and id: deleted now, on this
+        // thread, like the cached config above, under every key and environment.
+        feedbackSender.store.clear()
     }
 
     // MARK: - Public API: Performance
@@ -1458,7 +1689,9 @@ public final class SheepitClient: @unchecked Sendable {
     /// character boundary); an empty result clears the crash context's screen.
     public func setScreen(_ screenName: String) {
         guard !destroyedFlag.value else { return }
-        crashReporter?.setScreen(Self.boundedScreenName(screenName))
+        let bounded = Self.boundedScreenName(screenName)
+        crashReporter?.setScreen(bounded)
+        currentScreen.value = bounded.isEmpty ? nil : bounded
     }
 
     /// Record that the user is now on `name`: tracks a `$screen` event carrying the property
@@ -1532,7 +1765,22 @@ public final class SheepitClient: @unchecked Sendable {
             flagCount: flagManager.count(),
             experimentCount: experimentManager.count(),
             sdkVersion: SDKDefaults.sdkVersion,
-            rejectionReason: inertReason
+            rejectionReason: inertReason,
+            identity: inertReason == nil && !destroyedFlag.value ? identityStatus() : nil
+        )
+    }
+
+    private func identityStatus() -> SDKStatus.Identity {
+        let serverUser: SDKStatus.Identity.ServerUser
+        switch context.serverHeldUser.user {
+        case .unknown: serverUser = .unknown
+        case .known(let userId?) where !userId.isEmpty: serverUser = .user(userId)
+        case .known: serverUser = .anonymous
+        }
+        return SDKStatus.Identity(
+            serverUser: serverUser,
+            deviceRegistered: isRegisteredInThisScope(),
+            lastIdentifyRejection: lastIdentifyRejection()
         )
     }
 
@@ -1598,6 +1846,8 @@ public final class SheepitClient: @unchecked Sendable {
         if let reporter = crashReporter {
             Task { await reporter.stop() }
         }
+        let feedback = feedbackSender
+        Task { await feedback.stop() }
         releaseSelfStartingComponents()
         // Finish outstanding flagChanges() streams so a consumer whose
         // lifetime isn't tied to a cancellable scope sees completion
@@ -1660,7 +1910,14 @@ public final class SheepitClient: @unchecked Sendable {
     /// the recheck at the end of this function for that, deterministic, no-race case.
     private func beginWork() {
         guard inertReason == nil, !destroyedFlag.value else { return }
+        // Before anything persists or `start()` reads the slot: an upgraded install's unscoped server
+        // state goes and its offline queue joins this slot (`StorageScope.adoptLegacyState`). Here,
+        // not in `init`, so a candidate that never begins work writes nothing.
+        if let adoption = StorageScope.adoptLegacyState(raw: rawStorage, into: offlineQueue) {
+            reportScopeAdoption(adoption)
+        }
         context.persistOnBeginWork()
+        experimentManager.dropLegacyStickyMap()
         didBeginWork = true
         SheepitClient.beginWorkCallCountLock.lock()
         SheepitClient._beginWorkCallCountForTesting += 1
@@ -1696,6 +1953,43 @@ public final class SheepitClient: @unchecked Sendable {
         if destroyedFlag.value {
             performTeardown()
         }
+    }
+
+    /// Emitted here, after `StorageScope`'s process-wide lock is released: a host `onDiagnostic` runs
+    /// synchronously and may call into another client that is beginning work.
+    private func reportScopeAdoption(_ adoption: StorageScope.Adoption) {
+        let queue = adoption.queue
+        if queue.unencodable > 0 {
+            diagnosticBus.emit(
+                .error,
+                .transport,
+                code: "offline_queue.unencodable_dropped",
+                message: "Dropped \(queue.unencodable) events that cannot be encoded as JSON (non-finite number?)",
+                data: ["dropped_count": AnyCodable(queue.unencodable)]
+            )
+        }
+        if queue.trimmed > 0 {
+            diagnosticBus.emit(
+                .warn,
+                .transport,
+                code: "offline_queue.trimmed",
+                message: "Offline queue full (\(offlineQueue.capacity)) — dropped \(queue.trimmed) of the oldest events",
+                data: [
+                    "max_size": AnyCodable(offlineQueue.capacity),
+                    "dropped_count": AnyCodable(queue.trimmed),
+                ]
+            )
+        }
+        diagnosticBus.emit(
+            .info,
+            .identity,
+            code: "identity.scope_adopted",
+            message: "Upgraded from unscoped storage: server state re-established for this apiUrl, environment and key",
+            data: [
+                "legacy_server_state_discarded": AnyCodable(adoption.serverStateDiscarded),
+                "legacy_queue_events_adopted": AnyCodable(queue.kept),
+            ]
+        )
     }
 
     /// Release every component that begins work in its OWN initializer, rather than in
@@ -1780,7 +2074,10 @@ public final class SheepitClient: @unchecked Sendable {
         // returns a `RegistrationOutcome` that tells the two apart; see
         // `deviceRegistrationBackoffActive()` for how a terminal failure is remembered
         // without being confused for success.
-        if storage.string(forKey: StorageKeys.deviceRegistered) == nil, !deviceRegistrationBackoffActive() {
+        //
+        // 🔴 The slot holds the id it registered, not "1": the device id is shared by every scope, so
+        // a `reset()` in another scope can rotate it, and this scope must then register the new one.
+        if !isRegisteredInThisScope(), !deviceRegistrationBackoffActive() {
             registrationTask = Task { [weak self] in
                 guard let self else { return }
                 // Captured BEFORE the round trip: this is the id every event enqueued during
@@ -1877,9 +2174,21 @@ public final class SheepitClient: @unchecked Sendable {
             }
         }
 
+        // Feedback an earlier launch could not deliver. Off this thread: it lists directories.
+        // First, other scopes' queues (an old key or environment) nobody can send any more.
+        let feedback = feedbackSender
+        let feedbackClock = now
+        Task.detached {
+            feedback.store.reapStrandedScopes(now: feedbackClock(), maxAge: FeedbackSender.maxAge)
+            await feedback.drain()
+        }
+
         // Flush on background + re-open the session on foreground (both
         // no-ops off UIKit platforms). Assigned before `register()` installs
         // the observer that reads it.
+        // 🔴 0.6-C: after a background launch this is what opens the first session — the
+        // notification flips `appState` first, then `handleWillEnterForeground()` mints and
+        // announces it exactly once.
         lifecycleObserver.onForeground = { [weak self] in
             await self?.handleWillEnterForeground()
         }
@@ -1977,7 +2286,7 @@ public final class SheepitClient: @unchecked Sendable {
                 self.context.setServerHeldUser(.known(nil))
             }
             self.context.setDeviceId(deviceId)
-            self.storage.set("1", forKey: StorageKeys.deviceRegistered)
+            self.storage.set(deviceId, forKey: StorageKeys.deviceRegistered)
             RegistrationBackoff.clear(storage: self.storage)
             self.deviceIdDidChange()
         case .transientFailure:
@@ -2119,6 +2428,11 @@ public final class SheepitClient: @unchecked Sendable {
         }
     }
 
+    /// Whether this scope registered the CURRENT device id (`StorageKeys.deviceRegistered`).
+    private func isRegisteredInThisScope() -> Bool {
+        storage.string(forKey: StorageKeys.deviceRegistered) == context.deviceId
+    }
+
     /// True while a registration failure — TERMINAL (400/401/403, `.terminalFailure`) or
     /// CAP-REACHED (422, `.capReached`, a shorter window) — is still inside the backoff window
     /// `RegistrationBackoff.record` wrote for it. Checked alongside — never in place of —
@@ -2198,12 +2512,12 @@ public final class SheepitClient: @unchecked Sendable {
     /// see that type's doc for why decision 7's suppression check cannot be "does
     /// `StorageKeys.deviceId` exist" by the time this runs.
     ///
-    /// The version resolved here MUST match what every other event's wire payload carries.
-    /// `TrackSnapshot.capture(appVersion:)` (audit L-005) prefers the host-provided `config.appVersion`
-    /// (a release-binding customer sets this to a commit SHA / build tag, not
-    /// `CFBundleShortVersionString`, so events resolve to a `Release` row) and only falls
-    /// back to `CFBundleShortVersionString` when the host never set it. Using
-    /// `DeviceProfile.appVersion()` alone here — as this used to — would make
+    /// The version resolved here MUST match what every other event's wire payload carries,
+    /// so it is `DeviceProfile.wireAppVersion(override:)`: `config.appVersion` when the host
+    /// set it, else `CFBundleShortVersionString`, bounded exactly as every stream bounds it.
+    /// The STORED value is bounded the same way before comparing, so a long version stored
+    /// unbounded by an older SDK does not fire one spurious `$app_update` after the upgrade.
+    /// Using `DeviceProfile.appVersion()` alone here — as this used to — would make
     /// `previous_version`/`current_version` disagree with `app.version` on every other
     /// event in the same batch, and would mean `$app_update` never fires when only
     /// `config.appVersion` changes, the exact release-upgrade scenario the event exists for.
@@ -2217,8 +2531,9 @@ public final class SheepitClient: @unchecked Sendable {
     /// tracked as a known limitation in `PENDING_WORK.md` rather than added machinery for,
     /// since a real app always carries `CFBundleShortVersionString`.
     internal func emitAppInstallOrUpdateIfOwed() {
-        guard let currentVersion = config.appVersion ?? DeviceProfile.appVersion() else { return }
-        let storedVersion = storage.string(forKey: StorageKeys.installedAppVersion)
+        guard let currentVersion = DeviceProfile.wireAppVersion(override: config.appVersion) else { return }
+        let storedVersion = DeviceProfile.hostOverride(storage.string(forKey: StorageKeys.installedAppVersion))
+            .map { DeviceProfile.boundedForAllStreams($0) }
         let decision = AppLifecycleEventDecider.decide(
             storedVersion: storedVersion,
             currentVersion: currentVersion,
@@ -2238,6 +2553,16 @@ public final class SheepitClient: @unchecked Sendable {
         }
     }
 
+    /// `properties` plus `app_state` (0.6-C), when the state is tracked. A host property of the
+    /// same name is kept: the host's value is the one record the SDK cannot rebuild.
+    static func withAppState(_ properties: [String: Any]?, _ appState: String?) -> [String: AnyCodable]? {
+        var wire = properties?.mapValues { AnyCodable($0) }
+        guard let appState else { return wire }
+        if wire == nil { wire = [:] }
+        if wire?["app_state"] == nil { wire?["app_state"] = AnyCodable(appState) }
+        return wire
+    }
+
     /// Foreground handler — the timely session boundary on UIKit platforms.
     /// `track()` carries the same check for every platform and for the case
     /// where the app was never backgrounded.
@@ -2254,8 +2579,22 @@ public final class SheepitClient: @unchecked Sendable {
         guard !destroyedFlag.value else { return }
         await awaitDeviceIdSettlementForAutoFlush()
         await transport.flush()
-        context.rolloverIfExpired()
+        rolloverSessionIfExpired()
         emitSessionStartIfOwed()
+    }
+
+    private func rolloverSessionIfExpired() {
+        if context.rolloverIfExpired() { sessionDidChange() }
+    }
+
+    /// Every path that changes the session id refreshes the crash context, which holds its own
+    /// copy. It was written only at crash-handler install and on a device-id change, so a crash
+    /// after a rollover shipped the previous session — and, since 0.6-C, a crash after the first
+    /// foreground of a background launch would ship none, which release health counts as an
+    /// orphan crash.
+    private func sessionDidChange() {
+        crashReporter?.updateContext()
+        sessionChangeHookForTesting.value?(context.sessionId ?? "")
     }
 
     /// Track an SDK-internal error as a `$error` event so it appears in the dashboard.
@@ -2269,7 +2608,7 @@ public final class SheepitClient: @unchecked Sendable {
         var props: [String: Any] = [
             "source": source,
             "error": error.localizedDescription,
-            "platform": "ios",
+            "platform": DeviceProfile.platform,
             "origin": "sdk",
             "type": "sdk_internal",
         ]

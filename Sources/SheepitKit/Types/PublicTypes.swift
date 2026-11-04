@@ -26,6 +26,21 @@ public struct SheepitConfig: Sendable {
     /// actually enforced at `ConfigSync`'s `Task.sleep` site via
     /// `TimeInterval.sanitizedForSleep()` (finding MF-1).
     public var configRefreshInterval: TimeInterval
+    /// The age past which a successful fetch was expected to have replaced the cached config.
+    /// An older cache is still applied (up to `configOfflineMaxAge`) and reported stale in
+    /// `status().configFreshness`. Default 24 hours. Must be finite and positive; it is lowered to
+    /// `configOfflineMaxAge` when larger. Validated again where it is used, since this is a `var`.
+    public var configStaleAfter: TimeInterval
+    /// The oldest cached config applied at launch, measured from when the server last sent or
+    /// confirmed it (a 304). Checked at launch only. A device that cannot reach the server keeps the
+    /// flags and experiment assignments it last fetched for up to this long; past it the cache is
+    /// deleted and flags read their defaults until a fetch lands. A failed fetch never deletes the
+    /// cache, a successful one replaces it, and `reset()` deletes it. Default 7 days. Must be finite
+    /// and positive; an invalid value uses the default.
+    ///
+    /// Set it equal to `configStaleAfter` (`86_400`) for the behaviour of 0.8.0 and earlier, where
+    /// a cache more than 24 hours old was deleted at launch.
+    public var configOfflineMaxAge: TimeInterval
     /// Clamped to a floor of 1 here AND at the actual consumer, `EventQueue.init` — this is a
     /// public `var`, so `var cfg = ...; cfg.maxQueueSize = 0` bypasses this initializer clamp
     /// entirely and reaches `EventQueue` unclamped. `EventQueue.add` evicts the oldest event
@@ -119,7 +134,9 @@ public struct SheepitConfig: Sendable {
         onDiagnostic: DiagnosticListener? = nil,
         diagnosticBufferSize: Int = DiagnosticBus.defaultBufferSize,
         allowFlagOverrides: Bool? = nil,
-        requestTelemetryHosts: [String] = []
+        requestTelemetryHosts: [String] = [],
+        configStaleAfter: TimeInterval = 86_400,
+        configOfflineMaxAge: TimeInterval = 604_800
     ) {
         self.apiKey = apiKey
         self.environment = environment
@@ -139,6 +156,9 @@ public struct SheepitConfig: Sendable {
         self.diagnosticBufferSize = diagnosticBufferSize
         self.allowFlagOverrides = allowFlagOverrides
         self.requestTelemetryHosts = requestTelemetryHosts
+        let limits = CachedConfigLimits(staleAfter: configStaleAfter, offlineMaxAge: configOfflineMaxAge)
+        self.configStaleAfter = limits.staleAfter
+        self.configOfflineMaxAge = limits.offlineMaxAge
     }
 }
 
@@ -292,6 +312,11 @@ public struct SDKStatus: Sendable {
     /// device. nil for a client whose key was refused (it never talks to a server) or that was
     /// destroyed.
     public let identity: Identity?
+    /// The config flags and experiments are evaluated from: whether it came from the server or the
+    /// on-device cache, when the server last sent or confirmed it, and its age. nil when none is
+    /// applied (nothing cached and no fetch has landed yet, after `reset()`, or for a refused or
+    /// destroyed client): flags then read their defaults.
+    public let configFreshness: ConfigFreshness?
 
     /// The server's side of identity, which `userId` cannot show: a user the app identified is not
     /// necessarily bound on the server (a POST still in flight, failed, or rejected).
@@ -352,7 +377,8 @@ public struct SDKStatus: Sendable {
         experimentCount: Int,
         sdkVersion: String,
         rejectionReason: String? = nil,
-        identity: Identity? = nil
+        identity: Identity? = nil,
+        configFreshness: ConfigFreshness? = nil
     ) {
         self.initialized = initialized
         self.online = online
@@ -366,6 +392,7 @@ public struct SDKStatus: Sendable {
         self.sdkVersion = sdkVersion
         self.rejectionReason = rejectionReason
         self.identity = identity
+        self.configFreshness = configFreshness
     }
 }
 
@@ -408,7 +435,7 @@ enum SDKDefaults {
     /// `publish-sdk-swift.yml` refuses to release on a mismatch. The package
     /// is deliberately on `0.x` while the API settles, and `2.0.0` is reserved
     /// for the first stable release — see the CHANGELOG's "Version policy".
-    static let sdkVersion = "0.8.0"
+    static let sdkVersion = "0.9.0"
     /// Stamped on every ingest batch (`context.sdk.name`) so the dashboard can filter /
     /// triage by which SDK sent a given event. Follows the monorepo directory-name
     /// convention (`sdk-js`, `sdk-server`, `sdk-swift`) and is pinned by
@@ -439,7 +466,10 @@ enum SDKDefaults {
     /// header. Matches the JS SDK's `parseInt(... ?? "5")` default.
     static let defaultRetryAfter: TimeInterval = 5.0
     static let sessionTimeoutSeconds: TimeInterval = 30 * 60
-    static let configMaxAge: TimeInterval = 24 * 60 * 60
+    /// `SheepitConfig.configStaleAfter`'s default. 0.8.0 and earlier deleted the cache here.
+    static let configStaleAfter: TimeInterval = 24 * 60 * 60
+    /// `SheepitConfig.configOfflineMaxAge`'s default.
+    static let configOfflineMaxAge: TimeInterval = 7 * 24 * 60 * 60
     static let offlineQueueMax = 500
     static let eventNameMaxLength = 200
     /// `screen(_:)`'s name cap: the crash context's `screen_name[256]` C buffer less its NUL
@@ -458,7 +488,7 @@ enum SDKDefaults {
     }
     /// How long `start()` withholds a RETRY after a terminal (401/403) registration
     /// failure, before treating the device as eligible to try again. Matches
-    /// `configMaxAge`'s once-a-day cadence — long enough that a permanently revoked key
+    /// `configStaleAfter`'s once-a-day cadence — long enough that a permanently revoked key
     /// does not hammer the endpoint on every cold start, short enough that a fix shipped
     /// in a later build is picked up within a day rather than never.
     static let deviceRegistrationTerminalBackoff: TimeInterval = 24 * 60 * 60

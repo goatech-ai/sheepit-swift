@@ -18,6 +18,9 @@ actor ConfigSync {
     private let log: Logger
     /// Receives the config and the identity it was fetched under (see `identityProvider`).
     private let onConfig: @Sendable (SDKConfigResponse, ConfigIdentity) -> Void
+    /// Called after every `onConfig`, once the reset gate is released: `onConfig` runs inside the
+    /// gate, which must not resume anything (`IdentifyWaiters.configAppliedOutsideGate()`).
+    private let onApplied: @Sendable () -> Void
     /// What the server's device row holds (`ContextManager.serverHeldUser`) and its epoch.
     ///
     /// `/v1/config` sends no user: the server buckets `u:` on the user its device row holds
@@ -33,6 +36,12 @@ actor ConfigSync {
     private var etagResetToken: UInt64 = 0
     /// Shared with `SheepitClient.reset()`; see `ConfigResetGate`.
     private let resetGate: ConfigResetGate
+    /// How old a cached body may be at launch, and when it counts as stale (`CachedConfigLimits`).
+    private let limits: CachedConfigLimits
+    /// The SDK's clock: every cache stamp and age is measured with it, so tests can age a cache.
+    private let now: @Sendable () -> Date
+    /// Shared with `SheepitClient` (`status()`, exposure events) and cleared by its `reset()`.
+    private let freshness: ConfigFreshnessRecorder
     private var refreshTask: Task<Void, Never>?
     /// Start order of fetches. Actor methods re-enter at every `await`, so two fetches can be in
     /// flight at once (the refresh loop and an identify-triggered refetch) and their responses can
@@ -55,8 +64,12 @@ actor ConfigSync {
         refreshInterval: TimeInterval,
         log: Logger,
         resetGate: ConfigResetGate = ConfigResetGate(),
+        limits: CachedConfigLimits = .default,
+        now: @escaping @Sendable () -> Date = { Date() },
+        freshness: ConfigFreshnessRecorder = ConfigFreshnessRecorder(),
         identityProvider: @escaping @Sendable () -> (identity: ConfigIdentity, epoch: UInt64),
-        onConfig: @escaping @Sendable (SDKConfigResponse, ConfigIdentity) -> Void
+        onConfig: @escaping @Sendable (SDKConfigResponse, ConfigIdentity) -> Void,
+        onApplied: @escaping @Sendable () -> Void = {}
     ) {
         self.http = http
         self.storage = storage
@@ -64,7 +77,11 @@ actor ConfigSync {
         self.log = log
         self.identityProvider = identityProvider
         self.onConfig = onConfig
+        self.onApplied = onApplied
         self.resetGate = resetGate
+        self.limits = limits
+        self.now = now
+        self.freshness = freshness
     }
 
     /// Start sync: load cache immediately, then fetch periodically.
@@ -129,7 +146,11 @@ actor ConfigSync {
         let (identityAtRequest, epochAtRequest) = identityProvider()
         var headers: [String: String] = ["X-Device-ID": deviceId]
         let unconditional = needsUnconditional
-        if !unconditional, let etag, etagResetToken == resetTokenAtStart { headers["If-None-Match"] = etag }
+        var sentValidator = false
+        if !unconditional, let etag, etagResetToken == resetTokenAtStart {
+            headers["If-None-Match"] = etag
+            sentValidator = true
+        }
 
         do {
             // 🔴 Never from the URL cache. A resolved `/v1/config` 200 carries
@@ -146,6 +167,7 @@ actor ConfigSync {
             // 304 Not Modified
             if response.statusCode == 304 {
                 log.debug("Config unchanged (304)")
+                confirmCachedBody(sentValidator: sentValidator, sequence: sequence, resetTokenAtStart: resetTokenAtStart)
                 return
             }
 
@@ -184,16 +206,19 @@ actor ConfigSync {
             let applied = resetGate.ifNotReset(since: resetTokenAtStart) {
                 storage.removeObject(forKey: StorageKeys.sdkConfigFetchedUnder)
                 storage.set(data, forKey: StorageKeys.sdkConfig)
-                storage.set(String(Date().timeIntervalSince1970), forKey: StorageKeys.sdkConfigCachedAt)
+                let fetchedAt = now()
+                storage.set(String(fetchedAt.timeIntervalSince1970), forKey: StorageKeys.sdkConfigCachedAt)
                 if let label = try? JSONEncoder().encode(ServerHeldUser(identity)) {
                     storage.set(label, forKey: StorageKeys.sdkConfigFetchedUnder)
                 }
                 onConfig(sdkConfig, identity)
+                freshness.record(.server, fetchedAt: fetchedAt)
             }
             guard applied else {
                 log.debug("Config response discarded — reset() while in flight")
                 return
             }
+            onApplied()
 
             lastAppliedSequence = sequence
             // Applied, so an unconditional request may now release the flag.
@@ -208,7 +233,44 @@ actor ConfigSync {
         }
     }
 
-    /// Drop the cached config: used when the cache on disk is stale at launch.
+    /// A 304 confirms that the body applied, and on disk, is still the server's current one: the
+    /// stored stamp moves to now, as an HTTP cache freshens a stored response (RFC 9111 §4.3.4).
+    ///
+    /// 🔴 Without this a process that stays alive and polls into 304s keeps the stamp of its last
+    /// 200, which can be days old, and the next launch that cannot reach the server drops (past
+    /// `configOfflineMaxAge`) a body the server confirmed minutes earlier.
+    ///
+    /// Only for a request that sent the validator (an unconditional request answered 304 is
+    /// unexplained, so it confirms nothing), that started after the last applied body (an older
+    /// request's 304 refers to an older validator), while no unconditional refetch is owed, and
+    /// inside the reset gate, so a 304 landing after `reset()` writes nothing back.
+    ///
+    /// 🔴 And only while the stored label and what the server's row is known to hold now are BOTH
+    /// known and equal. The ETag carries no user, so a 304 says nothing about who the body was
+    /// bucketed for. After an `identify()` whose POST committed but whose answer was lost, or was
+    /// refused while `/v1/config` still answers, the row's state is `.unknown`, no unconditional
+    /// refetch is owed, and every poll 304s against the previous user's body. Re-stamping there
+    /// kept that body fresh forever, so offline launches applied it past `configOfflineMaxAge`.
+    /// Skipping leaves the stamp at the last 200, the 0.8.0 behaviour. `.unknown == .unknown` is
+    /// not a match: it says nothing about the row.
+    private func confirmCachedBody(sentValidator: Bool, sequence: Int, resetTokenAtStart: UInt64) {
+        guard sentValidator, sequence > lastAppliedSequence, !needsUnconditional else { return }
+        let current = identityProvider().identity
+        guard case .fetchedUnder = current else { return }
+        resetGate.ifNotReset(since: resetTokenAtStart) {
+            guard storage.data(forKey: StorageKeys.sdkConfig) != nil,
+                  let label = storage.data(forKey: StorageKeys.sdkConfigFetchedUnder)
+                    .flatMap({ try? JSONDecoder().decode(ServerHeldUser.self, from: $0) }),
+                  label.configIdentity == current
+            else { return }
+            let confirmedAt = now()
+            storage.set(String(confirmedAt.timeIntervalSince1970), forKey: StorageKeys.sdkConfigCachedAt)
+            freshness.confirm(at: confirmedAt)
+        }
+    }
+
+    /// Drop the cached config: used when the cache on disk is older than `configOfflineMaxAge`, or
+    /// carries no usable stamp, at launch. Never called because a fetch failed.
     ///
     /// 🔴 NOT called by `SheepitClient.reset()` any more. Logout clears synchronously through
     /// `ConfigResetGate`; a clear sent to this actor ran at an arbitrary later time and deleted
@@ -237,19 +299,24 @@ actor ConfigSync {
         // the app is offline, since no fetch replaces them.
         let resetTokenAtRead = resetGate.current
         var stale = false
+        var appliedFromCache = false
         resetGate.ifNotReset(since: resetTokenAtRead) {
-            guard let data = storage.data(forKey: StorageKeys.sdkConfig),
-                  let cached = try? JSONDecoder().decode(ApiDataResponse<SDKConfigResponse>.self, from: data)
-            else { return }
+            guard let data = storage.data(forKey: StorageKeys.sdkConfig) else { return }
+            // An unreadable body can never be applied, so nothing would ever delete it either.
+            guard let cached = try? JSONDecoder().decode(ApiDataResponse<SDKConfigResponse>.self, from: data) else {
+                stale = true
+                return
+            }
 
-            // 🔴 Age check. `SDKDefaults.configMaxAge` existed but was DEAD — declared
-            // and never read — so an iOS cache was served indefinitely while the web
-            // enforced the same 24h bound (`sdk-js/src/config-sync.ts`). A config kept
-            // past its bound serves stale targeting forever on a device that stops
-            // fetching, and it is a retention problem as well as a correctness one.
+            // 🔴 Age check: two limits, "may apply" and "must delete" (`CachedConfigLimits`).
+            // Up to `offlineMaxAge` (7 days by default) the body is applied, so a device that
+            // cannot reach the server keeps the flags it last had; past `staleAfter` (24 hours) it
+            // is reported stale. Past `offlineMaxAge` it is deleted: a config kept forever serves
+            // old targeting forever on a device that stops fetching, and it is one user's data
+            // kept on the device. A failed fetch deletes nothing; a successful one replaces it.
             //
-            // A missing timestamp means the entry predates this key: treat it as stale
-            // rather than trusting it, which costs one fetch on upgrade.
+            // A missing timestamp means the entry predates this key: treat it as unusable rather
+            // than trusting it, which costs one fetch on upgrade.
             // Stored as a String: `StorageProvider` vends String and Data only, and
             // widening the protocol for one timestamp is not worth it.
             let cachedAt = storage.string(forKey: StorageKeys.sdkConfigCachedAt).flatMap(Double.init) ?? 0
@@ -257,12 +324,16 @@ actor ConfigSync {
             // satisfies `> 0` and makes the age negative — a cache that never
             // expires. A future-dated stamp (clock skew at write) does the same.
             // Require a finite stamp that is not in the future.
-            let now = Date().timeIntervalSince1970
-            guard cachedAt.isFinite, cachedAt > 0, cachedAt <= now,
-                now - cachedAt <= SDKDefaults.configMaxAge
+            let nowSeconds = now().timeIntervalSince1970
+            guard cachedAt.isFinite, cachedAt > 0, cachedAt <= nowSeconds,
+                nowSeconds - cachedAt <= limits.offlineMaxAge
             else {
                 stale = true
                 return
+            }
+            let age = nowSeconds - cachedAt
+            if age > limits.staleAfter {
+                log.debug("Cached config is \(Int(age / 3600)) h old, past the \(Int(limits.staleAfter / 3600)) h refresh limit — applying it until a fetch replaces it")
             }
 
             log.debug("Loaded config from cache (v\(cached.data.configVersion))")
@@ -270,7 +341,7 @@ actor ConfigSync {
             // is known to hold now, read at the same moment. Every identified launch has just set
             // that state to unknown, and the stored label can be wrong (an identify request that
             // committed after the fetch that wrote it): trusting it re-applied the previous row's
-            // body under the stored user on every offline relaunch, up to the 24 h cache limit.
+            // body under the stored user on every offline relaunch, up to `configOfflineMaxAge`.
             // Otherwise the body is applied as `.unknown`, which also covers a body with no
             // readable label (written by an earlier SDK). User-bucketed entries are then
             // unattributed until a fetch lands: the safe direction.
@@ -278,10 +349,13 @@ actor ConfigSync {
                 .flatMap { try? JSONDecoder().decode(ServerHeldUser.self, from: $0) }
             let current = identityProvider().identity
             onConfig(cached.data, label?.configIdentity == current ? current : .unknown)
+            appliedFromCache = true
+            freshness.record(.cache, fetchedAt: Date(timeIntervalSince1970: cachedAt))
         }
+        if appliedFromCache { onApplied() }
         // Outside the gate: dropping a stale cache is not a write that can resurrect anything.
         if stale {
-            log.debug("Cached config is stale or unstamped — dropping it")
+            log.debug("Cached config is past configOfflineMaxAge, unstamped or unreadable — dropping it")
             clearCache()
         }
     }

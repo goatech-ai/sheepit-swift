@@ -17,23 +17,23 @@ Web and backend get flags and experiments from the Sheepit SDKs, and native apps
 
 ## Install
 
-Sheepit is developed in the Sheepit monorepo (`packages/sdk-swift`) and published to the public mirror repository [`goatech-ai/sheepit-swift`](https://github.com/goatech-ai/sheepit-swift), which is what Swift Package Manager resolves against. Every release tag on the mirror is a bare semver version (`0.8.0`), mirrored from the monorepo by CI.
+Sheepit is developed in the Sheepit monorepo (`packages/sdk-swift`) and published to the public mirror repository [`goatech-ai/sheepit-swift`](https://github.com/goatech-ai/sheepit-swift), which is what Swift Package Manager resolves against. Every release tag on the mirror is a bare semver version (`0.9.0`), mirrored from the monorepo by CI.
 
 ### Xcode
 
-**File → Add Package Dependencies…** → enter `https://github.com/goatech-ai/sheepit-swift.git` → choose **Exact Version** and enter `0.8.0`.
+**File → Add Package Dependencies…** → enter `https://github.com/goatech-ai/sheepit-swift.git` → choose **Exact Version** and enter `0.9.0`.
 
-> 🔴 **Choose "Exact Version" `0.8.0`. Do not accept Xcode's default "Up to Next Major", and do not use `from:`.**
-> The mirror also carries tags `1.0.0` and `1.0.1`. They are **older** code than `0.8.0` and
+> 🔴 **Choose "Exact Version" `0.9.0`. Do not accept Xcode's default "Up to Next Major", and do not use `from:`.**
+> The mirror also carries tags `1.0.0` and `1.0.1`. They are **older** code than `0.9.0` and
 > export a different product name (`SheepitSDK`, not `SheepitKit`). Semver ranks them higher,
 > so Xcode pre-fills its default rule from `1.0.1` and resolves the wrong release. Pin
-> `exact: "0.8.0"` and upgrade deliberately. See the CHANGELOG's "Version policy".
+> `exact: "0.9.0"` and upgrade deliberately. See the CHANGELOG's "Version policy".
 
 ### Package.swift
 
 ```swift
 dependencies: [
-  .package(url: "https://github.com/goatech-ai/sheepit-swift.git", exact: "0.8.0"),
+  .package(url: "https://github.com/goatech-ai/sheepit-swift.git", exact: "0.9.0"),
 ]
 ```
 
@@ -106,6 +106,13 @@ func example(sheepit: SheepitClient) async {
     // targeted on. Send anything the server needs as event properties instead.
     sheepit.identify(userId: "user_abc")
 
+    // or, from 0.9.0: identify and wait (at most 2 s) until flags answer for that user
+    let outcome = await sheepit.identify(userId: "user_abc", timeout: .seconds(2))
+    if outcome != .ready { /* flags still answer anonymously (or with defaults) */ }
+
+    // from 0.9.0: on a fresh install, wait for the first config before reading a flag
+    await sheepit.awaitConfig(timeout: .seconds(1))
+
     // evaluate a flag (synchronous; returns the default until config has loaded)
     let showBeta = sheepit.flag("show_beta_ui", default: .bool(false))
     if showBeta.boolValue == true { /* ... */ }
@@ -130,7 +137,8 @@ func example(sheepit: SheepitClient) async {
 SheepitKit evaluates nothing locally. It fetches `GET /v1/config`, which returns values the API has already evaluated for this device, and caches them. `flag(_:default:)` and `experiment(_:)` read that cache synchronously.
 
 - Configuration is polled every `configRefreshInterval`, **300 seconds by default**. A flag change or kill switch can therefore take up to about five minutes to reach a running app; lower `configRefreshInterval` if you need faster propagation.
-- The first `flag` read per flag and the first `experiment` read per experiment emit `$flag_exposure` / `$experiment_exposure`. `inspect(_:default:)` never emits exposure.
+- The last config fetched is kept on the device, so a launch that cannot reach the server (airplane mode, no signal) keeps the flags and experiment arms the device last had. A cache up to `configOfflineMaxAge` old (**7 days** by default, counted from when the server last sent or confirmed it, and checked at launch) is applied; past `configStaleAfter` (**24 hours**) it is reported stale. An older cache is deleted at launch and flags read their defaults until a fetch lands. A failed fetch never deletes the cache, a successful one replaces it, and `reset()` deletes it. `status().configFreshness` reports where the applied config came from (`.server` or `.cache`), when it was fetched, its `age` and `isStale`, so you can show "cached, 30 h old". Set `configOfflineMaxAge: 86_400` for the behaviour of 0.8.0 and earlier, which deleted a cache older than 24 hours.
+- The first `flag` read per flag and the first `experiment` read per experiment emit `$flag_exposure` / `$experiment_exposure`, each with `config_source` (`server` or `cache`) and `config_age_ms`, so an analysis can separate evaluations made from an old cache. `inspect(_:default:)` never emits exposure.
 - Every payload reports the device the app runs on as `platform`: `ios` (iPhone), `ipados` (iPad, and Vision Pro), `macos` (a Mac app, a Catalyst app, or an iPhone/iPad app running on an Apple-silicon Mac), `tvos` or `watchos`. A flag targeted at `ios` also reaches `ipados` devices; `macos`, `tvos` and `watchos` receive only flags targeted at them or at every platform.
 
 ## Configuration
@@ -145,6 +153,8 @@ SheepitKit evaluates nothing locally. It fetches `GET /v1/config`, which returns
 | `flushInterval`          | `TimeInterval` (s)                              | `5.0`                                 |
 | `flushSize`              | `Int`                                           | `20`                                  |
 | `configRefreshInterval`  | `TimeInterval` (s)                              | `300`                                 |
+| `configStaleAfter`       | `TimeInterval` (s)                              | `86_400` (24 hours)                   |
+| `configOfflineMaxAge`    | `TimeInterval` (s)                              | `604_800` (7 days)                    |
 | `maxQueueSize`           | `Int`                                           | `1000`                                |
 | `retryAttempts`          | `Int`                                           | `3`                                   |
 | `debug`                  | `Bool`                                          | `false`                               |
@@ -234,30 +244,32 @@ TestFlight and the App Store ship the same binary, so the URL compiled into the 
 
 ## API reference
 
-| Symbol                                                              | Purpose                                                            |
-| ------------------------------------------------------------------- | ------------------------------------------------------------------ |
-| `SheepitClient.create(config:)`                                     | Create an instance (preferred for SwiftUI)                         |
-| `SheepitClient.initialize(config:)` / `SheepitClient.shared`        | Singleton create and accessor                                      |
-| `track(_:properties:)`                                              | Send an event                                                      |
-| `flag(_:default:)`                                                  | Evaluate a flag; returns a `FlagValue`                             |
-| `experiment(_:)`                                                    | Get a `SheepitExperimentResult` (with `.variant`)                  |
-| `identify(userId:)` / `reset()`                                     | Set or clear user identity (no traits — see below)                 |
-| `flush() async` / `destroy()`                                       | Send queued events / tear down                                     |
-| `screen(_:properties:)`                                             | Track a `$screen` event and set the crash context's screen         |
-| `captureError(_:error:attributes:)`                                 | Report a handled (non-fatal) error as a `$error` event             |
-| `recordRequest(method:url:status:durationMs:responseBytes:error:)`  | Report a failed first-party HTTP request as a `$http_error` event  |
-| `addBreadcrumb(category:message:)` / `setScreen(_:)`                | Context attached to crash reports                                  |
-| `submitFeedback(message:type:email:attributes:screenshots:) async`  | Send in-app feedback with up to 3 screenshots (see below)          |
-| `startSpan(_:attributes:)` / `endSpan(_:)` / `markFirstFrame()`     | Performance spans (when `performance.enabled`)                     |
-| `FlagValue`                                                         | Enum: `.bool`, `.string`, `.int`, `.double`, `.json`               |
-| `overrideFlag(_:value:)` / `clearOverride(_:)` / `clearOverrides()` | Set/clear debug flag overrides                                     |
-| `getOverrides()`                                                    | Read the debug flag overrides currently set                        |
-| `inspect(_:default:)`                                               | Non-exposing diagnostic read — `SheepitFlagInspection` (dev menu)  |
-| `knownFlagKeys()`                                                   | Sorted union of remote-valued + overridden flag keys               |
-| `flagChanges()`                                                     | `AsyncStream<Void>` — fires on config apply / override set / clear |
-| `status()`                                                          | Queues, `lastFlushAt`, device / user id, `identity` (server side)  |
-| `diagnostics()` / `getRecentDiagnostics()`                          | Live and buffered internal SDK events                              |
-| `SheepitConfig`                                                     | Configuration, including optional `crashes` and `performance`      |
+| Symbol                                                              | Purpose                                                                              |
+| ------------------------------------------------------------------- | ------------------------------------------------------------------------------------ |
+| `SheepitClient.create(config:)`                                     | Create an instance (preferred for SwiftUI)                                           |
+| `SheepitClient.initialize(config:)` / `SheepitClient.shared`        | Singleton create and accessor                                                        |
+| `track(_:properties:)`                                              | Send an event                                                                        |
+| `flag(_:default:)`                                                  | Evaluate a flag; returns a `FlagValue`                                               |
+| `experiment(_:)`                                                    | Get a `SheepitExperimentResult` (with `.variant`)                                    |
+| `identify(userId:)` / `reset()`                                     | Set or clear user identity (no traits — see below)                                   |
+| `identify(userId:timeout:) async`                                   | Identify, then wait until flags answer for the user (0.9.0)                          |
+| `awaitConfig(timeout:) async`                                       | Wait until a config is applied, e.g. on a fresh install (0.9.0)                      |
+| `flush() async` / `destroy()`                                       | Send queued events / tear down                                                       |
+| `screen(_:properties:)`                                             | Track a `$screen` event and set the crash context's screen                           |
+| `captureError(_:error:attributes:)`                                 | Report a handled (non-fatal) error as a `$error` event                               |
+| `recordRequest(method:url:status:durationMs:responseBytes:error:)`  | Report a failed first-party HTTP request as a `$http_error` event                    |
+| `addBreadcrumb(category:message:)` / `setScreen(_:)`                | Context attached to crash reports                                                    |
+| `submitFeedback(message:type:email:attributes:screenshots:) async`  | Send in-app feedback with up to 3 screenshots (see below)                            |
+| `startSpan(_:attributes:)` / `endSpan(_:)` / `markFirstFrame()`     | Performance spans (when `performance.enabled`)                                       |
+| `FlagValue`                                                         | Enum: `.bool`, `.string`, `.int`, `.double`, `.json`                                 |
+| `overrideFlag(_:value:)` / `clearOverride(_:)` / `clearOverrides()` | Set/clear debug flag overrides                                                       |
+| `getOverrides()`                                                    | Read the debug flag overrides currently set                                          |
+| `inspect(_:default:)`                                               | Non-exposing diagnostic read — `SheepitFlagInspection` (dev menu)                    |
+| `knownFlagKeys()`                                                   | Sorted union of remote-valued + overridden flag keys                                 |
+| `flagChanges()`                                                     | `AsyncStream<Void>` — fires on config apply / override set / clear                   |
+| `status()`                                                          | Queues, `lastFlushAt`, device / user id, `identity` (server side), `configFreshness` |
+| `diagnostics()` / `getRecentDiagnostics()`                          | Live and buffered internal SDK events                                                |
+| `SheepitConfig`                                                     | Configuration, including optional `crashes` and `performance`                        |
 
 **`identify()` takes no traits.** 🔴 The `traits` parameter was **removed in 0.7.0** — `identify(userId:traits:)` no longer exists, so a call site passing them is a compile error. It is a deliberate break rather than a silent no-op: the values used to be merged into a server-side column that survived both `reset()` and a GDPR erase, and they could never be targeted on again. Send what you need as event properties for dashboards and experiment/release metrics instead: `track("plan_selected", properties: ["plan": "pro"])` — event properties are not evaluable by flag/experiment rules, so this does not restore targeting. To keep targeting the value, add the user to a group (`POST /v1/groups/:id/members`, target `user_group`) or call `POST /v1/devices/:deviceId/identify` directly with `attributes` (same retention trade-off: survives `reset()`, not cleared by GDPR end-user erase). The web SDK has always behaved this way. ⚠️ **Upgrading from 0.6.0? This is about new traits only** — whatever 0.6.0 already uploaded stays on the device row and keeps matching targeting rules. See the [CHANGELOG](CHANGELOG.md).
 

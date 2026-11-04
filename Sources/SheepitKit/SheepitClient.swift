@@ -519,6 +519,10 @@ public final class SheepitClient: @unchecked Sendable {
     private let configSync: ConfigSync
     /// Shared with `configSync`: `reset()` and config writes are serialized through it.
     private let configResetGate: ConfigResetGate
+    /// Shared with `configSync`: where the applied config came from and when it was fetched.
+    private let configFreshness: ConfigFreshnessRecorder
+    /// `configStaleAfter` / `configOfflineMaxAge`, validated here because both are public `var`s.
+    private let configLimits: CachedConfigLimits
     private let performanceMonitor: PerformanceMonitor?
     private let crashReporter: CrashReporter?
     /// The crash retry queue. Read by `CrashReporter` when there is one, and aged out by
@@ -555,7 +559,16 @@ public final class SheepitClient: @unchecked Sendable {
     private var identifyExhaustedUserId: String?
     /// See `identifyRetryDelaysForTesting`. Guarded by `identifyLock`; nil in production.
     private var _identifyRetryDelaysForTesting: [TimeInterval]?
+    /// The sequence of the last identify POST queued. Guarded by `identifyLock`; lets a wait in
+    /// `identify(userId:timeout:)` ignore the end of a POST queued before its own.
+    private var identifyPostSequence: UInt64 = 0
+    /// The user of every identify POST queued or in flight, by sequence. Guarded by `identifyLock`.
+    private var pendingIdentifyPostUsers: [UInt64: String] = [:]
+    /// Whether `refetchConfigForAwaitedIdentify()` has a fetch in flight. Guarded by `identifyLock`.
+    private var awaitedIdentifyRefetchInFlight = false
     private let identifyLock = NSLock()
+    /// The waits behind `identify(userId:timeout:)` and `awaitConfig(timeout:)`.
+    let identifyWaiters: IdentifyWaiters
     /// Internal, not private, for `SheepitClient+ErrorCapture.swift`.
     let destroyedFlag = AtomicFlag()
     /// Burst limiter for `captureError` (`SheepitClient+ErrorCapture.swift`), on a monotonic clock.
@@ -754,12 +767,21 @@ public final class SheepitClient: @unchecked Sendable {
         let logger = self.log
         let resetGate = ConfigResetGate()
         self.configResetGate = resetGate
+        let freshness = ConfigFreshnessRecorder()
+        self.configFreshness = freshness
+        let limits = CachedConfigLimits(staleAfter: config.configStaleAfter, offlineMaxAge: config.configOfflineMaxAge)
+        self.configLimits = limits
+        let waiters = IdentifyWaiters(serverHeldUser: { contextRef.serverHeldUser.user })
+        self.identifyWaiters = waiters
         self.configSync = ConfigSync(
             http: http,
             storage: storage,
             refreshInterval: config.configRefreshInterval,
             log: log,
             resetGate: resetGate,
+            limits: limits,
+            now: now,
+            freshness: freshness,
             // What the server's device row holds, not the app's id: see `ConfigSync.identityProvider`.
             identityProvider: {
                 let held = contextRef.serverHeldUser
@@ -768,11 +790,14 @@ public final class SheepitClient: @unchecked Sendable {
             onConfig: { response, fetchedUnder in
                 fm.setEvaluatedFlags(response.flags)
                 em.setAssignments(response.experiments, appliedUnder: fetchedUnder)
+                // Inside the reset gate: records only; the waits are decided in `onApplied`.
+                waiters.configApplied(fetchedUnder)
                 logger.debug(
                     "Config applied: \(response.flags.count) flags, "
                     + "\(response.experiments.count) experiments"
                 )
-            }
+            },
+            onApplied: { waiters.configAppliedOutsideGate() }
         )
 
         // Performance monitoring
@@ -1040,7 +1065,7 @@ public final class SheepitClient: @unchecked Sendable {
             defaultValue: defaultValue,
             onExposure: { [weak self] key, value, reason in
                 guard let self else { return }
-                self.track("$flag_exposure", properties: [
+                self.track("$flag_exposure", properties: self.withConfigFreshness([
                     "flag_key": key,
                     // Raw value, not a case description — matches
                     // packages/sdk-js/src/client.ts and the
@@ -1049,7 +1074,7 @@ public final class SheepitClient: @unchecked Sendable {
                     // What makes a dedup regression visible server-side: repeated `first`
                     // exposures for one device and flag within a session mean it broke again.
                     "exposure_reason": reason.rawValue,
-                ])
+                ]))
                 if reason == .valueChanged {
                     self.diagnosticBus.emit(
                         .info,
@@ -1177,11 +1202,11 @@ public final class SheepitClient: @unchecked Sendable {
         guard !destroyedFlag.value else { return SheepitExperimentResult(variant: "control") }
         return experimentManager.resolve(experimentKey: experimentKey) { [weak self] key, variant, reason in
             guard let self else { return }
-            self.track("$experiment_exposure", properties: [
+            self.track("$experiment_exposure", properties: self.withConfigFreshness([
                 "experiment_key": key,
                 "variant": variant,
                 "exposure_reason": reason.rawValue,
-            ])
+            ]))
             if reason == .variantChanged {
                 self.diagnosticBus.emit(
                     .info,
@@ -1221,7 +1246,25 @@ public final class SheepitClient: @unchecked Sendable {
     ///   `SDKDefaults.userIdMaxLength` UTF-16 units; a longer one is refused,
     ///   never truncated.
     public func identify(userId: String) {
-        guard !destroyedFlag.value else { return }
+        dispatchIdentify(userId: userId)
+    }
+
+    /// What one `identify(userId:)` call did, for `identify(userId:timeout:)` to wait on.
+    enum IdentifyDispatch {
+        /// Nothing queued and nothing will bind: destroyed, a `userId` that is too long, or the
+        /// same user with a reason not to send (rejected, registration backed off, ladder exhausted).
+        case notSent
+        /// An identify POST with this sequence (or one already in flight) decides it.
+        case posted(UInt64)
+        /// The same user, and the row is already known to hold them. POSTs from this sequence on
+        /// can still fail the wait.
+        case alreadyBound(UInt64)
+    }
+
+    /// `identify(userId:)`, reporting what it did.
+    @discardableResult
+    func dispatchIdentify(userId: String) -> IdentifyDispatch {
+        guard !destroyedFlag.value else { return .notSent }
 
         // Refused, not truncated (founder decision, S3c): ingest and device identify both cap
         // a user id at 256 UTF-16 units, so every event tracked under a longer one was
@@ -1238,7 +1281,7 @@ public final class SheepitClient: @unchecked Sendable {
                     "max_length": AnyCodable(SDKDefaults.userIdMaxLength),
                 ]
             )
-            return
+            return .notSent
         }
 
         // Read BEFORE the identity changes: the POST is sent only while no `reset()` has run since
@@ -1250,14 +1293,15 @@ public final class SheepitClient: @unchecked Sendable {
             // Same user: nothing to flush, nothing to re-bucket. A POST only if the server's row is
             // not known to hold them: the stored id is the app's own label and survives a change of
             // key or environment, so "same user" alone said nothing about THIS server's row.
-            identifySameUser(userId, resetToken: resetToken)
-            return
+            return identifySameUser(userId, resetToken: resetToken)
         }
 
         // Flush events attributed to the previous identity first.
         Task { await flush() }
 
         context.setUserId(userId)
+        // Every wait for the user the app no longer names is superseded.
+        identifyWaiters.supersede(by: userId)
 
         // Clears the exposures only. The server's assignments stay, still labelled
         // with the row's previous user, so events tracked until the identify POST succeeds and its
@@ -1276,7 +1320,7 @@ public final class SheepitClient: @unchecked Sendable {
         // Synchronously, before the POST is even queued: from here until a POST answers, the SDK
         // cannot say which user the server's device row holds (`ServerHeldUser`).
         context.setServerHeldUser(.unknown)
-        postIdentity(userId: userId, sendIf: identifySendGuard(resetToken: resetToken))
+        return .posted(postIdentity(userId: userId, sendIf: identifySendGuard(resetToken: resetToken)))
     }
 
     /// `identify()` with the user the app already names. No-op while the row is known to hold them,
@@ -1284,7 +1328,7 @@ public final class SheepitClient: @unchecked Sendable {
     /// backed off (the POST can only 404), or after their ladder ran out until the next automatic
     /// retry. Otherwise one POST through the automatic guard, idle-only so it never doubles the launch
     /// POST, and without the user-change side effects: the app's user did not change.
-    private func identifySameUser(_ userId: String, resetToken: UInt64) {
+    private func identifySameUser(_ userId: String, resetToken: UInt64) -> IdentifyDispatch {
         // The same guards as the automatic retry, plus "its ladder just ran out": `identify()` is host
         // code and may be called on every screen, so each failure mode needs a reason not to resend.
         let reason: String?
@@ -1297,12 +1341,11 @@ public final class SheepitClient: @unchecked Sendable {
         } else if identifyExhausted(for: userId) {
             reason = "recently_exhausted"
         } else {
-            postIdentity(
+            return .posted(postIdentity(
                 userId: userId,
                 onlyIfIdle: true,
                 sendIf: automaticIdentifySendGuard(userId: userId, resetToken: resetToken)
-            )
-            return
+            ))
         }
         diagnosticBus.emit(
             .debug,
@@ -1312,6 +1355,39 @@ public final class SheepitClient: @unchecked Sendable {
                 ?? "identify() called with the current userId — no POST",
             data: reason.map { ["reason": AnyCodable($0)] }
         )
+        return reason == nil ? .alreadyBound(alreadyBoundFailingFrom(userId)) : .notSent
+    }
+
+    /// The first POST whose failure fails a wait on a row already known to hold `userId`: the
+    /// earliest one for them still queued or in flight (it marks the row unknown as it goes out, so
+    /// its failure means the row is no longer known to hold them), else the next one queued.
+    private func alreadyBoundFailingFrom(_ userId: String) -> UInt64 {
+        identifyLock.lock()
+        defer { identifyLock.unlock() }
+        return pendingIdentifyPostUsers.filter { $0.value == userId }.keys.min() ?? identifyPostSequence &+ 1
+    }
+
+    /// For `identify(userId:timeout:)` on a row already known to hold the user, when the config in
+    /// memory was not fetched for them. At most one in flight: a screen awaiting on every appearance
+    /// must not turn into one full (ETag-less) config fetch per call.
+    func refetchConfigForAwaitedIdentify() {
+        identifyLock.lock()
+        let start = !awaitedIdentifyRefetchInFlight
+        awaitedIdentifyRefetchInFlight = true
+        identifyLock.unlock()
+        guard start else { return }
+        Task { [weak self] in
+            guard let self else { return }
+            await self.configSync.refetchUnconditionally(deviceId: self.context.deviceId)
+            self.awaitedIdentifyRefetchFinished()
+        }
+    }
+
+    /// Synchronous so the lock is never held across a suspension point.
+    private func awaitedIdentifyRefetchFinished() {
+        identifyLock.lock()
+        awaitedIdentifyRefetchInFlight = false
+        identifyLock.unlock()
     }
 
     /// POST the identity and record what the server's device row holds afterwards.
@@ -1341,20 +1417,27 @@ public final class SheepitClient: @unchecked Sendable {
     ///     `.notSent`, label unknown). `identifySendGuard` for `identify()`,
     ///     `automaticIdentifySendGuard` for the launch re-POST and the retry.
     ///   - beforeSendForTesting: see `configRefreshTickForTesting(beforeSend:)`.
+    /// - Returns: the sequence of the POST queued, or with `onlyIfIdle` and one already pending, of
+    ///   the last one queued. Every exit of the task signals `identifyWaiters` with it, except a
+    ///   destroyed client's (`destroy()` ends every wait itself).
+    @discardableResult
     private func postIdentity(
         userId: String,
         onlyIfIdle: Bool = false,
         sendIf: (@Sendable () -> Bool)? = nil,
         beforeSendForTesting: (@Sendable () -> Void)? = nil
-    ) {
+    ) -> UInt64 {
         identifyLock.lock()
         defer { identifyLock.unlock() }
         // Checked and counted under the same lock, so two triggers cannot both see "idle".
-        if onlyIfIdle, pendingIdentifyPosts > 0 { return }
+        if onlyIfIdle, pendingIdentifyPosts > 0 { return identifyPostSequence }
         pendingIdentifyPosts += 1
+        identifyPostSequence &+= 1
+        let sequence = identifyPostSequence
+        pendingIdentifyPostUsers[sequence] = userId
         let previous = identifyTask
         identifyTask = Task { [weak self] in
-            defer { self?.identifyPostFinished() }
+            defer { self?.identifyPostFinished(sequence) }
             // Cancelling this task (`destroy()`) cancels every POST queued before it too, so no
             // queued or retrying POST from a destroyed client can move the row later.
             await withTaskCancellationHandler {
@@ -1412,6 +1495,8 @@ public final class SheepitClient: @unchecked Sendable {
                     code: "identity.identify_answer_for_rotated_device",
                     message: "Identify POST answered for a device replaced by reset() — ignored"
                 )
+                // Never `.ready` from it: it bound the abandoned row.
+                self.identifyWaiters.identifyFailed(userId, sequence: sequence)
                 return
             }
             if result.outcome.isBound {
@@ -1421,6 +1506,8 @@ public final class SheepitClient: @unchecked Sendable {
                 self.recordIdentifyRejection(nil, status: nil)
                 self.recordIdentifyExhausted(nil)
                 self.context.setServerHeldUser(.known(userId))
+                // After the label: a wait is `.ready` once the refetch below is applied for them.
+                self.identifyWaiters.identifyBound(userId)
                 self.reportIdentifyResult(result)
                 await self.configSync.refetchUnconditionally(deviceId: self.context.deviceId)
                 return
@@ -1428,7 +1515,10 @@ public final class SheepitClient: @unchecked Sendable {
             // A failure the app has moved past is stale too: after a `reset()` the label and the
             // device are the rotation's, and the failure says nothing about them (an answer for the
             // rotation's placeholder, which is never registered, is a 404).
-            guard isCurrent() else { return }
+            guard isCurrent() else {
+                self.identifyWaiters.identifyFailed(userId, sequence: sequence)
+                return
+            }
             // Nothing sent leaves the label alone: after a `reset()` it is the fresh device's.
             if result.attempts > 0 { self.context.markServerHeldUserUnknown() }
             // On a replacement device now, but unbound: the config held is the dead device's.
@@ -1449,7 +1539,9 @@ public final class SheepitClient: @unchecked Sendable {
                 break
             }
             self.reportIdentifyResult(result)
+            self.identifyWaiters.identifyFailed(userId, sequence: sequence)
         }
+        return sequence
     }
 
     /// How the bind ended, for the app's diagnostics and the project's own data. `stale` reports
@@ -1489,9 +1581,10 @@ public final class SheepitClient: @unchecked Sendable {
         }
     }
 
-    private func identifyPostFinished() {
+    private func identifyPostFinished(_ sequence: UInt64) {
         identifyLock.lock()
         pendingIdentifyPosts -= 1
+        pendingIdentifyPostUsers[sequence] = nil
         identifyLock.unlock()
     }
 
@@ -1586,7 +1679,10 @@ public final class SheepitClient: @unchecked Sendable {
         // Read first, a ladder that marked and sent between the read and the token kept a device the
         // POST then bound to the logged-out user. Nothing else is cleared here: the config clear
         // still moves the token again below, after the rotation, so no fetch names the old device.
-        configResetGate.reset {}
+        // Not applied from here on for `awaitConfig`: the config in memory is cleared below.
+        configResetGate.reset { identifyWaiters.configCleared() }
+        // Every identify wait so far ends `.failed`: the user it waits for is being logged out.
+        identifyWaiters.resetHappened()
         // Read before anything is cleared: whether a user is, or may be, on the server's row.
         let rotateDevice = deviceRotation.deviceMayBeBound()
         context.resetIdentity(mintSession: appState.isForeground)
@@ -1630,6 +1726,7 @@ public final class SheepitClient: @unchecked Sendable {
         configResetGate.reset {
             experimentManager.clearForLogout()
             flagManager.clearEvaluated()
+            identifyWaiters.configCleared()
             // 🔴 The on-disk copy goes SYNCHRONOUSLY, here. A user who logs out and immediately
             // force-quits (or is killed by the OS) must not leave `gt_config` on disk for the next
             // launch to re-apply via `loadFromCache()` — precisely the case this exists to prevent,
@@ -1638,6 +1735,7 @@ public final class SheepitClient: @unchecked Sendable {
             storage.removeObject(forKey: StorageKeys.sdkConfig)
             storage.removeObject(forKey: StorageKeys.sdkConfigCachedAt)
             storage.removeObject(forKey: StorageKeys.sdkConfigFetchedUnder)
+            configFreshness.clear()
         }
         // Queued feedback carries the logged-out user's words, email and id: deleted now, on this
         // thread, like the cached config above, under every key and environment.
@@ -1766,8 +1864,23 @@ public final class SheepitClient: @unchecked Sendable {
             experimentCount: experimentManager.count(),
             sdkVersion: SDKDefaults.sdkVersion,
             rejectionReason: inertReason,
-            identity: inertReason == nil && !destroyedFlag.value ? identityStatus() : nil
+            identity: inertReason == nil && !destroyedFlag.value ? identityStatus() : nil,
+            configFreshness: inertReason == nil && !destroyedFlag.value
+                ? configFreshness.snapshot(now: now(), staleAfter: configLimits.staleAfter) : nil
         )
+    }
+
+    /// Adds `config_source` and `config_age_ms` to an exposure event: whether the value came from
+    /// the server or the on-device cache, and how old that config was, so an analysis can separate
+    /// evaluations made offline from a stale cache. Adds nothing when no config is applied.
+    private func withConfigFreshness(_ properties: [String: Any]) -> [String: Any] {
+        guard let freshness = configFreshness.snapshot(now: now(), staleAfter: configLimits.staleAfter) else {
+            return properties
+        }
+        var merged = properties
+        merged["config_source"] = freshness.source.rawValue
+        merged["config_age_ms"] = Int(freshness.age * 1000)
+        return merged
     }
 
     private func identityStatus() -> SDKStatus.Identity {
@@ -1853,6 +1966,8 @@ public final class SheepitClient: @unchecked Sendable {
         // lifetime isn't tied to a cancellable scope sees completion
         // rather than hanging forever.
         flagManager.finishAllChanges()
+        // Every identify / config wait ends; none starts after this.
+        identifyWaiters.close()
         SheepitClient.instanceLock.lock()
         if SheepitClient.instance === self {
             SheepitClient.instance = nil
@@ -1933,6 +2048,10 @@ public final class SheepitClient: @unchecked Sendable {
         for warning in config.activeInfoPlistWarnings {
             log.warn(warning)
             diagnosticBus.emit(.warn, .config, code: InfoPlistReader.warningCode, message: warning)
+        }
+        for issue in configLimits.issues {
+            log.warn(issue)
+            diagnosticBus.emit(.warn, .config, code: "config.cache_limit_invalid", message: issue)
         }
 
         // `start()` calls host code synchronously — `emitSessionStartIfOwed()` -> `track()` ->

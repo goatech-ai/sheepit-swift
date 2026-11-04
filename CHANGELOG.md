@@ -27,6 +27,74 @@ package uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 > resolves `>=1.0.0 <2.0.0`, so **a consumer pinned to `1.0.x` will never
 > receive a `0.x` release.** They are frozen until they re-pin to `0.x`.
 
+## [0.9.0] - 2026-11-03
+
+### Upgrading from 0.8.0
+
+- **Pin `exact: "0.9.0"`.** On `0.x` a minor may break you, and SPM's "Up to Next Major" does not
+  stop at the next `0.x` minor.
+- **No API is removed or renamed.** `SheepitConfig.init` and `SDKStatus.init` gain defaulted
+  parameters at the end.
+- **A device that cannot reach the server now keeps its cached flags for up to 7 days**, not 24
+  hours (see Changed). Set `configOfflineMaxAge: 86_400` to keep 0.8.0's behaviour.
+- **`$flag_exposure` and `$experiment_exposure` gain `config_source` and `config_age_ms`.** A strict
+  event schema that declares either property with another type rejects those events.
+
+### Changed
+
+- **The cached config is applied for up to `configOfflineMaxAge` (default 7 days) at launch.**
+  0.8.0 deleted any cache older than 24 hours when the app started, so a device launched offline a
+  day after its last fetch read every flag at its compiled-in default and moved users out of their
+  experiment arms until a launch reached the server. The cache is now deleted only when a fetch
+  replaces it, when `reset()` runs, or when it passes `configOfflineMaxAge`. A failed fetch never
+  deletes it. The existing launch guards are unchanged: a missing, infinite or future-dated stamp
+  is still refused, a `reset()` racing the cache load still applies nothing, and a body whose
+  stored user does not match what the server is known to hold is still applied as unknown, so its
+  user-bucketed assignments are marked `identity_changed` on events.
+- **A 304 now refreshes the cache's timestamp** while the server is known to hold the same user
+  the body was fetched for. Without this, an app kept alive for days measured the cache's age from
+  its last full response, and its next offline launch could drop a body the server had confirmed
+  minutes earlier. After an `identify()` whose outcome is unknown (its answer lost, or refused),
+  a 304 refreshes nothing, so another user's body still ages out.
+- **A cached config that cannot be read is deleted at launch**, rather than left on disk.
+
+### Added
+
+- **`SheepitConfig.configStaleAfter`** (default 24 hours): the age past which a successful fetch was
+  expected to have replaced the cache. An older cache is still applied and is reported stale.
+- **`SheepitConfig.configOfflineMaxAge`** (default 7 days): the oldest cache applied at launch.
+  Both must be finite and positive, or they fall back to their defaults. When
+  `configOfflineMaxAge` is below `configStaleAfter`, `configStaleAfter` is lowered to it. They are
+  checked again when the client is created, so setting the `var` after init cannot bypass it. An
+  invalid value logs a warning and emits a `config.cache_limit_invalid` diagnostic.
+- **`SDKStatus.configFreshness`**: where the applied config came from (`.server` or `.cache`),
+  `fetchedAt`, `age` and `isStale`. nil when no config is applied. Use it to show "cached, 30 h
+  old".
+- **`config_source` (`server` | `cache`) and `config_age_ms` on `$flag_exposure` and
+  `$experiment_exposure`**, so an analysis can separate evaluations made from an old cache.
+- **`identify(userId:timeout:) async -> IdentifyOutcome`.** Does what `identify(userId:)` does, then
+  waits, at most `timeout`, until the server's device row is known to hold the user AND the config
+  applied in memory was evaluated while it held them (usually the fetch right after the bind; on a
+  cold launch possibly the on-device cache, at most `configOfflineMaxAge` old), so `flag()` answers for them.
+  `.ready`, `.timedOut` (the request and the fetch carry on in the background) or `.failed`: the
+  user is not bound now and this call will not bind them (rejected, device not found, retries ran
+  out, registration backed off, `reset()` / `destroy()` during the wait, another user identified,
+  a `userId` over 256 UTF-16 units, or a destroyed / inert client). Only a rejection is final:
+  after a backoff or exhausted retries the SDK's periodic retry may still bind the user, so call
+  again later. With the user already identified it returns `.ready` without a request when their
+  config is applied, and `.failed` at once when nothing would be sent. Cancelling the calling task
+  ends only the wait (`.timedOut`). Compare against `.ready`; cases may be added.
+  `identify(userId:)` is unchanged.
+- **`awaitConfig(timeout:) async -> Bool`.** `true` once any config is applied in memory (from the
+  on-device cache or a fetch); `false` on timeout, cancellation or `destroy()`. For a fresh install
+  that reads a flag before its first config fetch has landed. After `reset()` it waits for the
+  next fetch again.
+
+### Not in sdk-js yet
+
+sdk-js 0.9.1 still ignores a cached config older than 24 hours and sends no `config_source` or
+`config_age_ms`. The same options and properties come to sdk-js in its next release.
+
 ## [0.8.0] - 2026-10-28
 
 ### Upgrading from 0.7.0

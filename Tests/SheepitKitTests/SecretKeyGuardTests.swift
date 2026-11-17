@@ -145,18 +145,42 @@ final class SecretKeyGuardTests: XCTestCase {
         sdk.destroy()  // asserted for real in testInertClientReleasesItsNetworkMonitor
     }
 
-    // MARK: - The prefix is not compiled in
+    // MARK: - The prefix is never compared to a literal (contract § 5)
 
-    /// The point of the change: a future mint under a different vendor prefix must work on
-    /// an SPM version pinned today. Published versions are immutable, so this is the test
-    /// that keeps the prefix cheap to rename. The vendor segment is the ONLY part not
-    /// validated — everything else about the shape still is.
-    func testPublishableKeyUnderADifferentVendorPrefixIsAccepted() {
-        for key in ["si_pub_xxx_\(Self.hex)", "sheepit_pub_xxx_\(Self.hex)"] {
+    /// `si_` is the decided rename with permanent dual-accept, and a published SPM version is
+    /// immutable, so the vendor segment is shape-checked only: any `[A-Za-z0-9][A-Za-z0-9-]{0,15}`.
+    func testAnyWellFormedVendorPrefixIsAcceptedAndAMalformedOneIsNot() {
+        for key in ["lp_pub_xxx_\(Self.hex)", "si_pub_xxx_\(Self.hex)", "LP_pub_xxx_\(Self.hex)", "a-b_pub_xxx_\(Self.hex)"] {
             let sdk = SheepitClient.create(config: makeConfig(apiKey: key))
             XCTAssertTrue(sdk.status().initialized, "\(key) should be admitted")
             sdk.destroy()
         }
+        for key in ["sheepit_ai_pub_xxx_\(Self.hex)", "-lp_pub_xxx_\(Self.hex)", "\(String(repeating: "v", count: 17))_pub_xxx_\(Self.hex)", "l.p_pub_xxx_\(Self.hex)"] {
+            let sdk = SheepitClient.create(config: makeConfig(apiKey: key))
+            XCTAssertFalse(sdk.status().initialized, "\(key) must be refused")
+            sdk.destroy()
+        }
+    }
+
+    /// The tail is exactly what the server mints (`generateApiKey`): slug `[a-z0-9]{3}`, secret
+    /// 64 lowercase hex. 0.9.x admitted any slug and any printable secret of 32+ characters.
+    func testTheSlugAndSecretMustMatchTheMintedShape() {
+        let rejected = [
+            "lp_pub_prod_\(Self.hex)",                                   // 4-char slug
+            "lp_pub_PRD_\(Self.hex)",                                    // upper-case slug
+            "lp_pub_xxx_\(String(repeating: "a", count: 32))",           // 32-char secret
+            "lp_pub_xxx_\(String(repeating: "A", count: 64))",           // upper-case hex
+            "lp_pub_xxx_\(String(repeating: "g", count: 64))",           // not hex
+            "lp_pub_xxx_\(String(repeating: "a", count: 65))",           // too long
+        ]
+        for key in rejected {
+            let sdk = SheepitClient.create(config: makeConfig(apiKey: key))
+            XCTAssertFalse(sdk.status().initialized, "\(key) must be refused")
+            sdk.destroy()
+        }
+        let sdk = SheepitClient.create(config: makeConfig(apiKey: "lp_pub_a1z_0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"))
+        XCTAssertTrue(sdk.status().initialized, "a minted-shape key is admitted")
+        sdk.destroy()
     }
 
     /// ...and the secret-key guard must not fail open under that same rename.
@@ -427,10 +451,9 @@ final class SecretKeyGuardTests: XCTestCase {
         XCTAssertFalse(sdk.status().initialized)
     }
 
-    /// A legitimate key with an all-ASCII vendor and slug must still be admitted — the
-    /// widened check must not reject anything it used to accept.
+    /// A legitimate minted-shape key must still be admitted.
     func testLegitimateKeyWithOrdinaryVendorAndSlugIsStillAccepted() {
-        let sdk = SheepitClient.create(config: makeConfig(apiKey: "lp_pub_prod_\(Self.hex)"))
+        let sdk = SheepitClient.create(config: makeConfig(apiKey: "lp_pub_prd_\(Self.hex)"))
         XCTAssertTrue(sdk.status().initialized)
         sdk.destroy()
     }

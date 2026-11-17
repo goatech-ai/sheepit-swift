@@ -70,6 +70,13 @@ actor HTTPClient {
     /// against a synthetic host (finding MF-4's regression coverage).
     var baseURLForTesting: URL { baseURL }
 
+    /// `baseURL` joined with an endpoint path that is ALREADY percent-encoded (`SDKEndpoints`
+    /// encodes path-interpolated ids). Concatenated, not `appendingPathComponent`: that encodes
+    /// `%` again, so an encoded id would reach the server double-encoded.
+    func endpointURL(_ path: String) -> URL {
+        URL(string: baseURL.absoluteString + path) ?? baseURL.appendingPathComponent(path)
+    }
+
     // MARK: - Public API
 
     /// - Parameter maxAttempts: overrides `config.retryAttempts` for this call (see `postRaw`).
@@ -88,15 +95,18 @@ actor HTTPClient {
     /// One POST attempt whose response comes back whatever its status, like `getRaw`: for a caller
     /// that reads the error body or `Retry-After` and retries on its own schedule (the identify
     /// ladder). Throws only when nothing came back: a network error or timeout, cancellation, or
-    /// `RequestPreconditionFailed` when `sendIf` no longer holds.
+    /// `RequestPreconditionFailed` when `sendIf` no longer holds. `timeout` overrides the session's
+    /// 30 s request timeout for this call (device registration uses 10 s, as every SDK does).
     func postOnceRaw(
         path: String,
         body: some Encodable & Sendable,
-        sendIf: (@Sendable () -> Bool)? = nil
+        sendIf: (@Sendable () -> Bool)? = nil,
+        timeout: TimeInterval? = nil
     ) async throws -> (Data, HTTPURLResponse) {
         try Task.checkCancellation()
         if let sendIf, !sendIf() { throw RequestPreconditionFailed() }
-        var request = URLRequest(url: baseURL.appendingPathComponent(path))
+        var request = URLRequest(url: endpointURL(path))
+        if let timeout { request.timeoutInterval = timeout }
         request.httpMethod = "POST"
         applyHeaders(to: &request, extraHeaders: [:])
         request.httpBody = try JSONEncoder().encode(AnyEncodableWrapper(body))
@@ -112,7 +122,7 @@ actor HTTPClient {
     /// nothing came back: a network error or timeout, or cancellation.
     func postMultipartOnce(path: String, body: Data, contentType: String) async throws -> (Data, HTTPURLResponse) {
         try Task.checkCancellation()
-        var request = URLRequest(url: baseURL.appendingPathComponent(path))
+        var request = URLRequest(url: endpointURL(path))
         request.httpMethod = "POST"
         applyHeaders(to: &request, extraHeaders: ["Content-Type": contentType])
         request.httpBody = body
@@ -159,7 +169,7 @@ actor HTTPClient {
         extraHeaders: [String: String] = [:],
         cachePolicy: URLRequest.CachePolicy = .useProtocolCachePolicy
     ) async throws -> (Data, HTTPURLResponse) {
-        let url = baseURL.appendingPathComponent(path)
+        let url = endpointURL(path)
         var request = URLRequest(url: url)
         request.httpMethod = "GET"
         request.cachePolicy = cachePolicy
@@ -198,7 +208,7 @@ actor HTTPClient {
         // retry is itself a call to this function from inside a `catch`, and a throw from there
         // propagates to the caller.
         if let sendIf, !sendIf() { throw RequestPreconditionFailed() }
-        let url = baseURL.appendingPathComponent(path)
+        let url = endpointURL(path)
         var request = URLRequest(url: url)
         request.httpMethod = method
         applyHeaders(to: &request, extraHeaders: extraHeaders)
@@ -276,16 +286,27 @@ actor HTTPClient {
     /// ("120") or an HTTP-date ("Wed, 21 Oct 2015 07:28:00 GMT"). Parsing
     /// only the first silently yields nil for the second, so a
     /// date-emitting proxy would collapse to the default back-off.
+    ///
+    /// Clamped to finite values in `0...maximumRetryAfter`: `TimeInterval("inf")` and `"nan"` parse,
+    /// and an unbounded value used to reach `Int(backoff)` in `Transport`, which traps on infinity.
     static func parseRetryAfter(_ header: String?) -> TimeInterval? {
         guard let header = header?.trimmingCharacters(in: .whitespaces), !header.isEmpty else {
             return nil
         }
-        if let seconds = TimeInterval(header) {
-            return max(0, seconds)
+        let seconds: TimeInterval
+        if let parsed = TimeInterval(header) {
+            seconds = parsed
+        } else if let date = imfFixdateFormatter.date(from: header) {
+            seconds = date.timeIntervalSinceNow
+        } else {
+            return nil
         }
-        guard let date = imfFixdateFormatter.date(from: header) else { return nil }
-        return max(0, date.timeIntervalSinceNow)
+        guard seconds.isFinite else { return nil }
+        return min(max(0, seconds), maximumRetryAfter)
     }
+
+    /// The longest `Retry-After` the SDK honours: one hour, as every Sheepit SDK does.
+    static let maximumRetryAfter: TimeInterval = 60 * 60
 
     private func applyHeaders(to request: inout URLRequest, extraHeaders: [String: String]) {
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")

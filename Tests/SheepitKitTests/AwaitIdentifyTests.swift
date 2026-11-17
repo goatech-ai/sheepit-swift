@@ -11,6 +11,12 @@ final class AwaitIdentifyTests: XCTestCase {
         SharedSDKStorage.clear()
         AttributionCaptureProtocol.reset()
         AttributionCaptureProtocol.registerDeviceId = "dev_await_\(UUID().uuidString)"
+        // The server honours a well-formed proposal (device registration contract § 2), so the
+        // launch registration changes no id. Config answers say `resolved`, as the current server
+        // does, so the accepted registration refetches nothing these counts would see
+        // (`ConfigSync.refetchAfterRegistration`); `startedClient()` waits for it to settle.
+        AttributionCaptureProtocol.echoRegisteredDeviceId = true
+        AttributionCaptureProtocol.configResolution = { _, _ in "resolved" }
     }
 
     override func tearDown() {
@@ -58,6 +64,18 @@ final class AwaitIdentifyTests: XCTestCase {
         let client = makeClient()
         let started = await waitUntil { AttributionCaptureProtocol.configRequestCount >= 1 }
         XCTAssertTrue(started, "precondition: the start-up config fetch ran")
+        let registered = await waitUntil {
+            client.getRecentDiagnostics().contains { $0.code == "identity.device_registered" }
+        }
+        XCTAssertTrue(registered, "precondition: the launch registration answered")
+        // The refetch decision it owes is made before a test takes its counts: skipped (a resolved
+        // body already applies), or sent (registration answered before the launch fetch landed).
+        let decided = await waitUntil {
+            let codes = client.getRecentDiagnostics().map(\.code)
+            return codes.contains("config.registration_refetch_skipped")
+                || (codes.contains("config.refetch_on_registration") && AttributionCaptureProtocol.configRequestCount >= 2)
+        }
+        XCTAssertTrue(decided, "precondition: the registration's config refetch was decided")
         return client
     }
 

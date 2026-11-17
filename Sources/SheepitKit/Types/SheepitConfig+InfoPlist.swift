@@ -69,6 +69,32 @@ extension SheepitConfig {
         return active.isEmpty ? nil : active.map(\.message).joined(separator: " ")
     }
 
+    /// Whether events go to the hosted Sheepit API: `apiUrl`'s host is `api.sheepit.ai` or its
+    /// co-equal `api.goatech.ai` (compared case-insensitively, whatever the scheme, port or path).
+    /// True when `SheepitAPIURL` is absent from Info.plist and when `apiUrl` was never set, and also
+    /// for an app that chose the hosted API on purpose. A self-hosted app can assert it is false in
+    /// its own tests.
+    public var isUsingDefaultHost: Bool {
+        guard let host = URL(string: apiUrl.trimmingCharacters(in: .whitespaces))?.host?.lowercased() else { return false }
+        return SheepitConfig.hostedHosts.contains(host)
+    }
+
+    /// `defaultAPIUrl`'s host, plus the co-equal `api.goatech.ai` (never retired: compiled into
+    /// published versions).
+    private static let hostedHosts: Set<String> =
+        ["api.goatech.ai", URL(string: defaultAPIUrl)?.host?.lowercased()].compactMap { $0 }.reduce(into: []) { $0.insert($1) }
+
+    /// What a started client logs as a `.fault` when events go to the hosted default by omission:
+    /// `SheepitAPIURL` absent from Info.plist, or `apiUrl` never passed to `init(apiKey:…)`. An app
+    /// that names the hosted API itself chose it and gets nothing.
+    var hostedDefaultNotice: String? {
+        if let notice = activeInfoPlistNotice { return notice }
+        guard apiURLWasOmitted, apiUrl == SheepitConfig.defaultAPIUrl else { return nil }
+        let host = URL(string: apiUrl)?.host ?? apiUrl
+        return "SheepitConfig was created without apiUrl, so events go to the hosted Sheepit API at \(host). "
+            + "If you self-host, pass apiUrl."
+    }
+
     /// What a started client logs when `SheepitAPIURL` was absent and `apiUrl` is still the
     /// hosted default, so "am I pointed at my own install?" is answerable from the console.
     var activeInfoPlistNotice: String? {
@@ -191,10 +217,12 @@ enum InfoPlistReader {
             candidate = "https://" + value
         }
 
-        if SheepitClient.apiURLRejectionReason(for: candidate) != nil {
+        // The gate's own reason is forwarded: since 0.10.0 it refuses more than a missing host
+        // (credentials, a query or fragment, a bad port), and "needs a host" would mislead.
+        if let reason = SheepitClient.apiURLRejectionReason(for: candidate) {
             issues.append(.init(field: .apiUrl, message: "Info.plist \(apiURLKey) does not form a "
-                + "usable URL: it needs a host, e.g. sheepit.example.com or "
-                + "sheepit.example.com/_sheepit. \(noFallback)"))
+                + "usable URL. \(reason) Set a host, optionally with a path prefix, e.g. "
+                + "sheepit.example.com or sheepit.example.com/_sheepit. \(noFallback)"))
             return ""
         }
         return candidate

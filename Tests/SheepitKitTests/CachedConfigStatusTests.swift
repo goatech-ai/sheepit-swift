@@ -48,7 +48,8 @@ final class CachedConfigStatusTests: XCTestCase {
                                        urlProtocolClasses: [OfflineURLProtocol.self])
     }
 
-    /// `ConfigSync.start()` (and its cache load) runs in a Task after `createForTesting` returns.
+    /// For what still happens after `createForTesting` returns (exposure events). The launch cache
+    /// itself is applied before it returns (`ConfigSync.applyLaunchCache()`).
     private func waitUntil(timeout: TimeInterval = 5, _ condition: () -> Bool) async -> Bool {
         let deadline = Date().addingTimeInterval(timeout)
         while !condition() {
@@ -129,20 +130,42 @@ final class CachedConfigStatusTests: XCTestCase {
 
     // MARK: - Validation
 
-    func testTheDefaultsAreTwentyFourHoursAndSevenDays() {
+    func testTheDefaultsAreTwentyFourHoursAndNoOfflineLimit() {
         let config = SheepitConfig(apiKey: "lp_pub_tst_" + String(repeating: "a", count: 64))
         XCTAssertEqual(config.configStaleAfter, 86_400)
-        XCTAssertEqual(config.configOfflineMaxAge, 604_800)
+        XCTAssertEqual(config.configOfflineMaxAge, TimeInterval.infinity)
+        XCTAssertFalse(CachedConfigLimits.default.hasOfflineLimit)
         XCTAssertEqual(config.configStaleAfter, SDKDefaults.configStaleAfter, "the init default drifted from SDKDefaults")
         XCTAssertEqual(config.configOfflineMaxAge, SDKDefaults.configOfflineMaxAge, "the init default drifted from SDKDefaults")
     }
 
     func testAnInvalidLimitFallsBackToItsDefault() {
-        for bad in [TimeInterval.nan, .infinity, -.infinity, 0, -1] {
+        for bad: TimeInterval in [.nan, -.infinity, 0, -1] {
             let limits = CachedConfigLimits(staleAfter: bad, offlineMaxAge: bad)
             XCTAssertEqual(limits, .default, "\(bad)")
             XCTAssertEqual(limits.issues.count, 2, "\(bad)")
         }
+        // `.infinity` is valid for both (sdk-js parity): no offline limit, never stale by age.
+        let infinite = CachedConfigLimits(staleAfter: .infinity, offlineMaxAge: .infinity)
+        XCTAssertEqual(infinite.staleAfter, .infinity)
+        XCTAssertEqual(infinite.offlineMaxAge, .infinity)
+        XCTAssertEqual(infinite.issues, [])
+        // A finite offline limit still lowers an infinite stale limit to it.
+        let bounded = CachedConfigLimits(staleAfter: .infinity, offlineMaxAge: 3600)
+        XCTAssertEqual(bounded.staleAfter, 3600)
+    }
+
+    /// `configStaleAfter = .infinity`: a 30-day cache is applied and NOT reported stale.
+    func testAnInfiniteStaleLimitNeverReportsStaleByAge() async throws {
+        try seedCache(ageHours: 30 * 24)
+        var config = makeConfig()
+        config.configStaleAfter = .infinity
+        let client = makeClient(config, clock: LockedBox(Self.launch))
+        defer { client.destroy() }
+
+        let freshness = try XCTUnwrap(client.status().configFreshness)
+        XCTAssertEqual(freshness.source, .cache)
+        XCTAssertFalse(freshness.isStale, "an infinite configStaleAfter reported a cache stale by age")
     }
 
     /// A shorter offline limit is a request for less retention: `configStaleAfter` comes down to it.
@@ -157,18 +180,30 @@ final class CachedConfigStatusTests: XCTestCase {
     }
 
     /// 🔴 Both limits are public `var`s: a mutation after init bypasses the initializer's
-    /// validation, so the client validates again. An infinite limit must not keep a 10-day cache.
-    func testAMutatedInfiniteOfflineLimitIsValidatedByTheClient() async throws {
+    /// validation, so the client validates again. A finite limit set after init is honoured.
+    func testAMutatedFiniteOfflineLimitIsHonouredByTheClient() async throws {
         try seedCache(ageHours: 10 * 24)
         var config = makeConfig()
-        config.configOfflineMaxAge = .infinity
+        config.configOfflineMaxAge = 7 * 24 * Self.hour
         let client = makeClient(config, clock: LockedBox(Self.launch))
         defer { client.destroy() }
         let defaults = try XCTUnwrap(UserDefaults(suiteName: SharedSDKStorage.suite))
-        let dropped = await waitUntil { defaults.data(forKey: SharedSDKStorage.slot(StorageKeys.sdkConfig)) == nil }
 
-        XCTAssertTrue(dropped, "an infinite limit kept a 10-day cache on disk past the 7-day default")
+        XCTAssertNil(defaults.data(forKey: SharedSDKStorage.slot(StorageKeys.sdkConfig)),
+                     "a host-set 7-day limit kept a 10-day cache on disk")
         XCTAssertNil(client.status().configFreshness)
         XCTAssertEqual(client.flag("native_home", default: .bool(false)), .bool(false))
+    }
+
+    /// A mutated NaN falls back to the default, which is no limit: the 10-day cache is applied.
+    func testAMutatedNaNOfflineLimitFallsBackToNoLimit() async throws {
+        try seedCache(ageHours: 10 * 24)
+        var config = makeConfig()
+        config.configOfflineMaxAge = .nan
+        let client = makeClient(config, clock: LockedBox(Self.launch))
+        defer { client.destroy() }
+
+        XCTAssertEqual(client.flag("native_home", default: .bool(false)), .bool(true))
+        XCTAssertEqual(client.status().configFreshness?.isStale, true)
     }
 }

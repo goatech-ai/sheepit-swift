@@ -26,8 +26,8 @@ TMP_DIR="$(mktemp -d)"
 trap 'rm -rf "$TMP_DIR"' EXIT
 
 # SwiftPM builds the C target's module map for us; a raw swiftc invocation
-# needs one written by hand.
-cp Sources/SheepitCrashHandler/include/SheepitCrashHandler.h "$TMP_DIR/"
+# needs one written by hand. Every public header: the umbrella includes the others.
+cp Sources/SheepitCrashHandler/include/*.h "$TMP_DIR/"
 cat > "$TMP_DIR/module.modulemap" <<'MODULEMAP'
 module SheepitCrashHandler {
     header "SheepitCrashHandler.h"
@@ -82,5 +82,17 @@ xcrun --sdk iphoneos swiftc -typecheck \
     -Xcc -fmodule-map-file="$TMP_DIR/module.modulemap" \
     -I "$TMP_DIR" \
     $(find Sources/SheepitKit -name '*.swift') "$TMP_DIR/ReadmeSample.swift"
+
+# The crash handler's C is compiled for the macOS host by `swift test` and never for a device.
+# Its register access differs by slice: arm64 reads the plain thread-state fields, arm64e the
+# opaque pointer-auth ones, and the x86_64 simulator another struct entirely. Compile each.
+echo "→ clang -fsyntax-only -Werror the crash handler for arm64, arm64e and the x86_64 simulator"
+SIM_SDK_PATH="$(xcrun --sdk iphonesimulator --show-sdk-path)"
+for target in "arm64-apple-ios16.0:$SDK_PATH" "arm64e-apple-ios16.0:$SDK_PATH" "x86_64-apple-ios16.0-simulator:$SIM_SDK_PATH"; do
+    xcrun clang -fsyntax-only -Werror -Wall -Wextra -Wno-unused-parameter \
+        -target "${target%%:*}" -isysroot "${target#*:}" \
+        -I Sources/SheepitCrashHandler/include -I Sources/SheepitCrashHandler \
+        Sources/SheepitCrashHandler/*.c
+done
 
 echo "✓ iOS type-check passed"

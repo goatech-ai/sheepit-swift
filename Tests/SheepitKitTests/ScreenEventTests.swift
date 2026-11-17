@@ -6,6 +6,17 @@ import SheepitCrashHandler
 /// context's screen. Clients are constructed but never started (`constructOnlyForTesting`), so
 /// nothing here touches the network; events are observed through `config.onEvent`.
 final class ScreenEventTests: XCTestCase {
+    override func setUp() {
+        SharedSDKStorage.clear()
+        AttributionCaptureProtocol.reset()
+        TeardownFlushes.install()
+    }
+    override func tearDown() async throws {
+        await TeardownFlushes.drain(context: name)
+        SharedSDKStorage.clear()
+        AttributionCaptureProtocol.reset()
+    }
+
     private typealias Captured = (name: String, properties: [String: Any]?)
 
     private func makeClient(
@@ -114,15 +125,10 @@ final class ScreenEventTests: XCTestCase {
         XCTAssertEqual(screens(events).first?.properties?["screen"] as? String, "Checkout")
     }
 
-    func testSetScreenIsBoundedOnACharacterBoundaryToo() throws {
-        let url = FileManager.default.temporaryDirectory
-            .appendingPathComponent("sheepit-setscreen-context-\(UUID().uuidString).bin")
-        defer { try? FileManager.default.removeItem(at: url) }
-        XCTAssertEqual(sheepit_crash_handler_install(url.path), 0, "precondition: handler must install")
-        defer { sheepit_crash_handler_uninstall() }
-
-        let (client, _) = makeClient(crashes: true)
-        defer { client.destroy() }
+    @MainActor
+    func testSetScreenIsBoundedOnACharacterBoundaryToo() async throws {
+        let directory = CrashFixtures.tempDirectory("setscreen-context")
+        let client = try await makeOwnedCrashClient(in: self, directory: directory)
 
         client.setScreen(String(repeating: "é", count: 200))
 
@@ -174,15 +180,10 @@ final class ScreenEventTests: XCTestCase {
     /// The crash half: a crash report reads `screen_name` from the mmap'd context, so the name
     /// must land there. Installs the process-global handler into a temp file and uninstalls
     /// before returning — the same discipline as `CrashContextDeviceProfileTests`.
-    func testScreenSetsTheCrashContextScreen() throws {
-        let url = FileManager.default.temporaryDirectory
-            .appendingPathComponent("sheepit-screen-context-\(UUID().uuidString).bin")
-        defer { try? FileManager.default.removeItem(at: url) }
-        XCTAssertEqual(sheepit_crash_handler_install(url.path), 0, "precondition: handler must install")
-        defer { sheepit_crash_handler_uninstall() }
-
-        let (client, _) = makeClient(crashes: true)
-        defer { client.destroy() }
+    @MainActor
+    func testScreenSetsTheCrashContextScreen() async throws {
+        let directory = CrashFixtures.tempDirectory("screen-context")
+        let client = try await makeOwnedCrashClient(in: self, directory: directory)
 
         client.screen("Checkout")
 

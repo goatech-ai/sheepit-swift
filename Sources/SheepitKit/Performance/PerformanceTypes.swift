@@ -153,9 +153,10 @@ struct PerformanceMetric: Encodable, Sendable {
     let statusCode: Int?
     let isError: Bool
     let timestamp: String
+    var context: PerfBatchContext? = nil
 
     enum CodingKeys: String, CodingKey {
-        case timestamp
+        case timestamp, context
         case metricType = "metric_type"
         case metricName = "metric_name"
         case valueMs = "value_ms"
@@ -178,22 +179,25 @@ struct PerfBatchRequest: Encodable, Sendable {
 
 /// Context included with each performance batch.
 struct PerfBatchContext: Encodable, Sendable {
+    var assignmentToken: String? = nil
+    var assignmentStatus: String? = nil
     let platform: String
     let appVersion: String?
     let buildNumber: String?
     let osVersion: String
     let deviceModel: String
-    let userId: String?
+    var userId: String?
     /// `perfBatchContextSchema.session_id` is nullable; nil when no session is live (0.6-C).
-    let sessionId: String?
-    let deviceId: String
+    var sessionId: String?
+    var deviceId: String?
     let country: String?
     let networkType: String?
     let activeFlags: [String: AnyCodable]?
-    let activeExperiments: [String: AnyCodable]?
 
     enum CodingKeys: String, CodingKey {
         case platform, country
+        case assignmentToken = "assignment_token"
+        case assignmentStatus = "assignment_status"
         case appVersion = "app_version"
         case buildNumber = "build_number"
         case osVersion = "os_version"
@@ -203,6 +207,5 @@ struct PerfBatchContext: Encodable, Sendable {
         case deviceId = "device_id"
         case networkType = "network_type"
         case activeFlags = "active_flags"
-        case activeExperiments = "active_experiments"
     }
 }

@@ -40,4 +40,16 @@ swift test -Xswiftc -warnings-as-errors
 echo "▸ typecheck the #if canImport(UIKit) branches at the iOS 16 floor"
 ./scripts/typecheck-ios.sh
 
+echo "▸ native crash cohort interruption and frozen ABI checks"
+cohort_check="$(mktemp -d)"
+trap 'rm -rf "$cohort_check"' EXIT
+clang -std=c11 -Wall -Wextra -Werror -I Sources/SheepitCrashHandler/include \
+    Tests/NativeCrashCohort/cohort.c -o "$cohort_check/cohort"
+"$cohort_check/cohort"
+clang -std=c11 -Wall -Wextra -Werror -Wno-unused-parameter \
+    -I Sources/SheepitCrashHandler/include -I Sources/SheepitCrashHandler \
+    Tests/NativeCrashCohort/signal_capture.c Sources/SheepitCrashHandler/*.c \
+    -o "$cohort_check/signal-capture"
+"$cohort_check/signal-capture" "$cohort_check"
+
 echo "✓ Swift SDK gate passed"

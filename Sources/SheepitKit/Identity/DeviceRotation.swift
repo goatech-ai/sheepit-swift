@@ -25,17 +25,19 @@ import Foundation
 /// other's unanswered POST recorded, in this launch or an earlier one. A stale id simply stops
 /// matching.
 ///
-/// **How.** Synchronously in `reset()`: a locally minted placeholder id replaces the old one (so
-/// no request after the logout names the old device), and the label becomes `.known(nil)`. Then
-/// the device is registered with no id, so the server mints one, under the rotated anonymous id —
-/// the same path a fresh install takes, including re-stamping queued events from the
-/// placeholder. A failed registration is retried with backoff and never falls back to the old id;
-/// until it succeeds, config fetched under the placeholder resolves no row and evaluates
+/// **How.** Synchronously in `reset()`: a freshly minted UUIDv4 replaces the old id (so no request
+/// after the logout names the old device), and the label becomes `.known(nil)`. Then that id is
+/// PROPOSED to `POST /v1/devices/register` under the rotated anonymous id — the same path a fresh
+/// install takes (`Docs/Technical/SDK_DEVICE_REGISTRATION_CONTRACT.md` § 1). When the server
+/// honours it nothing more changes; only a replaced id re-stamps queued events and refetches
+/// config. A failed registration is retried under `RegistrationPolicy` and never falls back to the
+/// old id; until it succeeds, config fetched under the new id resolves no row and evaluates
 /// anonymously.
 final class DeviceRotation: @unchecked Sendable {
     struct Dependencies {
         let context: ContextManager
         let deviceManager: DeviceManager
+        let policy: RegistrationPolicy
         let queue: EventQueue
         let offlineQueue: OfflineQueue
         let storage: StorageProvider
@@ -46,29 +48,43 @@ final class DeviceRotation: @unchecked Sendable {
         let isDestroyed: @Sendable () -> Bool
         /// The device id changed (placeholder, then the adopted id): refresh what crash reports carry.
         let onDeviceIdChanged: @Sendable () -> Void
+        /// C5 swapped a fresh device in for an anonymous install. Its exposure subject was the
+        /// device, so every flag and arm must be exposed again for the fresh id (sdk-js
+        /// `dropErasedDevicePayload`). Not for an identified install: its subject is the user.
+        var onAnonymousDeviceReplaced: @Sendable () -> Void = {}
+        /// Called BEFORE every write that changes the in-memory device id, so the receipt issued for
+        /// the old device is already invalid when the new id becomes visible: a capture can never pair
+        /// the old device's token with the new device id (`SheepitClient.deviceIdWillChange`).
+        var beforeDeviceIdChange: @Sendable () -> Void = {}
     }
 
     private let deps: Dependencies
+    /// F-2: C5 swapped a fresh device in for an identified install, whose label is now unknown.
+    /// `SheepitClient.start()` sets it to its existing identity retry (`retryIdentityIfUnknown`), so
+    /// the fresh row is bound at once, as sdk-js `enqueueBind`, not at the next refresh tick.
+    let onIdentifiedDeviceReplaced = LockedValue<(@Sendable () -> Void)?>(nil)
     private let lock = NSLock()
     /// Bumped by every rotation and by `cancel()`. A registration from an older generation adopts
     /// nothing.
     private var generation: UInt64 = 0
     private var task: Task<Void, Never>?
-    private var _retryDelayOverride: (@Sendable (Int) -> Duration)?
+    /// The replacement registering for a device id, if any (`replacement(for:)`): single-flight, so
+    /// an identify 404 and C5 for the same erased device register ONE replacement (SK-Q12).
+    private var replacing: (from: String, task: Task<String?, Never>)?
+    private var _retryDelayOverride: (@Sendable (TimeInterval) -> Duration)?
 
     init(_ deps: Dependencies) {
         self.deps = deps
     }
 
-    /// Test-only: replaces `retryDelay(afterFailures:)`.
-    var retryDelayOverride: (@Sendable (Int) -> Duration)? {
+    /// Test-only: maps the policy's wait (seconds) to the real sleep.
+    var retryDelayOverride: (@Sendable (TimeInterval) -> Duration)? {
         get { lock.lock(); defer { lock.unlock() }; return _retryDelayOverride }
         set { lock.lock(); _retryDelayOverride = newValue; lock.unlock() }
     }
 
-    /// 1 s doubling to a 60 s ceiling.
-    static func retryDelay(afterFailures failures: Int) -> Duration {
-        .seconds(min(1 << min(failures, 6), 60))
+    private func sleep(seconds: TimeInterval) async {
+        try? await Task.sleep(for: retryDelayOverride?(seconds) ?? .seconds(seconds))
     }
 
     /// Whether `reset()` must rotate, read BEFORE anything is cleared but after the reset token moves,
@@ -93,19 +109,53 @@ final class DeviceRotation: @unchecked Sendable {
     ///
     /// 🔴 The old id stays in use until a replacement exists: registering first and swapping only on
     /// success means a cap, a rate limit or an outage never leaves the app with no device at all.
-    /// Nothing is registered while a persisted backoff window is open, and a cap, a terminal refusal
-    /// or a 429 writes one, so a fleet of unknown devices cannot hammer the environment. The id is
-    /// server-minted, as for a rotation: re-registering the old one would resurrect an erased device.
+    /// Nothing is registered while a persisted backoff window is open, every failure writes one, and
+    /// the attempt comes out of the launch budget, so a fleet of unknown devices cannot hammer the
+    /// environment. The replacement is a FRESH local UUIDv4, proposed: re-registering the old id
+    /// would resurrect an erased device.
     ///
-    /// One attempt (`maxAttempts: 1`): the identify chain waits on this.
+    /// One request (`DeviceManager.register` never retries): the identify chain waits on this.
+    /// Single-flight per device id: a caller arriving while a replacement for `deviceId` registers
+    /// waits for that one (`replacement(for:)`).
     func replaceUnknown(_ deviceId: String) async -> String? {
+        await replacement(for: deviceId, onMinted: nil).task.value
+    }
+
+    /// The replacement for `deviceId`: the one already registering (`joined`), or a new one. Under
+    /// `lock`, so two callers cannot both start one. A caller arriving after it finished starts a new
+    /// one, which returns the device already in use without registering (`registerReplacement`).
+    /// `onMinted` belongs to the caller that starts it: called when ITS registration is answered
+    /// with a device, swapped in or not; a joiner's is never called.
+    private func replacement(
+        for deviceId: String, onMinted: (@Sendable () -> Void)?
+    ) -> (task: Task<String?, Never>, joined: Bool) {
+        lock.lock()
+        defer { lock.unlock() }
+        if let replacing, replacing.from == deviceId { return (replacing.task, true) }
+        let task = Task<String?, Never> { [weak self] in
+            guard let self else { return nil }
+            let result = await self.registerReplacement(for: deviceId, onMinted: onMinted)
+            self.finishReplacement(from: deviceId)
+            return result
+        }
+        replacing = (deviceId, task)
+        return (task, false)
+    }
+
+    private func finishReplacement(from deviceId: String) {
+        lock.lock()
+        defer { lock.unlock() }
+        if replacing?.from == deviceId { replacing = nil }
+    }
+
+    private func registerReplacement(for deviceId: String, onMinted: (@Sendable () -> Void)?) async -> String? {
         let context = deps.context
         guard !deps.isDestroyed() else { return nil }
         // Already moved off it. After a `reset()` the ladder stops anyway (`isCurrent`); after the
         // launch registration adopted its own id, that is the device to bind.
         let inUse = context.deviceId
         if inUse != deviceId { return inUse }
-        if RegistrationBackoff.isActive(storage: deps.storage, now: deps.now()) {
+        if deps.policy.openWindow() != nil {
             deps.diagnostics.emit(
                 .warn,
                 .identity,
@@ -120,17 +170,20 @@ final class DeviceRotation: @unchecked Sendable {
             code: "identity.device_unknown_reregistering",
             message: "The server has no record of this device — registering a replacement"
         )
+        guard deps.policy.takeAttempt() else { return nil }
         let started = currentGeneration()
-        let outcome = await deps.deviceManager.register(
-            anonymousId: context.anonymousId,
-            existingDeviceId: nil,
-            maxAttempts: 1
-        )
+        let proposal = ContextManager.mintDeviceId()
+        let outcome = await deps.deviceManager.register(anonymousId: context.anonymousId, proposedDeviceId: proposal)
         let failure: (outcome: String, data: [String: AnyCodable])
         switch outcome {
         case .success(let fresh):
+            onMinted?()
             switch swapInReplacement(fresh, for: deviceId, generation: started) {
             case .swapped:
+                // The erased row's cached body goes now: with no age limit nothing else removes
+                // it, and the next launch would apply it to the fresh id (SK-Q18). Only here, on
+                // a swap: a failed or deferred replacement keeps it, and its C5 stamp, for a retry.
+                deps.configSync.dropPersistedCacheForDeviceReplacement(freshId: fresh)
                 deps.onDeviceIdChanged()
                 deps.diagnostics.emit(
                     .info,
@@ -156,28 +209,17 @@ final class DeviceRotation: @unchecked Sendable {
                 )
                 return nil
             }
-        case .transientFailure:
-            failure = ("transient", [:])
+        case .transientFailure(let reason, let retryAfter):
+            deps.policy.recordFailure(.transient, retryAfter: retryAfter)
+            failure = (reason, [:])
         case .terminalFailure(let rejection):
-            RegistrationBackoff.record(storage: deps.storage, now: deps.now())
+            deps.policy.recordFailure(.terminal)
             failure = ("rejected", rejection.diagnosticData)
-        case .capReached(let rejection):
-            RegistrationBackoff.record(
-                storage: deps.storage,
-                now: deps.now(),
-                duration: SDKDefaults.deviceRegistrationCapBackoff
-            )
+        case .capReached(let rejection, let retryAfter):
+            deps.policy.recordFailure(.cap, retryAfter: retryAfter)
             failure = ("device_cap_reached", rejection.diagnosticData)
         case .rateLimited(let retryAfter):
-            // Persisted, unlike `register(placeholder:generation:)`: that loop paces itself, but a
-            // replacement is one request, and the retry tick that re-runs the ladder also fires on
-            // every reconnect. Same as sdk-js (`persistBackoffUntil` on `rate_limited`).
-            let wait = RegistrationRetryPolicy.delay(afterFailures: 0, retryAfter: retryAfter).components
-            RegistrationBackoff.record(
-                storage: deps.storage,
-                now: deps.now(),
-                duration: TimeInterval(wait.seconds) + TimeInterval(wait.attoseconds) / 1e18
-            )
+            deps.policy.recordFailure(.rateLimited, retryAfter: retryAfter)
             failure = ("rate_limited", [:])
         }
         deps.diagnostics.emit(
@@ -188,6 +230,60 @@ final class DeviceRotation: @unchecked Sendable {
             data: failure.data.merging(["outcome": AnyCodable(failure.outcome)]) { _, new in new }
         )
         return nil
+    }
+
+    /// C5 (contract § 7): `/v1/config` answered `unknown_device` for `deviceId` after a body it
+    /// resolved for that id was applied, so the row was erased or purged. The identify-404
+    /// replacement (`replaceUnknown`: fresh UUIDv4, same backoff, budget and swap), then the refetch
+    /// a replaced id owes, so a kill switch lands now rather than after the next re-registration.
+    ///
+    /// The fresh row holds no user. An identified app's label becomes unknown, so the next refresh
+    /// tick re-sends its identify (`retryIdentityIfUnknown`) and no body is labelled with a user the
+    /// row does not hold; an anonymous one's becomes `.known(nil)`, as after any new registration.
+    ///
+    /// Claims (or joins) the replacement synchronously and returns whether it JOINED one already
+    /// registering for `deviceId` (an identify 404's): then it registers nothing and leaves the label
+    /// to that caller, whose identify binds the fresh row, but still refetches so the kill switch
+    /// lands. Called from inside `ConfigSync`, so the rest runs in a task. If nothing replaces the
+    /// device (the registration failed or was deferred), `outcome.unreplaced` drops its values.
+    /// A nil `outcome` is a capped trigger: only say whether the client is still on `deviceId`.
+    func replaceErasedDevice(
+        _ deviceId: String, outcome: ConfigSync.ErasedDeviceOutcome?
+    ) -> ConfigSync.ErasedDeviceClaim {
+        let context = deps.context
+        // Already off it (a logout rotated, or an identify 404 replaced it): `replaceUnknown` would
+        // return the device in use, which is not a replacement and must be neither relabelled nor
+        // refetched here.
+        guard !deps.isDestroyed(), context.deviceId == deviceId else { return .notCurrent }
+        guard let outcome else { return .capped }
+        let (task, joined) = replacement(for: deviceId, onMinted: outcome.minted)
+        let (configSync, isDestroyed) = (deps.configSync, deps.isDestroyed)
+        let onAnonymousDeviceReplaced = deps.onAnonymousDeviceReplaced
+        let retryIdentity = onIdentifiedDeviceReplaced
+        Task {
+            guard let fresh = await task.value, fresh != deviceId else {
+                if !isDestroyed(), context.deviceId == deviceId { await outcome.unreplaced() }
+                return
+            }
+            guard context.deviceId == fresh else { return }
+            let anonymous = !joined && context.userId == nil
+            if !joined {
+                if anonymous {
+                    context.setServerHeldUser(.known(nil))
+                } else {
+                    context.markServerHeldUserUnknown()
+                    // A joined replacement belongs to the identify that owns it, which binds it.
+                    retryIdentity.value?()
+                }
+            }
+            await configSync.refetchAfterRegistration(
+                deviceId: fresh, replaced: true, isCurrent: { !isDestroyed() && context.deviceId == fresh })
+            // 🔴 After the refetch, whatever its outcome (F-1): until then the erased device's arms
+            // are still applied, and a read re-armed earlier exposed them under the fresh id. Held
+            // until here, such a read emits nothing; the first read after exposes the fresh arm.
+            if anonymous, !isDestroyed(), context.deviceId == fresh { onAnonymousDeviceReplaced() }
+        }
+        return joined ? .joined : .replacing
     }
 
     private enum ReplacementSwap {
@@ -222,27 +318,34 @@ final class DeviceRotation: @unchecked Sendable {
         guard current == deviceId else { return .moved(current) }
         // Re-stamp first, then adopt, as `adopt` does: a flush between the two then sends only
         // re-stamped events (a batch carries one device id).
+        // Marked before the id is written anywhere, even ahead to disk (see the doc above), and
+        // persisted before any event is re-stamped to it (contract § 1, same order as the launch).
+        BindMarker.insert(fresh, ifContains: deviceId, in: deps.storage)
+        context.persistDeviceIdAhead(fresh)
         deps.queue.restampDeviceId(from: deviceId, to: fresh)
         deps.offlineQueue.restampDeviceId(from: deviceId, to: fresh)
-        BindMarker.insert(fresh, ifContains: deviceId, in: deps.storage)
         // The launch registration adopts without this lock; the compare-and-set covers it.
-        guard context.replaceDeviceId(deviceId, with: fresh) else { return .moved(context.deviceId) }
-        deps.storage.set(fresh, forKey: StorageKeys.deviceRegistered)
-        RegistrationBackoff.clear(storage: deps.storage)
+        deps.beforeDeviceIdChange()
+        guard context.replaceDeviceId(deviceId, with: fresh) else {
+            context.persistDeviceIdAhead(context.deviceId)
+            return .moved(context.deviceId)
+        }
+        deps.policy.recordSuccess(fresh)
         return .swapped
     }
 
     /// Called from `reset()` after the identity is cleared (so the anonymous id is rotated) and
     /// before the config reset gate moves (so no fetch that starts after it names the old device).
     func rotate() {
-        let placeholder = UUID().uuidString
+        let placeholder = ContextManager.mintDeviceId()
         let context = deps.context
         // 🔴 Generation first, and all of it under `lock`: see `swapInReplacement`.
         lock.lock()
         generation &+= 1
         let current = generation
         task?.cancel()
-        deps.storage.removeObject(forKey: StorageKeys.deviceRegistered)
+        deps.policy.clearRegistered()
+        deps.beforeDeviceIdChange()
         context.setDeviceId(placeholder)
         lock.unlock()
         deps.onDeviceIdChanged()
@@ -267,6 +370,13 @@ final class DeviceRotation: @unchecked Sendable {
         }
         task = newTask
         lock.unlock()
+        // A persisted window still open: the task waits it out before its first attempt. Past
+        // IDENTIFY_WAIT_BUDGET the gate is NOT armed with it, so `identify()` never waits up to 24 h;
+        // a shorter window is waited out through the gate (same rule as `start()`).
+        if let window = deps.policy.openWindow(), window > RegistrationPolicy.identifyWaitBudgetSeconds {
+            deps.registrationGate.setTask(nil)
+            return
+        }
         // `identify()` and the SDK's own auto-flush triggers wait on the gate, so an identify issued
         // now binds the NEW device. The public `flush()` (and the one `reset()` itself fires) does
         // not wait: an event tracked after the logout can still be sent under the placeholder
@@ -295,12 +405,18 @@ final class DeviceRotation: @unchecked Sendable {
         return generation == self.generation && !Task.isCancelled && !deps.isDestroyed()
     }
 
+    /// Registers `placeholder`, the fresh id `rotate()` switched to, by proposing it. Waits out any
+    /// open backoff window first, then retries under `RegistrationPolicy` until success, a terminal
+    /// answer, the launch budget, or supersession.
     private func register(placeholder: String, generation: UInt64) async {
-        var failures = 0
+        if let window = deps.policy.openWindow() { await sleep(seconds: window) }
+        var attempts = 0
         while isCurrent(generation) {
+            guard deps.policy.takeAttempt() else { return }
+            attempts += 1
             let outcome = await deps.deviceManager.register(
                 anonymousId: deps.context.anonymousId,
-                existingDeviceId: nil
+                proposedDeviceId: placeholder
             )
             guard isCurrent(generation) else {
                 deps.diagnostics.emit(
@@ -311,117 +427,91 @@ final class DeviceRotation: @unchecked Sendable {
                 )
                 return
             }
+            let wait: TimeInterval?
+            let failure: (outcome: String, data: [String: AnyCodable])
             switch outcome {
             case .success(let deviceId):
-                adopt(deviceId, replacing: placeholder, attempts: failures + 1)
+                adopt(deviceId, replacing: placeholder, attempts: attempts)
                 return
-            case .transientFailure:
-                failures += 1
-                let delay = retryDelayOverride?(failures - 1) ?? Self.retryDelay(afterFailures: failures - 1)
-                deps.diagnostics.emit(
-                    .warn,
-                    .identity,
-                    code: "identity.device_rotation_failed",
-                    message: "Registering the fresh device failed — retrying with backoff",
-                    data: [
-                        "attempt": AnyCodable(failures),
-                        "outcome": AnyCodable("retrying"),
-                        "retry_in_ms": AnyCodable(Int(delay / .milliseconds(1))),
-                    ]
-                )
-                try? await Task.sleep(for: delay)
+            case .transientFailure(let reason, let retryAfter):
+                wait = deps.policy.recordFailure(.transient, retryAfter: retryAfter)
+                failure = (reason, [:])
             case .terminalFailure(let rejection):
-                // Same backoff marker `start()` writes: the next launches do not hammer a revoked
-                // key. The placeholder stays — never the old device.
-                // (`isCurrent` above is this path's supersession guard.)
-                RegistrationBackoff.record(storage: deps.storage, now: deps.now())
-                deps.diagnostics.emit(
-                    .error,
-                    .identity,
-                    code: "identity.device_rotation_failed",
-                    message: "Registering the fresh device was rejected (\(rejection.statusCode)) — not retried",
-                    data: rejection.diagnosticData.merging([
-                        "attempt": AnyCodable(failures + 1),
-                        "outcome": AnyCodable("rejected"),
-                    ]) { _, new in new }
-                )
-                return
-            case .capReached(let rejection):
-                // Fix round 1 (PR #1170 review), item 15: unlike `.terminalFailure`, this
-                // does NOT give up — it keeps retrying, just on the LONGER, jittered,
-                // `RegistrationRetryPolicy` schedule (up to 1h) instead of the ≤60s transient
-                // one, since a cap/rate-limit condition is not this device's fault and can
-                // clear on its own. `RegistrationBackoff` is still written on every occurrence
-                // (harmless to repeat) so a kill-and-relaunch mid-wait doesn't hammer either.
-                failures += 1
-                RegistrationBackoff.record(
-                    storage: deps.storage,
-                    now: deps.now(),
-                    duration: SDKDefaults.deviceRegistrationCapBackoff
-                )
-                let delay = RegistrationRetryPolicy.delay(afterFailures: failures - 1, retryAfter: nil)
-                deps.diagnostics.emit(
-                    .warn,
-                    .identity,
-                    code: "identity.device_rotation_failed",
-                    message: "Registering the fresh device was rejected (\(rejection.statusCode), cap reached) — retrying with backoff",
-                    data: rejection.diagnosticData.merging([
-                        "attempt": AnyCodable(failures),
-                        "outcome": AnyCodable("device_cap_reached"),
-                        "retry_in_ms": AnyCodable(Int(delay / .milliseconds(1))),
-                    ]) { _, new in new }
-                )
-                try? await Task.sleep(for: delay)
+                // The placeholder stays — never the old device.
+                wait = deps.policy.recordFailure(.terminal)
+                failure = ("rejected", rejection.diagnosticData)
+            case .capReached(let rejection, let retryAfter):
+                wait = deps.policy.recordFailure(.cap, retryAfter: retryAfter)
+                failure = ("device_cap_reached", rejection.diagnosticData)
             case .rateLimited(let retryAfter):
-                // Same shape as `.capReached` above, but the delay honors the server's own
-                // `Retry-After` when it asks for longer than the jittered exponential value.
-                //
-                // Fix round 2 (PR #1170 review), item 12: unlike `.capReached`, this does NOT
-                // call `RegistrationBackoff.record` — a 429 is the network/gateway telling this
-                // client to slow down, not a durable capacity fact about the environment the
-                // way a 402/422 is. Persisting the 1h cap window here would gate the NEXT cold
-                // start and `retryIdentityIfUnknown()` on a condition that may already have
-                // cleared by the time either runs. The in-session retry loop above already
-                // paces itself with `RegistrationRetryPolicy`; nothing durable needs to survive
-                // a reload for this outcome, same as `.transientFailure`.
-                failures += 1
-                let delay = RegistrationRetryPolicy.delay(afterFailures: failures - 1, retryAfter: retryAfter)
-                deps.diagnostics.emit(
-                    .warn,
-                    .identity,
-                    code: "identity.device_rotation_failed",
-                    message: "Registering the fresh device was rate limited (429) — retrying with backoff",
-                    data: [
-                        "attempt": AnyCodable(failures),
-                        "outcome": AnyCodable("rate_limited"),
-                        "retry_in_ms": AnyCodable(Int(delay / .milliseconds(1))),
-                    ]
-                )
-                try? await Task.sleep(for: delay)
+                wait = deps.policy.recordFailure(.rateLimited, retryAfter: retryAfter)
+                failure = ("rate_limited", [:])
             }
+            var data = failure.data
+            data["attempt"] = AnyCodable(attempts)
+            data["outcome"] = AnyCodable(failure.outcome)
+            if let wait { data["retry_in_ms"] = AnyCodable(Int(wait * 1000)) }
+            deps.diagnostics.emit(
+                wait == nil ? .error : .warn,
+                .identity,
+                code: "identity.device_rotation_failed",
+                message: wait == nil
+                    ? "Registering the fresh device was rejected — not retried"
+                    : "Registering the fresh device failed — retrying with backoff",
+                data: data
+            )
+            guard let wait else { return }
+            await sleep(seconds: wait)
         }
     }
 
-    /// The fresh-install adoption order (`SheepitClient.start()`): re-stamp both queues first, so a
-    /// flush between these statements sends only re-stamped events, then adopt the id.
+    /// The proposal honoured (the normal case): `rotate()` already switched to it, so the
+    /// registered marker is written — no re-stamp, no change callback — and config is refetched
+    /// unless a body the server resolved for it already applies: every fetch since the rotation
+    /// named a device with no row (`ConfigSync.refetchAfterRegistration`). Replaced
+    /// by the server: the launch swap order (`SheepitClient.adoptLaunchRegistration`) — persist the
+    /// id, re-stamp both queues, adopt it in memory, label the new row, then refetch its config.
+    ///
+    /// 🔴 Adopted by compare-and-set (SK-Q9): a second `reset()` landing after the register loop's
+    /// `isCurrent` check installs its own placeholder, and a plain write clobbered it with this
+    /// rotation's replaced id. The newer rotation then keeps its id, on disk too.
     private func adopt(_ deviceId: String, replacing placeholder: String, attempts: Int) {
         let context = deps.context
-        deps.queue.restampDeviceId(from: placeholder, to: deviceId)
-        deps.offlineQueue.restampDeviceId(from: placeholder, to: deviceId)
-        context.setServerHeldUser(.known(nil))
-        context.setDeviceId(deviceId)
-        deps.storage.set(deviceId, forKey: StorageKeys.deviceRegistered)
-        RegistrationBackoff.clear(storage: deps.storage)
-        deps.onDeviceIdChanged()
+        let replaced = deviceId != placeholder
+        if replaced {
+            context.persistDeviceIdAhead(deviceId)
+            deps.queue.restampDeviceId(from: placeholder, to: deviceId)
+            deps.offlineQueue.restampDeviceId(from: placeholder, to: deviceId)
+            deps.beforeDeviceIdChange()
+            guard context.replaceDeviceId(placeholder, with: deviceId) else {
+                context.persistDeviceIdAhead(context.deviceId)
+                deps.diagnostics.emit(
+                    .debug,
+                    .identity,
+                    code: "identity.device_registration_superseded",
+                    message: "A device registration finished after the client moved on — discarded"
+                )
+                return
+            }
+            context.setServerHeldUser(.known(nil))
+        }
+        deps.policy.recordSuccess(deviceId)
+        if replaced { deps.onDeviceIdChanged() }
         deps.diagnostics.emit(
             .info,
             .identity,
             code: "identity.device_rotated_on_reset",
             message: "Logged out on a bound device — now on a fresh device",
-            data: ["attempts": AnyCodable(attempts)]
+            data: ["attempts": AnyCodable(attempts), "outcome": AnyCodable(replaced ? "replaced" : "proposed")]
         )
         // Detached from the gate's task: an identify waiting on the gate need not wait for config.
+        guard !deps.isDestroyed() else { return }
         let configSync = deps.configSync
-        Task { await configSync.refetchUnconditionally(deviceId: deviceId) }
+        let isDestroyed = deps.isDestroyed
+        let isCurrent: @Sendable () -> Bool = { !isDestroyed() && context.deviceId == deviceId }
+        Task {
+            await configSync.refetchAfterRegistration(
+                deviceId: deviceId, replaced: replaced, isCurrent: isCurrent)
+        }
     }
 }

@@ -144,7 +144,10 @@ enum DeviceProfile {
     ///
     /// Neither is reachable by CI: `swift test` runs the macOS host, so only the
     /// `hw.model` branch executes, and the iOS typecheck never runs anything.
-    static func deviceModel() -> String {
+    static func deviceModel() -> String { cachedDeviceModel }
+    private static let cachedDeviceModel = computeDeviceModel()
+
+    private static func computeDeviceModel() -> String {
         #if targetEnvironment(simulator)
         if let simulated = ProcessInfo.processInfo.environment["SIMULATOR_MODEL_IDENTIFIER"],
            !simulated.isEmpty {
@@ -168,7 +171,11 @@ enum DeviceProfile {
     /// context rides the whole BATCH: one over-long string 400s up to 100 events, and
     /// sdk-js drops a 400 without retry. Losing the tail of a version string is a
     /// cosmetic defect; losing 100 events is data loss. Truncate.
-    static func osVersion() -> String {
+    static func osVersion() -> String { cachedOsVersion }
+    /// Both are process constants and sampled per slow frame on the main thread, so computed once.
+    private static let cachedOsVersion = computeOsVersion()
+
+    private static func computeOsVersion() -> String {
         // 🔴 `os(iOS) || os(tvOS)`, NOT `canImport(UIKit)`. UIKit IS importable on watchOS
         // but `UIDevice` is not available there, so the `canImport` guard compiled on every
         // platform except the one it needed to exclude — and `Package.swift` declares

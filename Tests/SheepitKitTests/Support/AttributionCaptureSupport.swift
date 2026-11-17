@@ -3,7 +3,7 @@ import Foundation
 
 /// Test doubles shared by the attribution and config reset suites.
 
-/// In-memory storage that runs a hook the first time a key is read, before the read returns.
+/// In-memory storage with one-shot data-read and string-write hooks.
 final class ReadHookStorage: StorageProvider, @unchecked Sendable {
     private let inner = InMemoryStorage()
     private let lock = NSLock()
@@ -16,7 +16,19 @@ final class ReadHookStorage: StorageProvider, @unchecked Sendable {
     }
 
     func string(forKey key: String) -> String? { inner.string(forKey: key) }
-    func set(_ value: String?, forKey key: String) { inner.set(value, forKey: key) }
+    func onFirstStringWrite(to key: String, _ hook: @escaping @Sendable () -> Void) {
+        lock.lock()
+        hooks["write:" + key] = hook
+        lock.unlock()
+    }
+
+    func set(_ value: String?, forKey key: String) {
+        lock.lock()
+        let hook = hooks.removeValue(forKey: "write:" + key)
+        lock.unlock()
+        hook?()
+        inner.set(value, forKey: key)
+    }
     func set(_ value: Data?, forKey key: String) { inner.set(value, forKey: key) }
     func removeObject(forKey key: String) { inner.removeObject(forKey: key) }
 
@@ -42,6 +54,8 @@ final class LockedBox<Value>: @unchecked Sendable {
 ///   - `/v1/config`: 500 for the next `failNextConfigRequests` requests, else 304 until `serveConfig` is called; then the body, or 304 when the request's
 ///     `If-None-Match` equals the body's ETag (`honorIfNoneMatch`), which is what the real route
 ///     does after `identify()`. `scriptConfig` answers requests in order with per-request delays.
+///     A config 200 carries `X-Sheepit-Device-Resolution` when `configResolution` is set: what it
+///     returns for the request's `X-Device-ID` and whether a register created that device's row.
 ///   - `/v1/devices/register`: the minted `registerDeviceId`, or `{}` (unreadable) when unset;
 ///     held until `releaseHeldRegister()` while `holdRegister` is set; a 500 for the next
 ///     `failNextRegisterRequests` requests. Bodies are recorded.
@@ -72,6 +86,8 @@ final class AttributionCaptureProtocol: URLProtocol, @unchecked Sendable {
         var configResponse: String?
         var configScript: [(String, TimeInterval)] = []
         var configHook: (@Sendable () -> Void)?
+        var configResolution: (@Sendable (_ deviceId: String, _ hasRow: Bool) -> String?)?
+        var configResponder: (@Sendable (_ deviceId: String, _ hasRow: Bool) -> (body: String, resolution: String?))?
         var honorIfNoneMatch = true
         var identifyReplies: [String: IdentifyReply] = [:]
         var heldIdentify: [(Int, String) -> Void] = []
@@ -114,6 +130,17 @@ final class AttributionCaptureProtocol: URLProtocol, @unchecked Sendable {
     static var onConfigRequest: (@Sendable () -> Void)? {
         get { with { $0.configHook } }
         set { with { $0.configHook = newValue } }
+    }
+    /// The `X-Sheepit-Device-Resolution` of each config 200; nil (the default) sends none.
+    static var configResolution: (@Sendable (_ deviceId: String, _ hasRow: Bool) -> String?)? {
+        get { with { $0.configResolution } }
+        set { with { $0.configResolution = newValue } }
+    }
+    /// When set, every config request that is not a scripted failure gets a 200 with this body and
+    /// resolution header, decided per `X-Device-ID` and whether a register created that row.
+    static var configResponder: (@Sendable (_ deviceId: String, _ hasRow: Bool) -> (body: String, resolution: String?))? {
+        get { with { $0.configResponder } }
+        set { with { $0.configResponder = newValue } }
     }
     static var honorIfNoneMatch: Bool {
         get { with { $0.honorIfNoneMatch } }
@@ -216,6 +243,14 @@ final class AttributionCaptureProtocol: URLProtocol, @unchecked Sendable {
         with { $0.ingestBodies }.flatMap(batch).last { $0["event"] as? String == name }
     }
 
+    /// Every sent copy of the event with this name for one user, oldest first.
+    static func events(named name: String, userId: String) -> [[String: Any]] {
+        with { $0.ingestBodies }.flatMap(batch).filter {
+            let user = ($0["context"] as? [String: Any])?["user"] as? [String: Any]
+            return $0["event"] as? String == name && user?["id"] as? String == userId
+        }
+    }
+
     /// `event(named:)` for one user (`context.user.id`). Suites share the on-disk offline queue, so an
     /// earlier test's event can reach this test's stub; a unique user id tells them apart.
     static func event(named name: String, userId: String) -> [String: Any]? {
@@ -274,10 +309,30 @@ final class AttributionCaptureProtocol: URLProtocol, @unchecked Sendable {
                 return ((200, config), 0, state.configHook)
             }
             hook?()
+            let (resolver, responder, hasRow) = Self.with { state in
+                (state.configResolution, state.configResponder, state.rows.contains { $0.hasSuffix("|\(deviceHeader)") })
+            }
+            var served = reply
+            var headers: [String: String] = [:]
+            if served.0 != 500, let responder {
+                let answer = responder(deviceHeader, hasRow)
+                // A matching `If-None-Match` is a 304, as on the route (`honorIfNoneMatch`).
+                let honor = Self.with { $0.honorIfNoneMatch }
+                if honor, let ifNoneMatch,
+                   answer.body.contains(#""etag":"\#(ifNoneMatch.replacingOccurrences(of: "\"", with: "\\\""))""#) {
+                    served = (304, "")
+                } else {
+                    served = (200, answer.body)
+                    if let value = answer.resolution { headers["X-Sheepit-Device-Resolution"] = value }
+                }
+            } else if served.0 == 200, let value = resolver?(deviceHeader, hasRow) {
+                headers["X-Sheepit-Device-Resolution"] = value
+            }
+            let (status, text, fields) = (served.0, served.1, headers)
             if delay > 0 {
-                DispatchQueue.global().asyncAfter(deadline: .now() + delay) { self.respond(reply.0, reply.1) }
+                DispatchQueue.global().asyncAfter(deadline: .now() + delay) { self.respond(status, text, headers: fields) }
             } else {
-                respond(reply.0, reply.1)
+                respond(status, text, headers: fields)
             }
         } else if path.hasSuffix("/v1/devices/register") {
             let registerBody = (try? JSONSerialization.jsonObject(with: body) as? [String: Any]) ?? [:]
@@ -359,9 +414,9 @@ final class AttributionCaptureProtocol: URLProtocol, @unchecked Sendable {
         }
     }
 
-    private func respond(_ status: Int, _ body: String) {
+    private func respond(_ status: Int, _ body: String, headers: [String: String] = [:]) {
         guard let url = request.url,
-              let response = HTTPURLResponse(url: url, statusCode: status, httpVersion: "HTTP/1.1", headerFields: nil)
+              let response = HTTPURLResponse(url: url, statusCode: status, httpVersion: "HTTP/1.1", headerFields: headers)
         else {
             client?.urlProtocol(self, didFailWithError: URLError(.badServerResponse))
             return

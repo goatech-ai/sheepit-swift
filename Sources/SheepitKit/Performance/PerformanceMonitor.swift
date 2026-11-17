@@ -18,7 +18,7 @@ actor PerformanceMonitor {
     private var memoryTracker: MemoryTracker?
 
     /// `SheepitConfig.appVersion`; see `DeviceProfile.wireAppVersion(override:)`.
-    private let appVersionOverride: String?
+    private nonisolated let appVersionOverride: String?
     private var buffer: [PerformanceMetric] = []
     private var spans: [String: SheepitSpan] = [:]
     private var flushTask: Task<Void, Never>?
@@ -31,6 +31,12 @@ actor PerformanceMonitor {
     /// by metrics arriving during the round trip would otherwise fire a concurrent POST.
     private var isFlushing = false
     private let now: @Sendable () -> Date
+    private nonisolated let captureContext: @Sendable () -> PerfBatchContext
+    private var spanContexts: [String: PerfBatchContext] = [:]
+    /// The identity epoch each open span was captured under; a span ended under a newer one is
+    /// unattributed (see `identityDidChange()`).
+    private var spanEpochs: [String: UInt64] = [:]
+    private nonisolated let identityEpoch = IdentityEpoch()
 
     init(
         http: HTTPClient,
@@ -38,8 +44,14 @@ actor PerformanceMonitor {
         config: PerformanceConfig,
         appVersionOverride: String?,
         log: Logger,
-        now: @escaping @Sendable () -> Date = { Date() }
+        now: @escaping @Sendable () -> Date = { Date() },
+        captureContext: (@Sendable () -> PerfBatchContext)? = nil
     ) {
+        self.captureContext = captureContext ?? {
+            context.tryEventContext().map {
+                PerfBatchContext.capture($0, appVersion: appVersionOverride, receipt: AssignmentReceipt())
+            } ?? PerfBatchContext.unattributed(appVersion: appVersionOverride)
+        }
         self.now = now
         self.http = http
         self.context = context
@@ -55,19 +67,29 @@ actor PerformanceMonitor {
     // MARK: - Lifecycle
 
     /// Start all enabled trackers and begin periodic flushing.
-    func start() {
+    nonisolated func start() async {
+        let captured = contextSnapshot()
+        await start(capturedContext: captured)
+    }
+
+    private func start(capturedContext: PerfBatchContext) {
         guard !isRunning else { return }
         isRunning = true
 
         // Create metric callback that buffers into this actor
+        let capture = captureContext
         let metricCallback: @Sendable (PerformanceMetric) -> Void = { [weak self] metric in
             guard let monitor = self else { return }
-            Task { await monitor.addMetric(metric) }
+            var captured = metric
+            if captured.context == nil { captured.context = capture() }
+            let frozen = captured
+            Task { await monitor.addMetric(frozen) }
         }
 
         // Initialize trackers based on config
         if config.startupTrackingEnabled {
-            let tracker = StartupTracker(onMetric: metricCallback)
+            let tracker = StartupTracker(captureContext: capture, initialContext: capturedContext,
+                                         epoch: identityEpoch, onMetric: metricCallback)
             self.startupTracker = tracker
             tracker.markFirstFrame()
         }
@@ -76,6 +98,9 @@ actor PerformanceMonitor {
             let tracker = FrameTracker(
                 slowFrameThresholdMs: config.slowFrameThresholdMs,
                 frozenFrameThresholdMs: config.frozenFrameThresholdMs,
+                captureContext: capture,
+                initialContext: capturedContext,
+                epoch: identityEpoch,
                 onMetric: metricCallback
             )
             self.frameTracker = tracker
@@ -92,7 +117,9 @@ actor PerformanceMonitor {
             }
         }
 
-        let watchdog = ANRWatchdog(thresholdMs: config.anrThresholdMs, onMetric: metricCallback)
+        let appVersion = appVersionOverride
+        let watchdog = ANRWatchdog(thresholdMs: config.anrThresholdMs, captureContext: capture, epoch: identityEpoch,
+            unattributedContext: { PerfBatchContext.unattributed(appVersion: appVersion) }, onMetric: metricCallback)
         self.anrWatchdog = watchdog
         watchdog.start()
 
@@ -148,7 +175,13 @@ actor PerformanceMonitor {
     // MARK: - Metric Collection
 
     /// Add a metric to the buffer. Flushes automatically when batch is full.
-    func addMetric(_ metric: PerformanceMetric) {
+    nonisolated func addMetric(_ metric: PerformanceMetric) async {
+        var captured = metric
+        if captured.context == nil { captured.context = contextSnapshot() }
+        await appendMetric(captured)
+    }
+
+    private func appendMetric(_ metric: PerformanceMetric) {
         if isSuspended() { return }
         buffer.append(metric)
         if buffer.count >= config.maxBatchSize {
@@ -159,7 +192,15 @@ actor PerformanceMonitor {
     // MARK: - Flush
 
     /// Flush buffered metrics to POST /v1/performance.
-    func flush() async {
+    nonisolated func flush() async {
+        // Epoch first, then the sample (the `spanSnapshot()` order): a reset during the actor hop
+        // ends the identity the sample was taken under.
+        let epoch = identityEpoch.current
+        let captured = contextSnapshot()
+        await flush(capturedContext: captured, epoch: epoch)
+    }
+
+    private func flush(capturedContext: PerfBatchContext, epoch: UInt64) async {
         if isSuspended() {
             buffer.removeAll()
             return
@@ -170,30 +211,16 @@ actor PerformanceMonitor {
 
         // Report periodic summaries before flush
         frameTracker?.reportSummary()
-        memoryTracker?.reportMetric()
+        memoryTracker?.reportMetric(context: epoch == identityEpoch.current ? capturedContext : capturedContext.anonymized())
 
         let metrics = buffer
         buffer.removeAll()
 
-        let ctx = context.eventContext()
         let payload = PerfBatchRequest(
             batch: metrics,
-            context: PerfBatchContext(
-                platform: DeviceProfile.platform,
-                // The same version and build events and crashes send; `perfBatchContextSchema` caps both at 64.
-                appVersion: DeviceProfile.wireAppVersion(override: appVersionOverride),
-                buildNumber: DeviceProfile.wireBuildNumber(),
-                osVersion: DeviceProfile.osVersion(),
-                deviceModel: DeviceProfile.deviceModel(),
-                userId: ctx.userId,
-                sessionId: ctx.sessionId,
-                deviceId: ctx.deviceId,
-                // `perfBatchContextSchema.country` is `length(2)`: see `TrackSnapshot.countryCode`.
-                country: TrackSnapshot.countryCode(Locale.current.region?.identifier),
-                networkType: nil,
-                activeFlags: nil,
-                activeExperiments: nil
-            ),
+            // Fail closed: the envelope names nobody. Every metric carries its own captured context,
+            // which the server reads in preference to this one.
+            context: PerfBatchContext.unattributed(appVersion: appVersionOverride),
             sentAt: ISO8601DateFormatter().string(from: Date())
         )
 
@@ -221,9 +248,42 @@ actor PerformanceMonitor {
     // MARK: - Custom Spans
 
     /// Start a named span for custom performance measurement.
-    func startSpan(_ name: String, attributes: [String: String] = [:]) -> SheepitSpan {
+    nonisolated func contextSnapshot() -> PerfBatchContext { captureContext() }
+
+    /// A span's start context and the identity epoch it was captured under. The epoch is read
+    /// FIRST: `identityDidChange()` runs after the identity is cleared, so a context that still
+    /// names the old identity was necessarily read under an epoch that is already stale.
+    struct SpanSnapshot: Sendable {
+        let epoch: UInt64
+        let context: PerfBatchContext
+    }
+
+    nonisolated func spanSnapshot() -> SpanSnapshot {
+        let epoch = identityEpoch.current
+        return SpanSnapshot(epoch: epoch, context: contextSnapshot())
+    }
+
+    /// The identity this monitor's captures belong to is gone (`reset()`; not an identify, which keeps
+    /// spans attributed to the identity they started under). Synchronous and lock-only, so it is complete before the caller returns: spans
+    /// open across it end `unattributed` (the duration is kept, the identity and receipt are not),
+    /// the frame window and any pending warm start are discarded on their next touch.
+    nonisolated func identityDidChange() { identityEpoch.advance() }
+
+    /// A different user identified on the same device: spans keep the identity they started under,
+    /// but the cumulative frame window and a pending warm start restart.
+    nonisolated func identitySwitched() { identityEpoch.advanceWindow() }
+
+    nonisolated func startSpan(_ name: String, attributes: [String: String] = [:],
+                              snapshot: SpanSnapshot? = nil) async -> SheepitSpan {
+        let captured = snapshot ?? spanSnapshot()
+        return await beginSpan(name, attributes: attributes, snapshot: captured)
+    }
+
+    private func beginSpan(_ name: String, attributes: [String: String], snapshot: SpanSnapshot) -> SheepitSpan {
         let span = SheepitSpan(name: name, startTime: Date(), attributes: attributes)
         spans[name] = span
+        spanContexts[name] = snapshot.context
+        spanEpochs[name] = snapshot.epoch
         return span
     }
 
@@ -239,7 +299,7 @@ actor PerformanceMonitor {
         )
 
         let durationMs = endTime.timeIntervalSince(span.startTime) * 1000
-        let metric = PerformanceMetric(
+        var metric = PerformanceMetric(
             metricType: "span",
             metricName: name,
             valueMs: durationMs,
@@ -247,6 +307,11 @@ actor PerformanceMonitor {
             isError: false,
             timestamp: ISO8601DateFormatter().string(from: Date())
         )
+        let startedContext = spanContexts.removeValue(forKey: name)
+        let startedEpoch = spanEpochs.removeValue(forKey: name)
+        // Read at end time on the actor, after `identityDidChange()` returned: no stale read.
+        let sameIdentity = startedEpoch == identityEpoch.current
+        metric.context = (sameIdentity ? startedContext : nil) ?? PerfBatchContext.unattributed(appVersion: appVersionOverride)
         buffer.append(metric)
 
         if buffer.count >= config.maxBatchSize {
@@ -270,6 +335,9 @@ actor PerformanceMonitor {
             anrCount: anrWatchdog?.anrCount ?? 0
         )
     }
+
+    /// Test-only: the live trackers, to drive frames and foreground transitions without a display.
+    func trackersForTesting() -> (frame: FrameTracker?, startup: StartupTracker?) { (frameTracker, startupTracker) }
 
     /// Mark the first frame rendered (for startup tracking).
     func markFirstFrame() {

@@ -21,8 +21,7 @@ final class DeviceRotationOnResetTests: XCTestCase {
         guard let defaults = UserDefaults(suiteName: suite) else { return }
         for key in [StorageKeys.sdkConfig, StorageKeys.sdkConfigCachedAt,
                     StorageKeys.sdkConfigFetchedUnder, StorageKeys.serverHeldUser,
-                    StorageKeys.identity, StorageKeys.deviceRegistrationBackoffUntil,
-                    StorageKeys.deviceRegistrationBackoffSDKVersion,
+                    StorageKeys.identity, StorageKeys.deviceRegistrationBackoff,
                     StorageKeys.deviceId, StorageKeys.deviceRegistered,
                     StorageKeys.deviceBindAttempted] {
             SharedSDKStorage.remove(key, from: defaults)
@@ -117,9 +116,9 @@ final class DeviceRotationOnResetTests: XCTestCase {
             AttributionCaptureProtocol.identifyDeviceIds.dropFirst(identifyMark).contains(Self.oldDevice))
         XCTAssertEqual(client.status().deviceId, Self.newDevice)
         XCTAssertEqual(client.context.serverHeldUser.user, .known(nil), "a new row holds no user")
-        XCTAssertNil(
-            AttributionCaptureProtocol.registerBodies.last?["device_id"],
-            "no device id is sent: the server mints one")
+        let proposed = AttributionCaptureProtocol.registerBodies.last?["device_id"] as? String
+        XCTAssertNotNil(proposed, "the rotation proposes a fresh local id (contract § 1), never nil")
+        XCTAssertNotEqual(proposed, Self.oldDevice, "the proposal is fresh, never the abandoned device")
         XCTAssertEqual(
             AttributionCaptureProtocol.registerBodies.last?["anonymous_id"] as? String,
             client.context.anonymousId, "registered under the rotated anonymous id")
@@ -178,15 +177,17 @@ final class DeviceRotationOnResetTests: XCTestCase {
         XCTAssertTrue(launching, "precondition: the launch registration is in flight")
 
         client.reset()
+        let placeholder = client.status().deviceId
         let rotating = await waitUntil { AttributionCaptureProtocol.registerRequestCount == 2 }
         XCTAssertTrue(rotating, "precondition: the rotation's registration is in flight")
-        AttributionCaptureProtocol.releaseHeldRegister(index: 1)
-        let adopted = await waitUntil { client.status().deviceId == Self.newDevice }
+        AttributionCaptureProtocol.releaseHeldRegister(index: 1) // echoes the rotation's proposal
+        let adopted = await waitUntil { SharedSDKStorage.isRegistered() }
         XCTAssertTrue(adopted)
         AttributionCaptureProtocol.releaseHeldRegister(index: 0) // echoes the old device
         try? await Task.sleep(for: .milliseconds(200))
 
-        XCTAssertEqual(client.status().deviceId, Self.newDevice, "the abandoned device must stay abandoned")
+        XCTAssertEqual(client.status().deviceId, placeholder, "the abandoned device must stay abandoned")
+        XCTAssertNotEqual(placeholder, Self.oldDevice)
     }
 
     /// An install upgraded from an SDK that never recorded the row has the label `.unknown` by
@@ -362,7 +363,7 @@ final class DeviceRotationOnResetTests: XCTestCase {
         AttributionCaptureProtocol.releaseHeldRegister(index: 0) // the launch request's 400
         try? await Task.sleep(for: .milliseconds(200))
 
-        XCTAssertNil(defaults?.string(forKey: SharedSDKStorage.slot(StorageKeys.deviceRegistrationBackoffUntil)))
+        XCTAssertNil(defaults?.string(forKey: SharedSDKStorage.slot(StorageKeys.deviceRegistrationBackoff)))
         XCTAssertFalse(client.getRecentDiagnostics().contains {
             $0.code == "identity.device_registration_terminal_failure"
         })

@@ -468,10 +468,10 @@ final class IsFirstSessionPropertyTests: XCTestCase {
             if let originalDeviceId {
                 defaults.set(originalDeviceId, forKey: StorageKeys.deviceId)
             } else {
-                defaults.removeObject(forKey: StorageKeys.deviceId)
+                SharedSDKStorage.remove(StorageKeys.deviceId, from: defaults)
             }
         }
-        defaults.removeObject(forKey: StorageKeys.deviceId) // forces didMintDeviceId == true
+        SharedSDKStorage.remove(StorageKeys.deviceId, from: defaults) // forces didMintDeviceId == true
 
         let recorder = EventNameRecorder()
         let client = SheepitClient.create(
@@ -498,7 +498,7 @@ final class IsFirstSessionPropertyTests: XCTestCase {
             if let originalDeviceId {
                 defaults.set(originalDeviceId, forKey: StorageKeys.deviceId)
             } else {
-                defaults.removeObject(forKey: StorageKeys.deviceId)
+                SharedSDKStorage.remove(StorageKeys.deviceId, from: defaults)
             }
         }
         defaults.set(UUID().uuidString, forKey: StorageKeys.deviceId) // forces didMintDeviceId == false

@@ -103,6 +103,13 @@ final class InfoPlistConfigTests: XCTestCase {
         XCTAssertTrue(reason.contains("does not form a usable URL"), reason)
     }
 
+    /// S3: the gate's own reason is forwarded, not a generic "needs a host".
+    func testAURLWithCredentialsForwardsTheGatesReason() {
+        let reason = rejection(config(url: "user:secret@sheepit.example.com")) ?? ""
+        XCTAssertTrue(reason.contains("credentials"), reason)
+        XCTAssertFalse(reason.contains("secret"), "the credentials are not echoed")
+    }
+
     func testNonStringValueIsInert() {
         let reason = rejection(config(url: 42)) ?? ""
         XCTAssertTrue(reason.contains("must be a String"), reason)

@@ -7,7 +7,9 @@ public struct CrashConfig: Sendable {
     /// Whether crash reporting is enabled.
     public var enabled: Bool
 
-    /// Maximum number of breadcrumbs retained before a crash.
+    /// Maximum number of breadcrumbs a crash report carries: the newest this many. The on-disk
+    /// ring holds 32, so a larger value acts as 32; 0 sends none. Applied when the report is
+    /// read on the next launch, so that launch's configuration decides.
     public var breadcrumbCapacity: Int
 
     /// Number of consecutive crashes within `crashLoopWindowSeconds` before
@@ -52,69 +54,6 @@ public struct SheepitBreadcrumb: Sendable {
 
 // MARK: - Internal Types
 
-/// The structured crash report payload sent to `POST /v1/crashes/report`.
-struct CrashReportPayload: Encodable, Sendable {
-    let platform: String
-    let appVersion: String
-    let buildNumber: String?
-    let osVersion: String?
-    let deviceModel: String?
-    let exceptionType: String
-    let exceptionMessage: String?
-    let stackTrace: CrashStackTrace
-    let threadInfo: [CrashThreadInfo]?
-    let isForeground: Bool
-    let freeMemoryMb: Int?
-    let freeDiskMb: Int?
-    let batteryLevel: Int?
-    let screenName: String?
-    let breadcrumbs: [CrashBreadcrumbPayload]?
-    let activeFlags: [String: AnyCodable]?
-    let activeExperiments: [String: AnyCodable]?
-    let customData: [String: AnyCodable]?
-    let userId: String?
-    let sessionId: String?
-    let deviceId: String?
-    let networkType: String?
-    /// Per-image Mach-O UUIDs captured at crash time. Required for
-    /// server-side symbolication; stays optional so older receivers
-    /// still accept the payload during phased rollout.
-    let binaryImages: [CrashBinaryImage]?
-    let timestamp: String
-    /// Stable per-report id (`PendingCrashStore.Entry.id`), identical on every retry, so the
-    /// server can recognise a re-send. `crashReportIngestSchema` is a non-strict `z.object`:
-    /// an API that does not know the field strips it rather than answering 400.
-    var reportId: String? = nil
-
-    enum CodingKeys: String, CodingKey {
-        case platform
-        case appVersion = "app_version"
-        case buildNumber = "build_number"
-        case osVersion = "os_version"
-        case deviceModel = "device_model"
-        case exceptionType = "exception_type"
-        case exceptionMessage = "exception_message"
-        case stackTrace = "stack_trace"
-        case threadInfo = "thread_info"
-        case isForeground = "is_foreground"
-        case freeMemoryMb = "free_memory_mb"
-        case freeDiskMb = "free_disk_mb"
-        case batteryLevel = "battery_level"
-        case screenName = "screen_name"
-        case breadcrumbs
-        case activeFlags = "active_flags"
-        case activeExperiments = "active_experiments"
-        case customData = "custom_data"
-        case userId = "user_id"
-        case sessionId = "session_id"
-        case deviceId = "device_id"
-        case networkType = "network_type"
-        case binaryImages = "binary_images"
-        case timestamp
-        case reportId = "report_id"
-    }
-}
-
 /// A single loaded Mach-O image captured from the crash context. The UUID
 /// is the LC_UUID load-command value — the same key used to look up the
 /// matching dSYM on the server for symbolication.
@@ -123,12 +62,33 @@ struct CrashBinaryImage: Encodable, Sendable {
     let name: String
     /// Hex string ("0x00000001029c8000") so large addresses survive JSON.
     let loadAddress: String
+    /// The image's `__TEXT` size since 0.10.1 (its largest segment before).
     let size: UInt64
+    // From the crash supplement (0.10.1+); absent for a report captured without one.
+    var cpuType: Int32? = nil
+    /// Raw `cpusubtype`, capability bits included (arm64e carries its pointer-auth ABI bit).
+    var cpuSubtype: UInt32? = nil
+    /// Signed hex ("0x4000", "-0x4000"): runtime header address minus the link-time `__TEXT` vmaddr.
+    var vmaddrSlide: String? = nil
+    /// Whether the image ships inside the app bundle — its full path, not its name.
+    var isAppImage: Bool? = nil
 
     enum CodingKeys: String, CodingKey {
         case uuid, name, size
         case loadAddress = "load_address"
+        case cpuType = "cpu_type"
+        case cpuSubtype = "cpu_subtype"
+        case vmaddrSlide = "vmaddr_slide"
+        case isAppImage = "is_app_image"
     }
+}
+
+/// The crashed thread's registers at the trap site, pointer-auth stripped, as hex strings.
+struct CrashRegisters: Encodable, Sendable, Equatable {
+    let pc: String
+    let lr: String?
+    let fp: String
+    let sp: String
 }
 
 struct CrashStackTrace: Encodable, Sendable {
@@ -166,6 +126,11 @@ struct CrashThreadInfo: Encodable, Sendable {
     let name: String?
     let isCrashed: Bool
     let frames: [CrashStackFrame]
+
+    /// This thread with only its first `count` frames.
+    func keepingFrames(_ count: Int) -> CrashThreadInfo {
+        CrashThreadInfo(threadId: threadId, name: name, isCrashed: isCrashed, frames: Array(frames.prefix(count)))
+    }
 
     enum CodingKeys: String, CodingKey {
         case threadId = "thread_id"

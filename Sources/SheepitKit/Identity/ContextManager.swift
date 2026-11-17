@@ -32,25 +32,37 @@ final class ContextManager: @unchecked Sendable {
     /// the epoch when its response lands; any change in between invalidates its label.
     private var _serverHeldEpoch: UInt64 = 0
     private var sessionLastSeen: Date
+    /// When the live session began; nil when unknown (a session stored by an SDK before
+    /// `$session_end`, or one `reset()` opened without announcing it). A session with no start
+    /// ends without a `$session_end`.
+    private var sessionStartedAt: Date?
+    /// The session that aged out and is owed a `$session_end`; taken once by
+    /// `takeEndedSession()`.
+    private var _endedSession: EndedSession?
+    /// The app version and build the live session began under, frozen with it: its `$session_end`
+    /// is stamped with these, not with whatever build is running when the end is noticed (an app
+    /// update between the two would otherwise move the whole session into the new release).
+    private var sessionAppVersion: String?
+    private var sessionAppBuild: String?
+    private let appIdentity: @Sendable () -> (version: String?, build: String?)
 
-    /// True when `init` minted `_deviceId` fresh because storage held nothing for
-    /// `StorageKeys.deviceId`. False whenever a value was restored from disk instead —
-    /// which, for every real existing install, is a LOCALLY-MINTED id that has never made
-    /// it to the server: `POST /v1/devices/register` has never fired in any published
-    /// version (`start()`'s guard was never satisfiable — verified back to the SDK's first
-    /// commit), so no install anywhere holds a server-assigned `dev_…` id today. The same
-    /// `false` value also covers the forward-looking case of a device that DOES already
-    /// hold a server-assigned id (once registration starts succeeding, a later bug that
-    /// re-triggers a second attempt must not re-mint). Read-only from outside; nothing after
-    /// `init` may change it.
-    ///
-    /// This is a DIFFERENT question from `StorageKeys.deviceRegistered` (whether registration
-    /// has ever *succeeded*): a device can hold a non-nil `_deviceId` without
-    /// `deviceRegistered` ever having been set — every real install today, plus one whose
-    /// first registration attempt failed. `start()` needs both: `deviceRegistered` decides
-    /// whether to attempt registration at all, `didMintDeviceId` decides what id (if any) to
-    /// send along with that attempt.
+    /// True when `init` minted `_deviceId` fresh (a UUIDv4) because storage held nothing for
+    /// `StorageKeys.deviceId`; false when it was restored from disk (a locally minted UUID, or a
+    /// legacy server-assigned `dev_…` id, kept verbatim). Either way the id is used immediately and
+    /// proposed as-is on registration (`Docs/Technical/SDK_DEVICE_REGISTRATION_CONTRACT.md` § 1);
+    /// this flag only decides first-session and install bookkeeping. Read-only after `init`.
     let didMintDeviceId: Bool
+    /// True when the stored id failed the contract's shape and `init` minted a replacement.
+    let replacedUnusableDeviceId: Bool
+    /// Why (`DeviceManager.unusableDeviceIdReason`), for the diagnostic. Never the id itself.
+    let unusableDeviceIdReason: String?
+    /// True when this scope's slot was empty and `init` took the pre-0.10.0 unscoped id.
+    let adoptedLegacyDeviceId: Bool
+
+    /// A fresh device id: a lowercase UUIDv4, byte-identical in shape to sdk-js and Kotlin.
+    static func mintDeviceId() -> String {
+        UUID().uuidString.lowercased()
+    }
 
     /// True once a fresh session id has been minted and not yet announced.
     /// `takeNewSessionFlag()` consumes it so `$session_start` is emitted
@@ -123,15 +135,33 @@ final class ContextManager: @unchecked Sendable {
         storage: StorageProvider,
         now: @escaping @Sendable () -> Date = { Date() },
         persistOnInit: Bool = true,
-        launchedInBackground: Bool = false
+        launchedInBackground: Bool = false,
+        legacyStorage: StorageProvider? = nil,
+        appIdentity: @escaping @Sendable () -> (version: String?, build: String?) = { (nil, nil) }
     ) {
         self.storage = storage
         self.now = now
+        self.appIdentity = appIdentity
 
         // Restore or generate device ID
-        let storedDeviceId = storage.string(forKey: StorageKeys.deviceId)
+        // 🔴 Minted LOWERCASE, like every other SDK; a stored id is kept byte-for-byte (an
+        // uppercase id from 0.9.x stays as it is). A stored id the server would refuse
+        // (`DeviceManager.isUsableDeviceId`) is never sent: it is replaced by a fresh one here,
+        // persisted at `persistOnBeginWork()`, and proposed (contract § 1).
+        //
+        // 🔴 Scoped since 0.10.0 (`StorageScope.scopedKeys`), like sdk-js's `gt_device_id:<scope>`.
+        // An empty slot takes the pre-scope unscoped id from `legacyStorage`, byte-for-byte, so an
+        // existing single-host install keeps its device; `SheepitClient.beginWork()` then writes
+        // the slot and deletes the legacy key (`StorageScope.retireLegacyDeviceId`).
+        let scopedDeviceId = storage.string(forKey: StorageKeys.deviceId)
+        let legacyDeviceId = scopedDeviceId == nil ? legacyStorage?.string(forKey: StorageKeys.deviceId) : nil
+        self.adoptedLegacyDeviceId = legacyDeviceId != nil
+        let storedDeviceId = scopedDeviceId ?? legacyDeviceId
         self.didMintDeviceId = storedDeviceId == nil
-        self._deviceId = storedDeviceId ?? UUID().uuidString
+        self.unusableDeviceIdReason = storedDeviceId.flatMap { DeviceManager.unusableDeviceIdReason($0) }
+        let usableStoredId = unusableDeviceIdReason == nil ? storedDeviceId : nil
+        self.replacedUnusableDeviceId = storedDeviceId != nil && usableStoredId == nil
+        self._deviceId = usableStoredId ?? Self.mintDeviceId()
         self._firstSessionPending = self.didMintDeviceId
 
         // Restore or generate anonymous ID
@@ -148,8 +178,32 @@ final class ContextManager: @unchecked Sendable {
             now().timeIntervalSince($0) > SDKDefaults.sessionTimeoutSeconds
         } ?? true
 
+        // Finite and positive only: `TimeInterval("nan")`, `("inf")` and `("1e300")` all parse, and a
+        // poisoned start would trap in `durationMs`. Anything else reads as "no start".
+        let storedStartedAt = storage.string(forKey: StorageKeys.sessionStartedAt)
+            .flatMap { TimeInterval($0) }
+            .flatMap { $0.isFinite && $0 > 0 && $0 < 4_102_444_800 ? Date(timeIntervalSince1970: $0) : nil }
+        let storedAppVersion = storage.string(forKey: StorageKeys.sessionAppVersion)
+        let storedAppBuild = storage.string(forKey: StorageKeys.sessionAppBuild)
+        // The previous process's session aged out while the app was dead: it is owed its end,
+        // timestamped at its last activity. Skipped when that end was already queued.
+        // A session stored without its app identity (by 0.10.1 or earlier) is not ended: stamping
+        // it with today's build would misattribute it.
+        if let storedSessionId, isExpired, let storedStartedAt, let storedLastSeen,
+           let storedAppVersion, let storedAppBuild,
+           storage.string(forKey: StorageKeys.sessionEndedId) != storedSessionId {
+            self._endedSession = EndedSession(
+                id: storedSessionId, startedAt: storedStartedAt, endedAt: storedLastSeen,
+                appVersion: storedAppVersion.isEmpty ? nil : storedAppVersion,
+                appBuild: storedAppBuild.isEmpty ? nil : storedAppBuild)
+        }
+
         if let storedSessionId, !isExpired {
             self._sessionId = storedSessionId
+            // No stored app identity (a session from 0.10.1 or earlier): it cannot be ended truthfully.
+            self.sessionStartedAt = storedAppVersion == nil || storedAppBuild == nil ? nil : storedStartedAt
+            self.sessionAppVersion = storedAppVersion.map { $0.isEmpty ? nil : $0 } ?? nil
+            self.sessionAppBuild = storedAppBuild.map { $0.isEmpty ? nil : $0 } ?? nil
             self.sessionLastSeen = storedLastSeen ?? now()
             // Resuming an existing session — nothing to announce.
             self._isNewSession = false
@@ -163,6 +217,8 @@ final class ContextManager: @unchecked Sendable {
         } else {
             self._sessionId = UUID().uuidString
             self.sessionLastSeen = now()
+            self.sessionStartedAt = self.sessionLastSeen
+            (self.sessionAppVersion, self.sessionAppBuild) = appIdentity()
             // Cold start into a brand-new session, or the stored one aged
             // out while the process was dead. Either way this is the first
             // session, so `$session_start` is owed.
@@ -197,6 +253,9 @@ final class ContextManager: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         persistIds()
+        // A freshly minted id must survive an immediate kill: it is already on every event and
+        // request, and it is the registration proposal.
+        if didMintDeviceId || replacedUnusableDeviceId || adoptedLegacyDeviceId { _ = storage.synchronize() }
     }
 
     // MARK: - Device
@@ -206,6 +265,14 @@ final class ContextManager: @unchecked Sendable {
         defer { lock.unlock() }
         _deviceId = id
         storage.set(id, forKey: StorageKeys.deviceId)
+        _ = storage.synchronize()
+    }
+
+    /// Writes `id` to disk (and flushes) WITHOUT adopting it in memory: the first step of adopting
+    /// a server-replaced id, so the id is durable before re-stamped events can leave the device.
+    func persistDeviceIdAhead(_ id: String) {
+        storage.set(id, forKey: StorageKeys.deviceId)
+        _ = storage.synchronize()
     }
 
     /// `setDeviceId(id)` only while the device is still `expected`, in one critical section: a
@@ -216,6 +283,7 @@ final class ContextManager: @unchecked Sendable {
         guard _deviceId == expected else { return false }
         _deviceId = id
         storage.set(id, forKey: StorageKeys.deviceId)
+        _ = storage.synchronize()
         return true
     }
 
@@ -262,11 +330,57 @@ final class ContextManager: @unchecked Sendable {
         guard timestamp.timeIntervalSince(sessionLastSeen) > SDKDefaults.sessionTimeoutSeconds else {
             return false
         }
+        oweEndOfCurrentSession()
         _sessionId = UUID().uuidString
         sessionLastSeen = timestamp
+        sessionStartedAt = timestamp
+        (sessionAppVersion, sessionAppBuild) = appIdentity()
         _isNewSession = true
         persistIds()
         return true
+    }
+
+    /// Bumps the session's last activity as the app leaves the foreground, so the duration of a
+    /// session that saw no event since it began still covers the time on screen. A no-op once
+    /// the idle window has already elapsed: touching would revive a session `rolloverIfExpired()`
+    /// is about to end.
+    func touchSessionIfLive() {
+        lock.lock()
+        defer { lock.unlock() }
+        let timestamp = now()
+        guard _sessionId != nil, !(timestamp.timeIntervalSince(sessionLastSeen) > SDKDefaults.sessionTimeoutSeconds) else { return }
+        sessionLastSeen = timestamp
+        storage.set(String(sessionLastSeen.timeIntervalSince1970), forKey: StorageKeys.sessionLastSeen)
+    }
+
+    /// The session owed a `$session_end`, if any, cleared so it is announced once in this process.
+    /// The caller queues the event and then calls `markSessionEndQueued(_:)`.
+    func takeEndedSession() -> EndedSession? {
+        lock.lock()
+        defer { lock.unlock() }
+        guard let ended = _endedSession else { return nil }
+        _endedSession = nil
+        return ended
+    }
+
+    /// Records, after its event is queued, that `id`'s end was announced, so a relaunch before a new
+    /// session is stored does not announce it again. Flushed: a kill right after must not repeat it.
+    func markSessionEndQueued(_ id: String) {
+        lock.lock()
+        defer { lock.unlock() }
+        storage.set(id, forKey: StorageKeys.sessionEndedId)
+        _ = storage.synchronize()
+    }
+
+    /// Callers hold `lock`. The live session, if it was announced and its identity is known, is
+    /// owed an end at its last activity.
+    private func oweEndOfCurrentSession(requireAnnounced: Bool = false) {
+        // An end already owed is kept. `reset()` also skips a session whose `$session_start` is
+        // still unannounced (a rollover just minted it): it has nothing to end yet.
+        guard _endedSession == nil, !(requireAnnounced && _isNewSession), let id = _sessionId, let started = sessionStartedAt else { return }
+        _endedSession = EndedSession(
+            id: id, startedAt: started, endedAt: sessionLastSeen,
+            appVersion: sessionAppVersion, appBuild: sessionAppBuild)
     }
 
     /// Returns whether a `$session_start` is owed, clearing the flag so the
@@ -356,6 +470,9 @@ final class ContextManager: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         _userId = nil
+        // The outgoing session was announced with `$session_start` (unless it is one `reset()`
+        // itself opened), so it is owed its end; leaving it out would orphan every logout's session.
+        oweEndOfCurrentSession(requireAnnounced: true)
         // The server-held label is not touched here: logout does not change the device row. When
         // that row may hold a user, `SheepitClient.reset()` switches to a fresh device
         // (`DeviceRotation`), which sets the label for the new row.
@@ -367,8 +484,13 @@ final class ContextManager: @unchecked Sendable {
             _sessionId = nil
             sessionLastSeen = .distantPast
             storage.removeObject(forKey: StorageKeys.sessionId)
+            storage.removeObject(forKey: StorageKeys.sessionStartedAt)
             storage.removeObject(forKey: StorageKeys.sessionLastSeen)
         }
+        // The session `reset()` opens is never announced, so it is never ended either: a
+        // `$session_end` with no `$session_start` would skew the pair.
+        sessionStartedAt = nil
+        storage.removeObject(forKey: StorageKeys.sessionStartedAt)
         // Deliberately does NOT set `_isNewSession`. `reset()` mints a new
         // session id on the web too (`context.ts:162`), and the JS SDK does
         // not emit `$session_start` for it either — the emit lives only on
@@ -386,6 +508,17 @@ final class ContextManager: @unchecked Sendable {
     func eventContext() -> EventContextSnapshot {
         lock.lock()
         defer { lock.unlock() }
+        return eventContextLocked()
+    }
+
+    /// Sampling never waits behind storage work holding the existing context lock.
+    func tryEventContext() -> EventContextSnapshot? {
+        guard lock.try() else { return nil }
+        defer { lock.unlock() }
+        return eventContextLocked()
+    }
+
+    private func eventContextLocked() -> EventContextSnapshot {
         let live = now().timeIntervalSince(sessionLastSeen) <= SDKDefaults.sessionTimeoutSeconds
         return EventContextSnapshot(
             deviceId: _deviceId,
@@ -411,6 +544,13 @@ final class ContextManager: @unchecked Sendable {
         guard let sessionId = _sessionId else { return }
         storage.set(sessionId, forKey: StorageKeys.sessionId)
         storage.set(String(sessionLastSeen.timeIntervalSince1970), forKey: StorageKeys.sessionLastSeen)
+        if let sessionStartedAt {
+            storage.set(String(sessionStartedAt.timeIntervalSince1970), forKey: StorageKeys.sessionStartedAt)
+        } else {
+            storage.removeObject(forKey: StorageKeys.sessionStartedAt)
+        }
+        storage.set(sessionAppVersion ?? "", forKey: StorageKeys.sessionAppVersion)
+        storage.set(sessionAppBuild ?? "", forKey: StorageKeys.sessionAppBuild)
     }
 
     private func persistIdentity() {
@@ -423,6 +563,26 @@ final class ContextManager: @unchecked Sendable {
 }
 
 // MARK: - Supporting Types
+
+/// A session that has aged out, with when it was last active: what `$session_end` reports.
+struct EndedSession: Sendable, Equatable {
+    let id: String
+    let startedAt: Date
+    let endedAt: Date
+    /// What the session began under; `$session_end` is stamped with it, not the running build.
+    var appVersion: String? = nil
+    var appBuild: String? = nil
+
+    /// Whole milliseconds between the start and the last activity; never negative (a wall-clock
+    /// step backwards would otherwise produce one).
+    var durationMs: Int {
+        let ms = (endedAt.timeIntervalSince(startedAt) * 1000).rounded()
+        // `Int(_:)` traps on NaN and out-of-range values; clamp first (30 days is far past any session).
+        guard ms.isFinite, ms > 0 else { return 0 }
+        // Below `Int32.max` (about 23 days): `Int` is 32 bits on watchOS arm64_32.
+        return Int(min(ms, 2_000_000_000))
+    }
+}
 
 struct EventContextSnapshot: Sendable {
     let deviceId: String

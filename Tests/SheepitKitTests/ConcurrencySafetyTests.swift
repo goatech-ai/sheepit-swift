@@ -129,7 +129,7 @@ final class ConcurrencySafetyTests: XCTestCase {
             if index.isMultiple(of: 4) {
                 manager.setAssignments([:], appliedUnderUserId: nil)
             } else {
-                _ = manager.resolve(experimentKey: "exp") { _, _, _ in }
+                _ = manager.resolve(experimentKey: "exp") { _, _, _, _ in }
                 _ = manager.count()
             }
         }
@@ -185,7 +185,7 @@ final class ConcurrencySafetyTests: XCTestCase {
     func testExperimentExposureCallbackCanReenterTheManager() {
         let manager = ExperimentManager(storage: InMemoryStorage())
         let count = Box<Int>(-1)
-        _ = manager.resolve(experimentKey: "missing") { _, _, _ in
+        _ = manager.resolve(experimentKey: "missing") { _, _, _, _ in
             count.value = manager.count()
         }
         // Not enrolled → no exposure fires; prove the un-enrolled path

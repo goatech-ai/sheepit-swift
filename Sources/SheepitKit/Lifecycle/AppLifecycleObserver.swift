@@ -51,6 +51,11 @@ final class AppLifecycleObserver: @unchecked Sendable {
     /// `register()` installs the observer that reads it.
     var onForeground: (@Sendable () async -> Void)?
 
+    /// Runs synchronously as the app leaves the foreground, before the flush: it records the
+    /// session's last activity, which is what a later `$session_end` reports. Assigned once,
+    /// before `register()`.
+    var onEnterBackground: (@Sendable () -> Void)?
+
     init(
         log: Logger,
         diagnostics: DiagnosticBus?,
@@ -125,6 +130,7 @@ final class AppLifecycleObserver: @unchecked Sendable {
 
     /// What `didEnterBackgroundNotification` does to the state, before its flush.
     func appDidEnterBackground() {
+        onEnterBackground?()
         appState.markBackground()
     }
 

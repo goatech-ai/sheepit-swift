@@ -56,7 +56,7 @@ final class ConfigResetRaceTests: XCTestCase {
             log: Logger(debug: false),
             resetGate: gate,
             identityProvider: { (.fetchedUnder(nil), 0) },
-            onConfig: { _, _ in applied.mutate { $0 += 1 } }
+            onConfig: { _, _, _ in applied.mutate { $0 += 1 } }
         )
     }
 

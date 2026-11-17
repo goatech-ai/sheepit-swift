@@ -14,8 +14,7 @@ final class IdentifyRetryTests: XCTestCase {
         guard let defaults = UserDefaults(suiteName: suite) else { return }
         for key in [StorageKeys.sdkConfig, StorageKeys.sdkConfigCachedAt,
                     StorageKeys.sdkConfigFetchedUnder, StorageKeys.serverHeldUser,
-                    StorageKeys.identity, StorageKeys.deviceRegistrationBackoffUntil,
-                    StorageKeys.deviceRegistrationBackoffSDKVersion, StorageKeys.deviceBindAttempted] {
+                    StorageKeys.identity, StorageKeys.deviceRegistrationBackoff, StorageKeys.deviceBindAttempted] {
             SharedSDKStorage.remove(key, from: defaults)
         }
     }
@@ -35,7 +34,7 @@ final class IdentifyRetryTests: XCTestCase {
     }
 
     private static let configBody = #"""
-    {"data":{"config_version":"7","etag":"\"v7\"","flags":{},"experiments":{
+    {"data":{"assignment_token":"receipt-fixture","config_version":"7","etag":"\"v7\"","flags":{},"experiments":{
       "pricing_test":{"variant_key":"treatment","payload":{},"experiment_id":"11111111-1111-4111-8111-111111111111","subject_kind":"user","bucketing_version":1,"assignment_revision":"7"},
       "onboarding_test":{"variant_key":"b","payload":{},"experiment_id":"22222222-2222-4222-8222-222222222222","subject_kind":"device","bucketing_version":1,"assignment_revision":"7"}}}}
     """#
@@ -129,10 +128,10 @@ final class IdentifyRetryTests: XCTestCase {
         XCTAssertEqual(client.context.serverHeldUser.user, .known(nil), "the new row holds nobody")
         let event = try XCTUnwrap(AttributionCaptureProtocol.event(named: name))
         let context = try XCTUnwrap(event["context"] as? [String: Any])
-        let experiments = context["experiments"] as? [String: Any] ?? [:]
-        let entries = context["experiment_assignments"] as? [String: [String: Any]] ?? [:]
-        XCTAssertNil(entries["pricing_test"]?["subject_status"], "bucketed for the anonymous row it is sent from")
-        XCTAssertEqual(experiments["onboarding_test"] as? String, "b", "precondition: the refetch was applied")
+        XCTAssertNil(context["assignment_status"], "bucketed for the anonymous row it is sent from")
+        XCTAssertEqual(context["assignment_token"] as? String, "receipt-fixture", "the refetch receipt was applied")
+        XCTAssertNil(context["experiments"])
+        XCTAssertNil(context["experiment_assignments"])
         XCTAssertEqual(posts(for: userA), 2, "nothing is re-sent for a logged-out user")
     }
 
@@ -454,15 +453,13 @@ final class IdentifyRetryTests: XCTestCase {
     /// While registration is backed off after a terminal failure the device is not on the server,
     /// so a retry can only 404.
     func testNoIdentifyRetryWhileDeviceRegistrationIsBackedOff() async throws {
-        let defaults = try XCTUnwrap(UserDefaults(suiteName: Self.suite))
         let client = makeClient()
         defer { client.destroy() }
         await waitForStartupFetch()
         let userA = uniqueUser("user-a")
 
         await identifyWithFailedPost(client, userA)
-        defaults.set(String(Date().timeIntervalSince1970 + 3600), forKey: SharedSDKStorage.slot(StorageKeys.deviceRegistrationBackoffUntil))
-        defaults.set(SDKDefaults.sdkVersion, forKey: SharedSDKStorage.slot(StorageKeys.deviceRegistrationBackoffSDKVersion))
+        SharedSDKStorage.seedBackoff(until: Date().addingTimeInterval(3600))
         client.configRefreshTickForTesting()
         await client.awaitIdentityPostForTesting()
 
@@ -525,8 +522,9 @@ final class IdentifyRetryTests: XCTestCase {
         await client.awaitIdentityPostForTesting()
 
         XCTAssertEqual(AttributionCaptureProtocol.identifyDeviceIds, [unknown, fresh])
-        XCTAssertNil(AttributionCaptureProtocol.registerBodies.last?["device_id"],
-                     "the replacement id is server-minted; the dead one is never re-registered")
+        let proposed = AttributionCaptureProtocol.registerBodies.last?["device_id"] as? String
+        XCTAssertNotNil(proposed, "the replacement proposes a fresh local id (contract § 1)")
+        XCTAssertNotEqual(proposed, unknown, "the dead id is never re-registered")
         XCTAssertEqual(client.context.deviceId, fresh)
         XCTAssertEqual(client.context.serverHeldUser.user, .known(userA))
         let recovered = try XCTUnwrap(diagnostics(client, "identity.identify_recovered").last)
@@ -623,15 +621,14 @@ final class IdentifyRetryTests: XCTestCase {
         let userA = uniqueUser("user-a")
         let device = client.context.deviceId
         let registersBefore = AttributionCaptureProtocol.registerRequestCount
-        defaults.set(String(Date().timeIntervalSince1970 + 3600), forKey: SharedSDKStorage.slot(StorageKeys.deviceRegistrationBackoffUntil))
-        defaults.set(SDKDefaults.sdkVersion, forKey: SharedSDKStorage.slot(StorageKeys.deviceRegistrationBackoffSDKVersion))
+        SharedSDKStorage.seedBackoff(until: Date().addingTimeInterval(3600))
 
         await identifyWithFailedPost(client, userA, reply: .notFound)
         XCTAssertEqual(AttributionCaptureProtocol.registerRequestCount, registersBefore)
         XCTAssertEqual(client.context.deviceId, device)
         XCTAssertEqual(diagnostics(client, "identity.device_replacement_deferred").count, 1)
 
-        SharedSDKStorage.remove(StorageKeys.deviceRegistrationBackoffUntil, from: defaults)
+        SharedSDKStorage.remove(StorageKeys.deviceRegistrationBackoff, from: defaults)
         AttributionCaptureProtocol.setIdentifyReply(.status(200), for: userA)
         client.configRefreshTickForTesting()
         await client.awaitIdentityPostForTesting()
@@ -652,7 +649,7 @@ final class IdentifyRetryTests: XCTestCase {
         await identifyWithFailedPost(client, userA, reply: .notFound)
 
         XCTAssertEqual(client.context.deviceId, device)
-        XCTAssertTrue(RegistrationBackoff.isActive(storage: SharedSDKStorage.slotStorage(), now: Date()))
+        XCTAssertGreaterThan(SharedSDKStorage.backoffRecord()?.until ?? 0, Date().timeIntervalSince1970)
         let failure = try XCTUnwrap(diagnostics(client, "identity.device_replacement_failed").last)
         XCTAssertEqual(failure.data?["outcome"]?.value as? String, "device_cap_reached")
     }
@@ -733,8 +730,8 @@ final class IdentifyRetryTests: XCTestCase {
         AttributionCaptureProtocol.setIdentifyReply(.sequence([.notFound, .status(200)]), for: userA)
         let defaults = try XCTUnwrap(UserDefaults(suiteName: SharedSDKStorage.suite))
         let observer = DeviceIdWriteObserver(watching: fresh)
-        defaults.addObserver(observer, forKeyPath: StorageKeys.deviceId, options: [.new], context: nil)
-        defer { defaults.removeObserver(observer, forKeyPath: StorageKeys.deviceId) }
+        defaults.addObserver(observer, forKeyPath: SharedSDKStorage.slot(StorageKeys.deviceId), options: [.new], context: nil)
+        defer { defaults.removeObserver(observer, forKeyPath: SharedSDKStorage.slot(StorageKeys.deviceId)) }
 
         client.identify(userId: userA)
         await client.awaitIdentityPostForTesting()

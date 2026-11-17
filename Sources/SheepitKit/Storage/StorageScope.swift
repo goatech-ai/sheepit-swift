@@ -10,24 +10,28 @@ import Foundation
 /// rejection: that install stayed anonymous for good. A's cached config, registration backoff,
 /// server-held label and offline queue leaked into B the same way.
 ///
-/// Scoped: the server's knowledge of this device (`scopedKeys`) and the offline queue, whose events
-/// were stamped for one project and must not be sent with another's key. Shared: the device and
-/// anonymous ids (registering in a new scope sends the existing id and the server upserts that
-/// environment's row, so one install stays one device everywhere), the app's own `identity`, the
-/// session, the markers, and `deviceBindAttempted`: a bind in any scope is a fact about the shared
-/// device, so `reset()` in every scope must rotate it (over-rotating is safe, under-rotating leaks
-/// the user's targeting). sdk-js counterpart: `tenancyScopeHash` in `config-sync.ts`; it scopes the
-/// device id, where Swift shares it and scopes the offline queue instead.
+/// Scoped: the device id (since 0.10.0, matching sdk-js's `gt_device_id:<scope>`; contract
+/// `Docs/Technical/SDK_DEVICE_REGISTRATION_CONTRACT.md`), the server's knowledge of this device
+/// (`scopedKeys`) and the offline queue, whose events were stamped for one project and must not be
+/// sent with another's key. A pre-0.10.0 unscoped device id is carried into the first scope that
+/// launches and then deleted (`retireLegacyDeviceId`), so a second scope mints its own. Shared: the
+/// anonymous id, the app's own `identity`, the session, the markers, and `deviceBindAttempted`: it
+/// is a set of ids, and a `reset()` in a scope rotates when it holds that scope's current id. sdk-js
+/// counterpart: `tenancyScopeHash` in `config-sync.ts`.
 enum StorageScope {
     /// The keys `ScopedStorage` moves into a slot. Every other key passes through unchanged.
     static let scopedKeys: Set<String> = [
+        StorageKeys.deviceId,
         StorageKeys.deviceRegistered,
         StorageKeys.serverHeldUser,
         StorageKeys.sdkConfig,
         StorageKeys.sdkConfigCachedAt,
         StorageKeys.sdkConfigFetchedUnder,
-        StorageKeys.deviceRegistrationBackoffUntil,
-        StorageKeys.deviceRegistrationBackoffSDKVersion,
+        StorageKeys.sdkConfigResolvedFor,
+        StorageKeys.deviceRegisteredAppVersion,
+        StorageKeys.deviceRegistrationBackoff,
+        StorageKeys.legacyDeviceRegistrationBackoffUntil,
+        StorageKeys.legacyDeviceRegistrationBackoffSDKVersion,
         StorageKeys.offlineQueue,
     ]
 
@@ -96,7 +100,7 @@ enum StorageScope {
     /// Serialises the upgrade across every client in the process: two clients on different keys
     /// beginning work at once must not both adopt the same legacy queue. Assumes the suite is not
     /// shared across processes (an App Group): a lock cannot serialise another process.
-    private static let adoptionLock = NSLock()
+    static let adoptionLock = NSLock()
 
     /// The upgrade from an SDK that kept this state unscoped, run from `beginWork()` (never from
     /// `init`: a constructed-but-unpublished `initialize()` loser must write nothing).
@@ -128,7 +132,9 @@ enum StorageScope {
             BindMarker.insert(deviceId, in: raw)
         }
         var discarded = false
-        for key in scopedKeys where key != StorageKeys.offlineQueue {
+        // The device id is not server knowledge to discard: `ContextManager` carried it into this
+        // slot, and `retireLegacyDeviceId` deletes it once that slot is written.
+        for key in scopedKeys where key != StorageKeys.offlineQueue && key != StorageKeys.deviceId {
             guard raw.data(forKey: key) != nil || raw.string(forKey: key) != nil else { continue }
             raw.removeObject(forKey: key)
             discarded = true
@@ -140,6 +146,30 @@ enum StorageScope {
         }
         guard discarded || queue != nil else { return nil }
         return Adoption(serverStateDiscarded: discarded, queue: queue ?? .init(kept: 0, trimmed: 0, unencodable: 0))
+    }
+}
+
+extension StorageScope {
+    /// Deletes an unscoped `gt_device_id` whenever this scope's slot durably holds an id, on EVERY
+    /// `beginWork()`: the sdk-js `migrateUnscopedDeviceId()` semantics. Left in place, a frozen id
+    /// (possibly one a user was bound to) would migrate straight into any later scope, a rotated key
+    /// or a drifted `apiUrl`, reattaching traffic to that device; so a second scope on the same
+    /// install mints its own.
+    ///
+    /// 🔴 Gated on "the slot is populated and flushed", NOT on "the legacy id equals this client's
+    /// id": a downgrade to 0.9.x and back writes a FRESH unscoped id while the slot keeps its own,
+    /// and an equality gate would leave that one behind for the next scope to adopt. When the slot
+    /// write did not stick (empty after `persistOnBeginWork`, or `synchronize()` failed), the legacy
+    /// key is kept and the next `beginWork()` tries again.
+    @discardableResult
+    static func retireLegacyDeviceId(raw: StorageProvider, scoped: StorageProvider) -> Bool {
+        adoptionLock.lock()
+        defer { adoptionLock.unlock() }
+        guard raw.string(forKey: StorageKeys.deviceId) != nil else { return false }
+        guard scoped.string(forKey: StorageKeys.deviceId) != nil, scoped.synchronize() else { return false }
+        raw.removeObject(forKey: StorageKeys.deviceId)
+        _ = raw.synchronize()
+        return true
     }
 }
 
@@ -164,4 +194,5 @@ final class ScopedStorage: StorageProvider, @unchecked Sendable {
     func data(forKey key: String) -> Data? { base.data(forKey: resolve(key)) }
     func set(_ value: Data?, forKey key: String) { base.set(value, forKey: resolve(key)) }
     func removeObject(forKey key: String) { base.removeObject(forKey: resolve(key)) }
+    func synchronize() -> Bool { base.synchronize() }
 }

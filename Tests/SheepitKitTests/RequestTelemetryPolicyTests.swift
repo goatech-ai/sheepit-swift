@@ -46,6 +46,9 @@ final class RequestTelemetryPolicyTests: XCTestCase {
         let vectors = [
             "example.com%2Fevil", "exa%2Fmple.com", "exa%00mple.com", "example.com%00",
             ".example.com", "example..com", "a\\b.com", "exa\u{7}mple.com", "*..example.com", "*.%2Fcom.example",
+            // Double-encoded: `%2541` decodes to a literal `%41` on every OS, so this vector guards
+            // the residual-`%` refusal without depending on how a given OS decodes `%00`.
+            "exa%2541mple.com",
         ]
         for vector in vectors {
             let policy = RequestTelemetryPolicy(hosts: [vector], apiUrl: "https://api.sheepit.ai")

@@ -16,10 +16,11 @@ enum SharedSDKStorage {
 
     static let keys: [String] = [
         StorageKeys.deviceId, StorageKeys.anonymousId, StorageKeys.identity, StorageKeys.sdkConfig,
-        StorageKeys.sdkConfigCachedAt, StorageKeys.sdkConfigFetchedUnder, StorageKeys.serverHeldUser,
-        StorageKeys.offlineQueue, StorageKeys.sessionId, StorageKeys.sessionLastSeen,
+        StorageKeys.sdkConfigCachedAt, StorageKeys.sdkConfigFetchedUnder, StorageKeys.sdkConfigResolvedFor, StorageKeys.serverHeldUser,
+        StorageKeys.offlineQueue, StorageKeys.sessionId, StorageKeys.sessionLastSeen, StorageKeys.sessionStartedAt, StorageKeys.sessionEndedId, StorageKeys.sessionAppVersion, StorageKeys.sessionAppBuild,
         StorageKeys.experimentAssignments, StorageKeys.deviceRegistered, StorageKeys.deviceBindAttempted,
-        StorageKeys.deviceRegistrationBackoffUntil, StorageKeys.deviceRegistrationBackoffSDKVersion,
+        StorageKeys.deviceRegisteredAppVersion, StorageKeys.deviceRegistrationBackoff,
+        StorageKeys.legacyDeviceRegistrationBackoffUntil, StorageKeys.legacyDeviceRegistrationBackoffSDKVersion,
         StorageKeys.installedAppVersion,
     ]
 
@@ -50,10 +51,36 @@ enum SharedSDKStorage {
     @discardableResult
     static func markRegistered(_ deviceId: String? = nil) -> String {
         let defaults = UserDefaults(suiteName: suite)
-        let id = deviceId ?? defaults?.string(forKey: StorageKeys.deviceId) ?? UUID().uuidString
-        defaults?.set(id, forKey: StorageKeys.deviceId)
+        let id = deviceId ?? currentDeviceId() ?? UUID().uuidString.lowercased()
+        defaults?.set(id, forKey: slot(StorageKeys.deviceId))
         defaults?.set(id, forKey: slot(StorageKeys.deviceRegistered))
+        defaults?.set(registeredAppVersion, forKey: slot(StorageKeys.deviceRegisteredAppVersion))
         return id
+    }
+
+    /// The standard config's device id: its slot, else a not-yet-adopted legacy unscoped one.
+    static func currentDeviceId() -> String? {
+        let defaults = UserDefaults(suiteName: suite)
+        return defaults?.string(forKey: slot(StorageKeys.deviceId)) ?? defaults?.string(forKey: StorageKeys.deviceId)
+    }
+
+    /// The app version the registered marker records for a client with no `appVersion` override.
+    static var registeredAppVersion: String { DeviceProfile.wireAppVersion(override: nil) ?? "" }
+
+    /// The standard config's backoff record, if any.
+    static func backoffRecord() -> RegistrationBackoffRecord? {
+        guard let raw = UserDefaults(suiteName: suite)?.string(forKey: slot(StorageKeys.deviceRegistrationBackoff)) else {
+            return nil
+        }
+        return try? JSONDecoder().decode(RegistrationBackoffRecord.self, from: Data(raw.utf8))
+    }
+
+    /// Seeds the standard config's backoff record (`sdkVersion` defaults to this build's).
+    static func seedBackoff(until: Date, failuresTotal: Int = 1, sdkVersion: String = SDKDefaults.sdkVersion) {
+        RegistrationBackoff.write(
+            RegistrationBackoffRecord(until: until.timeIntervalSince1970, failuresTotal: failuresTotal, writtenBy: sdkVersion),
+            storage: slotStorage()
+        )
     }
 
     /// Seeds "an identify POST was sent for `deviceId`" in the shared bind marker, in its current
@@ -71,7 +98,7 @@ enum SharedSDKStorage {
     static func isRegistered() -> Bool {
         let defaults = UserDefaults(suiteName: suite)
         guard let registered = defaults?.string(forKey: slot(StorageKeys.deviceRegistered)) else { return false }
-        return registered == defaults?.string(forKey: StorageKeys.deviceId)
+        return registered == currentDeviceId()
     }
 
     /// The real suite as a client on that config sees it.

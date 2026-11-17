@@ -78,7 +78,7 @@ final class LogoutClearsTargetingTests: XCTestCase {
         let mgr = ExperimentManager(storage: InMemoryStorage())
         mgr.setAssignments(["pricing_test": try assignment(variant: "treatment")], appliedUnderUserId: nil)
 
-        mgr.clearAssignments()
+        mgr.beginIdentitySwitch(to: "user-x")
 
         XCTAssertEqual(
             mgr.count(), 1, "identify() must not drop the server's current bucketing")
@@ -165,7 +165,7 @@ final class LogoutClearsTargetingTests: XCTestCase {
             refreshInterval: 60,
             log: Logger(debug: false),
             identityProvider: { (.fetchedUnder(nil), 0) },
-            onConfig: { _, _ in })
+            onConfig: { _, _, _ in })
         await sync.clearCache()
 
         XCTAssertNil(storage.data(forKey: StorageKeys.sdkConfig))

@@ -100,11 +100,13 @@ final class AppInstallAndUpdateEmissionTests: XCTestCase {
         let originalMarker = defaults.string(forKey: StorageKeys.installedAppVersion)
         defer {
             if let originalDeviceId { defaults.set(originalDeviceId, forKey: StorageKeys.deviceId) }
-            else { defaults.removeObject(forKey: StorageKeys.deviceId) }
+            else { SharedSDKStorage.remove(StorageKeys.deviceId, from: defaults) }
             if let originalMarker { defaults.set(originalMarker, forKey: StorageKeys.installedAppVersion) }
             else { defaults.removeObject(forKey: StorageKeys.installedAppVersion) }
         }
-        defaults.removeObject(forKey: StorageKeys.deviceId)
+        // Every slot too: the device id is scoped (0.10.0), and a slot left by an earlier suite
+        // would make this launch an existing install.
+        SharedSDKStorage.remove(StorageKeys.deviceId, from: defaults)
         defaults.removeObject(forKey: StorageKeys.installedAppVersion)
 
         let recorder = EventLifecycleRecorder()
@@ -134,11 +136,11 @@ final class AppInstallAndUpdateEmissionTests: XCTestCase {
         let originalMarker = defaults.string(forKey: StorageKeys.installedAppVersion)
         defer {
             if let originalDeviceId { defaults.set(originalDeviceId, forKey: StorageKeys.deviceId) }
-            else { defaults.removeObject(forKey: StorageKeys.deviceId) }
+            else { SharedSDKStorage.remove(StorageKeys.deviceId, from: defaults) }
             if let originalMarker { defaults.set(originalMarker, forKey: StorageKeys.installedAppVersion) }
             else { defaults.removeObject(forKey: StorageKeys.installedAppVersion) }
         }
-        defaults.removeObject(forKey: StorageKeys.deviceId)
+        SharedSDKStorage.remove(StorageKeys.deviceId, from: defaults)
         defaults.removeObject(forKey: StorageKeys.installedAppVersion)
         // `SheepitClient` hardcodes its `UserDefaults` suite, so a session left behind by
         // an earlier test would still be live (well within the 30-minute timeout) and no
@@ -175,7 +177,7 @@ final class AppInstallAndUpdateEmissionTests: XCTestCase {
         let originalMarker = defaults.string(forKey: StorageKeys.installedAppVersion)
         defer {
             if let originalDeviceId { defaults.set(originalDeviceId, forKey: StorageKeys.deviceId) }
-            else { defaults.removeObject(forKey: StorageKeys.deviceId) }
+            else { SharedSDKStorage.remove(StorageKeys.deviceId, from: defaults) }
             if let originalMarker { defaults.set(originalMarker, forKey: StorageKeys.installedAppVersion) }
             else { defaults.removeObject(forKey: StorageKeys.installedAppVersion) }
         }
@@ -203,7 +205,7 @@ final class AppInstallAndUpdateEmissionTests: XCTestCase {
         let originalMarker = defaults.string(forKey: StorageKeys.installedAppVersion)
         defer {
             if let originalDeviceId { defaults.set(originalDeviceId, forKey: StorageKeys.deviceId) }
-            else { defaults.removeObject(forKey: StorageKeys.deviceId) }
+            else { SharedSDKStorage.remove(StorageKeys.deviceId, from: defaults) }
             if let originalMarker { defaults.set(originalMarker, forKey: StorageKeys.installedAppVersion) }
             else { defaults.removeObject(forKey: StorageKeys.installedAppVersion) }
         }
@@ -229,7 +231,7 @@ final class AppInstallAndUpdateEmissionTests: XCTestCase {
         let originalMarker = defaults.string(forKey: StorageKeys.installedAppVersion)
         defer {
             if let originalDeviceId { defaults.set(originalDeviceId, forKey: StorageKeys.deviceId) }
-            else { defaults.removeObject(forKey: StorageKeys.deviceId) }
+            else { SharedSDKStorage.remove(StorageKeys.deviceId, from: defaults) }
             if let originalMarker { defaults.set(originalMarker, forKey: StorageKeys.installedAppVersion) }
             else { defaults.removeObject(forKey: StorageKeys.installedAppVersion) }
         }
@@ -264,7 +266,7 @@ final class AppInstallAndUpdateEmissionTests: XCTestCase {
         let originalMarker = defaults.string(forKey: StorageKeys.installedAppVersion)
         defer {
             if let originalDeviceId { defaults.set(originalDeviceId, forKey: StorageKeys.deviceId) }
-            else { defaults.removeObject(forKey: StorageKeys.deviceId) }
+            else { SharedSDKStorage.remove(StorageKeys.deviceId, from: defaults) }
             if let originalMarker { defaults.set(originalMarker, forKey: StorageKeys.installedAppVersion) }
             else { defaults.removeObject(forKey: StorageKeys.installedAppVersion) }
         }
@@ -299,7 +301,7 @@ final class AppInstallAndUpdateEmissionTests: XCTestCase {
         let originalMarker = defaults.string(forKey: StorageKeys.installedAppVersion)
         defer {
             if let originalDeviceId { defaults.set(originalDeviceId, forKey: StorageKeys.deviceId) }
-            else { defaults.removeObject(forKey: StorageKeys.deviceId) }
+            else { SharedSDKStorage.remove(StorageKeys.deviceId, from: defaults) }
             if let originalMarker { defaults.set(originalMarker, forKey: StorageKeys.installedAppVersion) }
             else { defaults.removeObject(forKey: StorageKeys.installedAppVersion) }
         }
@@ -343,7 +345,7 @@ final class AppInstallAndUpdateEmissionTests: XCTestCase {
         let originalMarker = defaults.string(forKey: StorageKeys.installedAppVersion)
         defer {
             if let originalDeviceId { defaults.set(originalDeviceId, forKey: StorageKeys.deviceId) }
-            else { defaults.removeObject(forKey: StorageKeys.deviceId) }
+            else { SharedSDKStorage.remove(StorageKeys.deviceId, from: defaults) }
             if let originalMarker { defaults.set(originalMarker, forKey: StorageKeys.installedAppVersion) }
             else { defaults.removeObject(forKey: StorageKeys.installedAppVersion) }
         }

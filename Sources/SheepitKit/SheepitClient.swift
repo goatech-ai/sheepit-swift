@@ -125,36 +125,48 @@ public final class SheepitClient: @unchecked Sendable {
     // MARK: - API key admission
 
     /// Key types the SDK understands. Matched by POSITION within the key's `_`-delimited
-    /// segments — `{vendor}_{type}_{slug}_{secret}` — never against a literal prefix.
+    /// segments — `{prefix}_{type}_{slug}_{secret}` — identically in every SDK
+    /// (`Docs/Technical/SDK_DEVICE_REGISTRATION_CONTRACT.md` § 5).
     ///
-    /// Segment 0, the vendor prefix, is deliberately never compared to anything: a published
-    /// SPM version is immutable forever, so a literal prefix compiled in here would have to
-    /// keep being minted for as long as anyone has that version pinned. Everything else is
-    /// checked, because the alternative — admitting anything containing the substring `pub`
-    /// — turns a developer's typo into a client that looks alive and silently 401s.
+    /// - prefix: `^[A-Za-z0-9][A-Za-z0-9-]{0,15}$`, never compared to a literal. The server mints
+    ///   `lp_` today and `si_` is the decided rename with permanent dual-accept (founder,
+    ///   2026-09-09); a published SPM version is immutable, so it must admit any future vendor
+    ///   prefix too. Same rule as `packages/sdk-js/src/api-key.ts`.
+    /// - type: `pub` (a `sec` or `dev` key is refused with its own message).
+    /// - slug: `[a-z0-9]{3}`; secret: `[a-f0-9]{64}` — exactly what `generateApiKey()`
+    ///   (`packages/shared/src/utils/index.ts`) mints and `apiKeyFormatSchema` accepts, so the
+    ///   tightening rejects no real key.
     ///
-    /// 🔴 LOAD-BEARING CONSTRAINT (2026-09 security follow-up to #972, finding E-002): the
-    /// key MUST have EXACTLY four segments, and **neither the vendor prefix nor the secret
-    /// may itself contain `_`.** Positional matching only works for a fixed segment count —
-    /// the previous "at least 4, sweep everything past index 2" version let a two-token
-    /// vendor prefix (e.g. `my_pub_sec_abc_<secret>`) slide a real `sec` type token into the
-    /// exempted slug slot, admitting a secret key. `{vendor}` and `{secret}` are minted by
-    /// one function (`generateApiKey`) that never puts a `_` in either, so this narrows the
-    /// format rather than breaking it — but it IS a narrowing, and the next person minting a
-    /// vendor prefix or secret alphabet must keep it `_`-free.
+    /// 🔴 LOAD-BEARING (finding E-002): EXACTLY four segments. Positional matching only works for a
+    /// fixed segment count — an "at least 4" version let a two-token prefix
+    /// (`my_pub_sec_abc_<secret>`) slide a real `sec` token into the slug slot.
     private enum APIKeyType: String {
         case publishable = "pub"
         case secret = "sec"
         case dev = "dev"
     }
 
-    /// The shape a key must have to be considered at all. Deliberately a LOWER bound on the
-    /// secret's length and no upper bound or character-set constraint beyond printable ASCII,
-    /// so the secret can grow or change encoding without stranding versions already published.
-    private static let minimumSecretLength = 32
     private static let expectedSegmentCount = 4
+    private static let prefixSegmentIndex = 0
     private static let typeSegmentIndex = 1
+    private static let slugSegmentIndex = 2
     private static let secretSegmentIndex = 3
+
+    private static func isKeyPrefix(_ segment: Substring) -> Bool {
+        guard let first = segment.unicodeScalars.first, (1...16).contains(segment.count) else { return false }
+        let alphanumeric: (Unicode.Scalar) -> Bool = {
+            ("a"..."z").contains($0) || ("A"..."Z").contains($0) || ("0"..."9").contains($0)
+        }
+        return alphanumeric(first) && segment.unicodeScalars.allSatisfy { alphanumeric($0) || $0 == "-" }
+    }
+
+    private static func isKeySlug(_ segment: Substring) -> Bool {
+        segment.count == 3 && segment.unicodeScalars.allSatisfy { ("a"..."z").contains($0) || ("0"..."9").contains($0) }
+    }
+
+    private static func isKeySecret(_ segment: Substring) -> Bool {
+        segment.count == 64 && segment.unicodeScalars.allSatisfy { ("a"..."f").contains($0) || ("0"..."9").contains($0) }
+    }
 
     /// Why this key may not drive a client-side SDK, or `nil` if it may.
     private static func rejectionReason(
@@ -171,8 +183,8 @@ public final class SheepitClient: @unchecked Sendable {
         // count — those three shapes were admitted before this fix (finding E-005).
         let segments = trimmed.split(separator: "_", omittingEmptySubsequences: false)
         let malformed = "Invalid API key format. Expected a publishable key, shaped "
-            + "{prefix}_pub_{env}_{secret} — EXACTLY four `_`-delimited segments, none of "
-            + "them empty. The vendor prefix and the secret must not themselves contain `_`."
+            + "{prefix}_pub_{env}_{secret}: an alphanumeric prefix (lp, si), a 3-character "
+            + "lowercase environment slug and a 64-character lowercase hex secret."
 
         // 🔴 2026-09 security follow-up (round 2), finding M3: this used to constrain ONLY
         // `segments[secretSegmentIndex]` to printable ASCII, leaving segment 0 (vendor) and
@@ -181,21 +193,18 @@ public final class SheepitClient: @unchecked Sendable {
         // the exact E-004 silent-401 class this guard exists to close. Checking the WHOLE
         // trimmed key subsumes the narrower secret-only check.
         guard segments.count == expectedSegmentCount,
-              segments.allSatisfy({ !$0.isEmpty }),
-              segments[typeSegmentIndex].count == 3,
+              isKeyPrefix(segments[prefixSegmentIndex]),
               let type = APIKeyType(rawValue: String(segments[typeSegmentIndex])),
-              segments[secretSegmentIndex].count >= minimumSecretLength,
+              isKeySlug(segments[slugSegmentIndex]),
+              isKeySecret(segments[secretSegmentIndex]),
               trimmed.unicodeScalars.allSatisfy(isPrintableASCII)
         else {
             return malformed
         }
 
-        // Defense in depth, not reachable today: `minimumSecretLength` (32) already rejects
-        // a secret segment short enough to equal "sec" or "dev" outright via the guard
-        // above, and the exactly-four-segment split above means the secret can never itself
-        // contain an embedded type token without also containing `_` (which would already
-        // have failed that guard). Kept so a future relaxation of either constant does not
-        // silently reopen E-002. Case-insensitive: `SEC`/`Dev` must not evade it either.
+        // Defense in depth, not reachable today: the 64-hex secret rule already rejects a secret
+        // equal to "sec" or "dev". Kept so a future relaxation does not silently reopen E-002.
+        // Case-insensitive: `SEC`/`Dev` must not evade it either.
         let secretLower = segments[secretSegmentIndex].lowercased()
         if secretLower == APIKeyType.secret.rawValue && !allowSecretKeyInClient {
             return secretKeyRejection
@@ -214,41 +223,48 @@ public final class SheepitClient: @unchecked Sendable {
         }
     }
 
-    /// 🔴 2026-09 security follow-up (round 3), finding SF-3, deliberately NOT fixed: `0x20`
-    /// (space) is printable ASCII, so `lp_pub_a c_<secret>` is admitted with a space in the
-    /// slug. Left as-is: an admitted key with a space 401s loudly against the real API — this
-    /// gate's job is stopping a typo from becoming a client that looks alive and silently
-    /// fails, and a space-containing key still fails loudly. Narrowing further risks
-    /// rejecting a legitimately space-containing value some future slug alphabet might use,
-    /// for a case that already fails safely.
+    /// Printable ASCII (space through `~`). Since 0.10.0 the key's slug and secret rules are
+    /// stricter than this; it still guards `environment`, sent verbatim as a header.
     private static func isPrintableASCII(_ scalar: Unicode.Scalar) -> Bool {
         scalar.value >= 0x20 && scalar.value < 0x7F
     }
 
-    /// Why `config.apiUrl` may not drive a client, or `nil` if it may. A malformed or empty
-    /// value (an unset env var is the common BYOC case) used to reach
-    /// `URL(string:)!` in `HTTPClient.init` and trap in release builds — this routes it
-    /// through the same inert-client path as a rejected key instead (2026-09 follow-up,
-    /// finding E-003).
+    /// Why `config.apiUrl` may not drive a client, or `nil` if it may. Identical in every SDK
+    /// (`Docs/Technical/SDK_DEVICE_REGISTRATION_CONTRACT.md` § 4). A refusal makes the client
+    /// inert (it never falls back to the default host).
     ///
-    /// 🔴 2026-09 security follow-up (round 3), finding MF-5: `url.scheme != nil` and
-    /// `url.host != nil` are the wrong checks — Foundation's `URL` returns EMPTY STRINGS for
-    /// a missing scheme/host, not `nil`. `"https://user:sup3rs3cret@"` parses with
-    /// `host == ""` (non-nil, so ADMITTED); `"://user:pass@host"` parses with
-    /// `scheme == ""` (also admitted). Both require a NON-EMPTY scheme and host, and the
-    /// scheme is further restricted to `http`/`https` — this is a REST API gateway URL, not
-    /// an arbitrary URI, so `foo://host` has no legitimate use here either.
+    /// - Must be an absolute `http`/`https` URL with a non-empty host. Foundation returns EMPTY
+    ///   strings, not nil, for a missing scheme/host (`"https://user:pass@"` parses with
+    ///   `host == ""`), so both are checked for emptiness (round 3, finding MF-5).
+    /// - REFUSED: userinfo (`user:pass@` — credentials would ride every request and be echoed into
+    ///   logs), a query string or fragment (even empty), a port outside 0…65535 or non-numeric.
+    /// - ALLOWED: plain `http`, `localhost`, IPv4/IPv6 literals and registry-style names such as
+    ///   `sheepit_api` (BYOC compose), an empty port (`http://h:`, as WHATWG parses it), and a path
+    ///   prefix (`https://app.example.com/_sheepit`). Trailing slashes are stripped by `HTTPClient`.
     private static let allowedAPIURLSchemes: Set<String> = ["http", "https"]
 
     static func apiURLRejectionReason(for apiUrl: String) -> String? {
         let trimmed = apiUrl.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard let url = URL(string: trimmed),
-              let scheme = url.scheme?.lowercased(), allowedAPIURLSchemes.contains(scheme),
-              let host = url.host, !host.isEmpty
+        let shown = redactingUserinfo(from: apiUrl)
+        guard let components = URLComponents(string: trimmed),
+              let scheme = components.scheme?.lowercased(), allowedAPIURLSchemes.contains(scheme),
+              let host = components.host, !host.isEmpty,
+              URL(string: trimmed) != nil
         else {
-            return "Invalid SheepitConfig.apiUrl \"\(redactingUserinfo(from: apiUrl))\". Expected "
+            return "Invalid SheepitConfig.apiUrl \"\(shown)\". Expected "
                 + "an absolute http(s) URL including a non-empty scheme and host, e.g. "
                 + "\"https://api.sheepit.ai\" or your self-hosted gateway's URL."
+        }
+        if components.percentEncodedUser != nil || components.percentEncodedPassword != nil {
+            return "Invalid SheepitConfig.apiUrl \"\(shown)\": it carries credentials (user:password@). "
+                + "Remove them; the SDK authenticates with its API key."
+        }
+        if components.percentEncodedQuery != nil || components.percentEncodedFragment != nil {
+            return "Invalid SheepitConfig.apiUrl \"\(shown)\": a query string or fragment is not allowed. "
+                + "Use the base URL only, optionally with a path prefix."
+        }
+        if let port = components.port, !(1...65_535).contains(port) {
+            return "Invalid SheepitConfig.apiUrl \"\(shown)\": port \(port) is out of range."
         }
         return nil
     }
@@ -388,15 +404,20 @@ public final class SheepitClient: @unchecked Sendable {
     ///   a test passes one that does, to run the iOS behaviour.
     /// - Parameter identifyRetryDelays: `identifyRetryDelaysForTesting`, set before work begins so the
     ///   launch identify POST already uses it.
+    /// - Parameter launchRegistrationRetryDelay: `launchRegistrationRetryDelayForTesting`, likewise.
+    /// - Parameter registrationJitter: `RegistrationPolicy.jitterForTesting`, likewise.
     internal static func createForTesting(
         config: SheepitConfig,
         now: @escaping @Sendable () -> Date,
         urlProtocolClasses: [AnyClass]? = nil,
         crashPendingDirectory: URL? = nil,
+        crashDirectory: URL? = nil,
         errorCaptureUptime: (@Sendable () -> TimeInterval)? = nil,
         appState: AppForegroundState? = nil,
         identifyRetryDelays: [TimeInterval]? = nil,
-        feedbackDirectory: URL? = nil
+        feedbackDirectory: URL? = nil,
+        launchRegistrationRetryDelay: (@Sendable (TimeInterval) -> Duration)? = nil,
+        registrationJitter: (@Sendable (Double) -> Double)? = nil
     ) -> SheepitClient {
         let reason = rejectionReason(
             for: config.apiKey,
@@ -408,11 +429,14 @@ public final class SheepitClient: @unchecked Sendable {
             now: now,
             urlProtocolClasses: urlProtocolClasses,
             crashPendingDirectory: crashPendingDirectory,
+            crashDirectory: crashDirectory,
             errorCaptureUptime: errorCaptureUptime,
             appState: appState,
             feedbackDirectory: feedbackDirectory
         )
         inst.identifyRetryDelaysForTesting = identifyRetryDelays
+        inst.launchRegistrationRetryDelayForTesting = launchRegistrationRetryDelay
+        if let registrationJitter { inst.registrationPolicy.jitterForTesting = registrationJitter }
         inst.beginWork()
         return inst
     }
@@ -430,12 +454,46 @@ public final class SheepitClient: @unchecked Sendable {
     /// can reach from a test — so a `reset()` wired to the wrong one was
     /// undetectable, which a mutation run proved. `@testable`-internal, so it
     /// cannot be reached by an app linking the released package.
+    ///
+    /// ⚠️ Writes the assignments alone, bypassing `ExposureDecisionGate`. A test of what a config
+    /// apply does to an exposure decision uses `applyConfigForTesting`, which is the gated path.
     internal func seedAssignmentsForTesting(
         _ assignments: [String: SDKExperimentAssignment],
-        appliedUnderUserId: String? = nil
+        appliedUnderUserId: String? = nil, assignmentToken: Any? = nil
     ) {
-        experimentManager.setAssignments(assignments, appliedUnderUserId: appliedUnderUserId)
+        experimentManager.setAssignments(assignments, appliedUnder: .fetchedUnder(appliedUnderUserId), assignmentToken: assignmentToken)
     }
+
+    /// Test-only seam: apply flags and assignments exactly as `onConfig` does, through
+    /// `ExposureDecisionGate.apply`. `@testable`-internal.
+    internal func applyConfigForTesting(
+        flags: [String: AnyCodable],
+        assignments: [String: SDKExperimentAssignment],
+        appliedUnder: ConfigIdentity,
+        origin: ConfigApplyOrigin = .server(fetch: .max),
+        assignmentToken: Any? = nil
+    ) {
+        exposureDecisionGate.apply(
+            flags: flags,
+            assignments: assignments,
+            appliedUnder: appliedUnder,
+            origin: origin,
+            assignmentToken: assignmentToken, context: context, crashReporter: crashReporter,
+            to: flagManager,
+            experimentManager
+        )
+    }
+
+    internal var crashReporterForTesting: CrashReporter? { crashReporter }
+
+    /// Test-only: `exposureDecisionGate`, so a test can prove who holds it and who waits for it.
+    internal var exposureDecisionGateForTesting: ExposureDecisionGate { exposureDecisionGate }
+
+    /// Test-only: whether an `identify()` switch still awaits its config (`ExperimentManager`).
+    internal var identitySwitchPendingForTesting: Bool { experimentManager.capture().identitySwitchPending }
+
+    /// Whether a known-to-known `identify()` holds config writes off the disk (`ConfigSync.persistHold`).
+    internal var configPersistHeldForTesting: Bool { configSync.persistHeldForTesting }
 
     /// Test-only seam: one `/v1/config` fetch through the real `ConfigSync` and its real
     /// `onConfig` wiring, so a test can prove which user id an applied config is recorded under.
@@ -480,11 +538,17 @@ public final class SheepitClient: @unchecked Sendable {
         set { identifyLock.lock(); _identifyRetryDelaysForTesting = newValue; identifyLock.unlock() }
     }
 
-    /// Test-only seam: the wait before each retry of a failed logout rotation, so a test does not
-    /// sit out the real 1 s…60 s backoff (`DeviceRotation`).
-    internal var deviceRotationRetryDelayForTesting: (@Sendable (Int) -> Duration)? {
+    /// Test-only seam: maps the policy's wait (seconds) before a logout rotation's next attempt to
+    /// the real sleep, so a test does not sit out the real backoff (`DeviceRotation`).
+    internal var deviceRotationRetryDelayForTesting: (@Sendable (TimeInterval) -> Duration)? {
         get { deviceRotation.retryDelayOverride }
         set { deviceRotation.retryDelayOverride = newValue }
+    }
+
+    /// Test-only seam: the same mapping for the launch registration's in-session waits.
+    internal var launchRegistrationRetryDelayForTesting: (@Sendable (TimeInterval) -> Duration)? {
+        get { registrationTaskLock.lock(); defer { registrationTaskLock.unlock() }; return _launchRetryDelay }
+        set { registrationTaskLock.lock(); _launchRetryDelay = newValue; registrationTaskLock.unlock() }
     }
 
     // MARK: - Internal Components
@@ -512,6 +576,8 @@ public final class SheepitClient: @unchecked Sendable {
     /// NWPathMonitor. Not part of the public surface.
     let connectivity: ConnectivityMonitor
     private let deviceManager: DeviceManager
+    /// The one registration retry/backoff policy, shared with `DeviceRotation` (`RegistrationPolicy`).
+    let registrationPolicy: RegistrationPolicy
     /// Internal, not private, so a test can read `overridesAllowedForTests` directly —
     /// see that property's doc for why. Not part of the public surface.
     let flagManager: FlagManager
@@ -519,8 +585,13 @@ public final class SheepitClient: @unchecked Sendable {
     private let configSync: ConfigSync
     /// Shared with `configSync`: `reset()` and config writes are serialized through it.
     private let configResetGate: ConfigResetGate
+    /// `flag()`'s decision and its exposure's assignments come from one applied config.
+    private let exposureDecisionGate = ExposureDecisionGate()
     /// Shared with `configSync`: where the applied config came from and when it was fetched.
     private let configFreshness: ConfigFreshnessRecorder
+    /// True while the flags in memory came from an unresolved `/v1/config` body applied to memory only
+    /// (`ConfigSync.onProvisional`); exposures then carry `config_source: "unresolved"`.
+    private let provisionalConfigApplied: LockedValue<Bool>
     /// `configStaleAfter` / `configOfflineMaxAge`, validated here because both are public `var`s.
     private let configLimits: CachedConfigLimits
     private let performanceMonitor: PerformanceMonitor?
@@ -617,6 +688,7 @@ public final class SheepitClient: @unchecked Sendable {
     /// lock-guarded-computed-property pattern.
     private let registrationTaskLock = NSLock()
     private var _registrationTask: Task<Void, Never>?
+    private var _launchRetryDelay: (@Sendable (TimeInterval) -> Duration)?
     private var registrationTask: Task<Void, Never>? {
         get { registrationTaskLock.lock(); defer { registrationTaskLock.unlock() }; return _registrationTask }
         set { registrationTaskLock.lock(); _registrationTask = newValue; registrationTaskLock.unlock() }
@@ -638,12 +710,24 @@ public final class SheepitClient: @unchecked Sendable {
     /// Logout rotation (`reset()` on a device a user may be bound to). See the type's doc.
     private let deviceRotation: DeviceRotation
     /// Refreshes the crash context after any device-id change. Built in `init`; see there.
-    private let deviceIdDidChange: @Sendable () -> Void
+    let deviceIdDidChange: @Sendable () -> Void
+    /// Runs BEFORE the in-memory device id changes (`DeviceRotation.Dependencies.beforeDeviceIdChange`).
+    private let deviceIdWillChange: @Sendable () -> Void
     /// Test-only: called with the device id every time `deviceIdDidChange` runs.
     let deviceIdChangeHookForTesting = LockedHook<String>()
     /// Test-only: called with the new session id (or "" for none) every time
     /// `sessionDidChange()` refreshes the crash context.
     let sessionChangeHookForTesting = LockedHook<String>()
+    /// Test-only: called with the exposure event's name after `flag()` / `experiment()` decided and
+    /// before it is tracked, so a test can apply a config inside that window. Nil in production.
+    let exposureDecisionHookForTesting = LockedHook<String>()
+    /// Test-only: called with the flag key INSIDE `flag()`'s decision gate, after the value was read
+    /// and before the assignments are captured, so a test can prove a config apply waits for it.
+    /// 🔴 Runs under the gate: a hook that applies a config on this thread deadlocks. Nil in production.
+    let flagDecisionInsideGateHookForTesting = LockedHook<String>()
+    /// Test-only: called with the new user right after `identify()` stores it, on the calling
+    /// thread, so a test can track an event at exactly that point. Nil in production.
+    let identifyUserIdSetHookForTesting = LockedHook<String>()
     /// The SDK's clock — same injected value `ContextManager` gets, kept here too so
     /// `deviceRegistrationBackoffActive()` can compare against it without threading a
     /// second clock through. Tests age a terminal-registration-failure backoff window with
@@ -659,6 +743,7 @@ public final class SheepitClient: @unchecked Sendable {
         now: @escaping @Sendable () -> Date = { Date() },
         urlProtocolClasses: [AnyClass]? = nil,
         crashPendingDirectory: URL? = nil,
+        crashDirectory: URL? = nil,
         errorCaptureUptime: (@Sendable () -> TimeInterval)? = nil,
         appState: AppForegroundState? = nil,
         feedbackDirectory: URL? = nil
@@ -724,7 +809,12 @@ public final class SheepitClient: @unchecked Sendable {
             storage: storage,
             now: now,
             persistOnInit: false,
-            launchedInBackground: !appState.isForeground
+            launchedInBackground: !appState.isForeground,
+            legacyStorage: rawStorage,
+            appIdentity: { [appVersion = config.appVersion] in
+                let snapshot = TrackSnapshot.capture(appVersion: appVersion)
+                return (snapshot.appVersion, snapshot.appBuild)
+            }
         )
         self.queue = EventQueue(maxSize: config.maxQueueSize, diagnostics: bus)
         self.offlineQueue = OfflineQueue(storage: storage, diagnostics: bus)
@@ -753,6 +843,13 @@ public final class SheepitClient: @unchecked Sendable {
             lastFlushClock: lastFlushClock
         )
         self.deviceManager = DeviceManager(http: http, log: log, appVersionOverride: config.appVersion)
+        self.registrationPolicy = RegistrationPolicy(
+            storage: storage,
+            diagnostics: bus,
+            log: log,
+            now: now,
+            appVersion: DeviceProfile.wireAppVersion(override: config.appVersion)
+        )
         self.flagManager = FlagManager(diagnostics: bus)
         if inertReason == nil {
             self.flagManager.setOverridesAllowed(config.allowFlagOverrides ?? config.debug)
@@ -763,57 +860,19 @@ public final class SheepitClient: @unchecked Sendable {
         // Capture managers (not self) to avoid a reference cycle.
         let fm = self.flagManager
         let em = self.experimentManager
+        let decisionGate = self.exposureDecisionGate
         let contextRef = self.context
         let logger = self.log
         let resetGate = ConfigResetGate()
         self.configResetGate = resetGate
         let freshness = ConfigFreshnessRecorder()
         self.configFreshness = freshness
+        let provisional = LockedValue(false)
+        self.provisionalConfigApplied = provisional
         let limits = CachedConfigLimits(staleAfter: config.configStaleAfter, offlineMaxAge: config.configOfflineMaxAge)
         self.configLimits = limits
         let waiters = IdentifyWaiters(serverHeldUser: { contextRef.serverHeldUser.user })
         self.identifyWaiters = waiters
-        self.configSync = ConfigSync(
-            http: http,
-            storage: storage,
-            refreshInterval: config.configRefreshInterval,
-            log: log,
-            resetGate: resetGate,
-            limits: limits,
-            now: now,
-            freshness: freshness,
-            // What the server's device row holds, not the app's id: see `ConfigSync.identityProvider`.
-            identityProvider: {
-                let held = contextRef.serverHeldUser
-                return (held.user.configIdentity, held.epoch)
-            },
-            onConfig: { response, fetchedUnder in
-                fm.setEvaluatedFlags(response.flags)
-                em.setAssignments(response.experiments, appliedUnder: fetchedUnder)
-                // Inside the reset gate: records only; the waits are decided in `onApplied`.
-                waiters.configApplied(fetchedUnder)
-                logger.debug(
-                    "Config applied: \(response.flags.count) flags, "
-                    + "\(response.experiments.count) experiments"
-                )
-            },
-            onApplied: { waiters.configAppliedOutsideGate() }
-        )
-
-        // Performance monitoring
-        if config.performance.enabled, inertReason == nil {
-            let monitor = PerformanceMonitor(
-                http: http,
-                context: context,
-                config: config.performance,
-                appVersionOverride: config.appVersion,
-                log: log
-            )
-            self.performanceMonitor = monitor
-        } else {
-            self.performanceMonitor = nil
-        }
-
         // Crash reporting
         if config.crashes.enabled, inertReason == nil {
             let reporter = CrashReporter(
@@ -824,30 +883,133 @@ public final class SheepitClient: @unchecked Sendable {
                 storage: storage,
                 log: log,
                 appState: appState,
+                crashDirectory: crashDirectory,
                 pendingDirectory: crashPendingStore.directory,
-                diagnostics: bus
+                diagnostics: bus,
+                refreshActiveState: { reporter in
+                    decisionGate.withLock {
+                        let snapshot = contextRef.eventContext()
+                        fm.refreshValuesObserver()
+                        reporter.setExperimentState(em.activeVariants())
+                        let receipt = em.receipt(eventUserId: snapshot.userId).receipt
+                        return reporter.publishIdentity(snapshot, assignmentToken: receipt.token,
+                            identityChanged: receipt.status == "identity_changed")
+                    }
+                }
             )
             self.crashReporter = reporter
+            // Every later change reaches the crash context as it happens; `refreshActiveState` covers
+            // what was applied before the handler mapped it.
+            fm.setValuesObserver { reporter.setFlagState($0) }
+            em.setVariantsObserver { reporter.setExperimentState($0) }
         } else {
             self.crashReporter = nil
+        }
+
+        let crashReporterRef = self.crashReporter
+
+        self.configSync = ConfigSync(
+            http: http,
+            storage: storage,
+            refreshInterval: config.configRefreshInterval,
+            log: log,
+            resetGate: resetGate,
+            limits: limits,
+            now: now,
+            freshness: freshness,
+            diagnostics: bus,
+            // What the server's device row holds, not the app's id: see `ConfigSync.identityProvider`.
+            identityProvider: {
+                let held = contextRef.serverHeldUser
+                return (held.user.configIdentity, held.epoch)
+            },
+            // Read under the lock a replacement's swap writes under: a response for a replaced id
+            // is discarded, never cached (`ConfigSync.isCurrentDevice`).
+            currentDeviceId: { contextRef.deviceId },
+            onConfig: { response, fetchedUnder, origin in
+                provisional.value = false
+                decisionGate.apply(
+                    flags: response.flags,
+                    assignments: response.experiments,
+                    appliedUnder: fetchedUnder,
+                    origin: origin,
+                    assignmentToken: response.rawAssignmentToken?.value,
+                    context: contextRef, crashReporter: crashReporterRef,
+                    to: fm,
+                    em
+                )
+                // Inside the reset gate: records only; the waits are decided in `onApplied`.
+                waiters.configApplied(fetchedUnder)
+                logger.debug(
+                    "Config applied: \(response.flags.count) flags, "
+                    + "\(response.experiments.count) experiments"
+                )
+            },
+            onProvisional: { response in
+                // An unresolved body, applied only while nothing else is: no user, no waiters.
+                provisional.value = true
+                // Through the gate like any apply, so a read never sees these flags with other
+                // assignments; `.provisional`, so an unresolved body never ends an identity switch.
+                decisionGate.apply(
+                    flags: response.flags,
+                    assignments: response.experiments,
+                    appliedUnder: .unknown,
+                    origin: .provisional,
+                    assignmentToken: response.rawAssignmentToken?.value,
+                    context: contextRef, crashReporter: crashReporterRef,
+                    to: fm,
+                    em
+                )
+                logger.debug("Config applied to memory only (device unresolved): \(response.flags.count) flags")
+            },
+            onApplied: { waiters.configAppliedOutsideGate() }
+        )
+
+        // Performance monitoring
+        if config.performance.enabled, inertReason == nil {
+            let contention = SamplingContentionCounter()
+            let monitor = PerformanceMonitor(
+                http: http,
+                context: context,
+                config: config.performance,
+                appVersionOverride: config.appVersion,
+                log: log,
+                captureContext: {
+                    PerfBatchContext.sample(gate: decisionGate, context: contextRef, experiments: em,
+                        appVersion: config.appVersion, diagnostics: bus, contention: contention)
+                }
+            )
+            self.performanceMonitor = monitor
+        } else {
+            self.performanceMonitor = nil
         }
 
         // One closure for every path that changes the device id (the launch registration's
         // adoption in `start()`, and both halves of a logout rotation), so crash reports
         // always carry the current id. Launch adoption used to skip it: a crash between the
         // first registration and the next context refresh shipped the pre-registration id.
-        let crashReporterRef = self.crashReporter
         let deviceIdChangeHook = self.deviceIdChangeHookForTesting
+        let perfRef = self.performanceMonitor
+        let deviceIdWillChange: @Sendable () -> Void = {
+            decisionGate.withLock { em.invalidateReceiptForDeviceChange() }
+            perfRef?.identityDidChange()
+        }
+        self.deviceIdWillChange = deviceIdWillChange
         let deviceIdDidChange: @Sendable () -> Void = {
+            decisionGate.withLock { em.invalidateReceiptForDeviceChange() }
+            // The device row a span's or window's receipt was issued for is gone.
+            perfRef?.identityDidChange()
             crashReporterRef?.updateContext()
             deviceIdChangeHook.value?(contextRef.deviceId)
         }
         self.deviceIdDidChange = deviceIdDidChange
 
         let destroyedFlagRef = self.destroyedFlag
+        let (experimentsRef, flagsRef) = (self.experimentManager, self.flagManager)
         self.deviceRotation = DeviceRotation(.init(
             context: context,
             deviceManager: deviceManager,
+            policy: registrationPolicy,
             queue: queue,
             offlineQueue: offlineQueue,
             storage: storage,
@@ -856,8 +1018,18 @@ public final class SheepitClient: @unchecked Sendable {
             registrationGate: registrationGate,
             now: now,
             isDestroyed: { destroyedFlagRef.value },
-            onDeviceIdChanged: deviceIdDidChange
+            onDeviceIdChanged: deviceIdDidChange,
+            onAnonymousDeviceReplaced: {
+                experimentsRef.clearExposures()
+                flagsRef.clearExposed()
+            },
+            beforeDeviceIdChange: deviceIdWillChange
         ))
+        // C5 (contract § 7): a resolved device answered `unknown_device` — replace it. Weak: the
+        // rotation already holds `configSync`.
+        configSync.onResolvedDeviceUnknown.value = { [weak rotation = self.deviceRotation] deviceId, outcome in
+            rotation?.replaceErasedDevice(deviceId, outcome: outcome) ?? .notCurrent
+        }
 
         // Flush on app background so queued events survive suspension.
         // `transport`/`registrationGate` are captured directly (not self) to avoid
@@ -947,6 +1119,32 @@ public final class SheepitClient: @unchecked Sendable {
     /// dropped with a logged error and a diagnostic rather than crashing the host — see
     /// `validateEventName`.
     public func track(_ eventName: String, properties: [String: Any]? = nil) {
+        track(eventName, properties: properties, decidedAssignments: nil)
+    }
+
+    /// Queues a finished session's `$session_end`: its own session id, and its last activity as
+    /// the timestamp, not the moment it is noticed.
+    private func trackSessionEnd(_ ended: EndedSession) {
+        track(
+            "$session_end",
+            properties: ["duration_ms": ended.durationMs],
+            decidedAssignments: nil,
+            endedSession: ended
+        )
+    }
+
+    /// - Parameters:
+    ///   - decidedAssignments: the set an exposure's decision was made under
+    ///     (`flag()` / `experiment()`); `nil` captures the current one.
+    ///   - exposure: what an exposure reports, so a marked one does not spend the exposure dedup
+    ///     (`ExperimentManager.receipt`).
+    private func track(
+        _ eventName: String,
+        properties: [String: Any]?,
+        decidedAssignments: ExperimentAssignmentSet?,
+        exposure: DecidedExposure? = nil,
+        endedSession: EndedSession? = nil
+    ) {
         guard !destroyedFlag.value else { return }
 
         guard let name = validateEventName(eventName) else {
@@ -975,12 +1173,18 @@ public final class SheepitClient: @unchecked Sendable {
         // Foreground only (0.6-C). In the background nothing mints, announces or extends a
         // session: the event joins the stored session while it is live (`eventContext()`)
         // and otherwise carries none. macOS and watchOS are always foreground here.
-        if appState.isForeground {
+        // A `$session_end` belongs to the session that ended, so it neither rolls over nor
+        // extends the live one.
+        if appState.isForeground, endedSession == nil {
             rolloverSessionIfExpired()
             emitSessionStartIfOwed()
             context.touchSession()
         }
-        let ctx = context.eventContext()
+        let (ctx, receipt, receiptSet) = exposureDecisionGate.withLock {
+            let snapshot = context.eventContext()
+            let set = decidedAssignments ?? experimentManager.capture()
+            return (snapshot, stampReceipt(set, exposure, eventUserId: snapshot.userId), set)
+        }
 
         let event = EnrichedEvent(
             eventId: UUID().uuidString,
@@ -988,7 +1192,7 @@ public final class SheepitClient: @unchecked Sendable {
             eventProperties: SheepitClient.withAppState(properties, appState.wireValue),
             deviceId: ctx.deviceId,
             anonymousId: ctx.anonymousId,
-            sessionId: ctx.sessionId,
+            sessionId: endedSession?.id ?? ctx.sessionId,
             userId: ctx.userId,
             platform: ctx.platform,
             sdkVersion: ctx.sdkVersion,
@@ -996,27 +1200,75 @@ public final class SheepitClient: @unchecked Sendable {
             // `Transport.context(for:)` for the calendar-extension case that exceeds it.
             locale: DeviceProfile.bounded(ctx.locale, 16),
             timezone: ctx.timezone,
-            timestamp: SheepitClient.formatEventTimestamp(Date()),
+            timestamp: SheepitClient.formatEventTimestamp(endedSession?.endedAt ?? Date()),
             // Frozen HERE, not read at flush: an event that waits in the offline queue
             // across an app update or a region change must still describe the app and
             // device that produced it (PILOT_CORRECTNESS_DESIGN.md §2.2).
-            snapshot: TrackSnapshot.capture(appVersion: config.appVersion),
-            // Also frozen here, against the SAME `ctx.userId` the event carries, so the
-            // identity comparison and the event's own user cannot disagree (§2.3). This covers
-            // `$experiment_exposure`, which is tracked through this method.
-            assignments: experimentManager.snapshot(eventUserId: ctx.userId)
+            snapshot: Self.snapshot(appVersion: config.appVersion, endedSession: endedSession),
+            // Stamped here, against the SAME `ctx.userId` the event carries, so the identity
+            // comparison and the event's own user cannot disagree (§2.3). An exposure brings the
+            // set its decision was made under, so it names the arm the app was given.
+            assignmentReceipt: receipt
         )
 
         queue.add(event)
-        crashReporter?.addBreadcrumb(category: "track", message: name)
-        config.onEvent?(name, properties)
-
+        crashReporter?.addBreadcrumb(category: "track", message: Self.trackBreadcrumbMessage(name, properties))
         if queue.size() >= config.flushSize {
             Task {
                 await awaitDeviceIdSettlementForAutoFlush()
                 await transport.flush()
             }
         }
+        // Deliberate order: the identity-change diagnostic is about THIS already-enqueued event, so it is
+        // reported before the host's `onEvent` runs; both are host callbacks, outside every SDK lock.
+        experimentManager.reportIdentityChange(receipt, set: receiptSet, eventUserId: ctx.userId)
+        config.onEvent?(name, properties)
+    }
+
+    /// The running app and device, except that a `$session_end` carries the version and build its
+    /// session began under: it is stamped at the session's last activity, which release health reads
+    /// as the session's latest event.
+    private static func snapshot(appVersion: String?, endedSession: EndedSession?) -> TrackSnapshot {
+        let now = TrackSnapshot.capture(appVersion: appVersion)
+        guard let endedSession else { return now }
+        return TrackSnapshot(
+            appVersion: endedSession.appVersion, appBuild: endedSession.appBuild,
+            appNamespace: now.appNamespace, buildChannel: now.buildChannel,
+            deviceModel: now.deviceModel, osVersion: now.osVersion, osName: now.osName,
+            deviceType: now.deviceType, country: now.country)
+    }
+
+    /// An exposure `track` is recording: which experiment arm, or which flag.
+    private enum DecidedExposure {
+        case experiment(String, variant: String)
+        case flag(String)
+    }
+
+    /// Caller holds Exposure; native identity and receipt derive from this one snapshot.
+    private func publishCrashIdentityLocked() -> Bool {
+        let snapshot = context.eventContext()
+        let receipt = experimentManager.receipt(eventUserId: snapshot.userId).receipt
+        return crashReporter?.publishIdentity(snapshot, assignmentToken: receipt.token,
+            identityChanged: receipt.status == "identity_changed") ?? false
+    }
+
+    /// Freeze the decided receipt, including explicit identity-switch status, before enqueue.
+    private func stampReceipt(
+        _ decided: ExperimentAssignmentSet?,
+        _ exposure: DecidedExposure?,
+        eventUserId: String?
+    ) -> AssignmentReceipt {
+        let result: (receipt: AssignmentReceipt, forgetFlag: Bool)
+        switch exposure {
+        case nil:
+            result = experimentManager.receipt(decided, eventUserId: eventUserId)
+        case .experiment(let key, let variant):
+            result = experimentManager.receipt(decided, eventUserId: eventUserId, experimentKey: key, variant: variant)
+        case .flag(let key):
+            result = experimentManager.receipt(decided, eventUserId: eventUserId, flagKey: key)
+            if result.forgetFlag { flagManager.forgetExposures([key]) }
+        }
+        return result.receipt
     }
 
     /// The wire timestamp for `EnrichedEvent.timestamp`. Sub-second precision
@@ -1060,32 +1312,40 @@ public final class SheepitClient: @unchecked Sendable {
     /// Evaluate a feature flag. Returns synchronously from cached config.
     public func flag(_ flagKey: String, default defaultValue: FlagValue = .bool(false)) -> FlagValue {
         guard !destroyedFlag.value else { return defaultValue }
-        return flagManager.evaluate(
-            flagKey: flagKey,
-            defaultValue: defaultValue,
-            onExposure: { [weak self] key, value, reason in
-                guard let self else { return }
-                self.track("$flag_exposure", properties: self.withConfigFreshness([
-                    "flag_key": key,
-                    // Raw value, not a case description — matches
-                    // packages/sdk-js/src/client.ts and the
-                    // `flag_value: "unknown"` event schema.
-                    "flag_value": value.anyValue,
-                    // What makes a dedup regression visible server-side: repeated `first`
-                    // exposures for one device and flag within a session mean it broke again.
-                    "exposure_reason": reason.rawValue,
-                ]))
-                if reason == .valueChanged {
-                    self.diagnosticBus.emit(
-                        .info,
-                        .flag,
-                        code: "flag.exposure_value_changed",
-                        message: "Flag value changed — exposure recorded again.",
-                        data: ["flag_key": AnyCodable(key)]
-                    )
-                }
+        // The value and the assignments its exposure carries are read under one gate, so a config
+        // applied in between cannot pair this value with the next config's arms. `onExposure` only
+        // records here: tracking reaches host closures, which must run outside the gate.
+        var decided: (reason: FlagExposureReason, assignments: ExperimentAssignmentSet)?
+        let value = exposureDecisionGate.withLock {
+            flagManager.evaluate(flagKey: flagKey, defaultValue: defaultValue) { _, _, reason in
+                flagDecisionInsideGateHookForTesting.value?(flagKey)
+                decided = (reason, experimentManager.capture())
             }
-        )
+        }
+        guard let decided else { return value }
+        exposureDecisionHookForTesting.value?("$flag_exposure")
+        track("$flag_exposure", properties: withConfigFreshness([
+            "flag_key": flagKey,
+            // Raw value, not a case description — matches
+            // packages/sdk-js/src/client.ts and the
+            // `flag_value: "unknown"` event schema.
+            "flag_value": value.anyValue,
+            // What makes a dedup regression visible server-side: repeated `first`
+            // exposures for one device and flag within a session mean it broke again. One
+            // legitimate repeat: a `first` sent marked during an identity switch is sent again,
+            // attributed, when the switch ends (`ExperimentManager.flagsExposedWhileMarked`).
+            "exposure_reason": decided.reason.rawValue,
+        ]), decidedAssignments: decided.assignments, exposure: .flag(flagKey))
+        if decided.reason == .valueChanged {
+            diagnosticBus.emit(
+                .info,
+                .flag,
+                code: "flag.exposure_value_changed",
+                message: "Flag value changed — exposure recorded again.",
+                data: ["flag_key": AnyCodable(flagKey)]
+            )
+        }
+        return value
     }
 
     /// Override a flag value for local testing. Only applies when
@@ -1200,23 +1460,29 @@ public final class SheepitClient: @unchecked Sendable {
     /// Get the assigned variant for an experiment.
     public func experiment(_ experimentKey: String) -> SheepitExperimentResult {
         guard !destroyedFlag.value else { return SheepitExperimentResult(variant: "control") }
-        return experimentManager.resolve(experimentKey: experimentKey) { [weak self] key, variant, reason in
-            guard let self else { return }
-            self.track("$experiment_exposure", properties: self.withConfigFreshness([
-                "experiment_key": key,
-                "variant": variant,
-                "exposure_reason": reason.rawValue,
-            ]))
-            if reason == .variantChanged {
-                self.diagnosticBus.emit(
-                    .info,
-                    .experiment,
-                    code: "experiment.exposure_variant_changed",
-                    message: "Experiment arm changed — exposure recorded for the new arm.",
-                    data: ["experiment_key": AnyCodable(key), "variant": AnyCodable(variant)]
-                )
-            }
+        // The variant and the assignment set come from one `ExperimentManager` lock acquisition;
+        // the exposure carries that set, not whatever config is applied by the time it is tracked.
+        var decided: (variant: String, reason: ExperimentExposureReason, assignments: ExperimentAssignmentSet)?
+        let result = experimentManager.resolve(experimentKey: experimentKey) { _, variant, reason, assignments in
+            decided = (variant, reason, assignments)
         }
+        guard let decided else { return result }
+        exposureDecisionHookForTesting.value?("$experiment_exposure")
+        track("$experiment_exposure", properties: withConfigFreshness([
+            "experiment_key": experimentKey,
+            "variant": decided.variant,
+            "exposure_reason": decided.reason.rawValue,
+        ]), decidedAssignments: decided.assignments, exposure: .experiment(experimentKey, variant: decided.variant))
+        if decided.reason == .variantChanged {
+            diagnosticBus.emit(
+                .info,
+                .experiment,
+                code: "experiment.exposure_variant_changed",
+                message: "Experiment arm changed — exposure recorded for the new arm.",
+                data: ["experiment_key": AnyCodable(experimentKey), "variant": AnyCodable(decided.variant)]
+            )
+        }
+        return result
     }
 
     // MARK: - Public API: Identity
@@ -1299,14 +1565,36 @@ public final class SheepitClient: @unchecked Sendable {
         // Flush events attributed to the previous identity first.
         Task { await flush() }
 
-        context.setUserId(userId)
-        // Every wait for the user the app no longer names is superseded.
-        identifyWaiters.supersede(by: userId)
+        // 🔴 One known user to ANOTHER: the config on disk was evaluated for the previous user, and
+        // with no age limit (0.10.2) an offline relaunch would apply it to this one forever. Only the
+        // persisted copy goes; memory keeps answering until this user's refetch lands, as before.
+        // Anonymous to known keeps it: that body is the device's own. BEFORE `setUserId`, which
+        // persists the new user: a process killed in between would otherwise relaunch as this user
+        // over the previous user's body. Until a body fetched for this user's row lands, nothing
+        // else is written to disk (`ConfigSync.dropPersistedCacheForUserChange(newUserId:)`).
+        if previousUserId != nil {
+            configSync.dropPersistedCacheForUserChange(newUserId: userId)
+        }
 
         // Clears the exposures only. The server's assignments stay, still labelled
         // with the row's previous user, so events tracked until the identify POST succeeds and its
-        // refetch lands carry `identity_changed` for user-bucketed experiments.
-        experimentManager.clearAssignments()
+        // refetch lands carry `identity_changed` for every experiment, whatever its kind.
+        // 🔴 BEFORE `setUserId`: a `track()` on another thread in between would carry the new user
+        // with no switch armed, crediting a device-kind arm to them.
+        // The exposures are cleared AFTER it, or a read in between re-fires as the previous user.
+        let (switchToken, crashPublished) = exposureDecisionGate.withLock {
+            let token = experimentManager.beginIdentitySwitch(to: userId)
+            context.setUserId(userId)
+            // A span started under the previous user keeps them; the cumulative windows do not.
+            performanceMonitor?.identitySwitched()
+            experimentManager.clearExposures()
+            let published = publishCrashIdentityLocked()
+            return (token, published)
+        }
+        defer { crashReporter?.recordIdentityPublication(crashPublished) }
+        identifyUserIdSetHookForTesting.value?(userId)
+        // Every wait for the user the app no longer names is superseded.
+        identifyWaiters.supersede(by: userId)
         flagManager.clearExposed()
 
         diagnosticBus.emit(
@@ -1320,7 +1608,42 @@ public final class SheepitClient: @unchecked Sendable {
         // Synchronously, before the POST is even queued: from here until a POST answers, the SDK
         // cannot say which user the server's device row holds (`ServerHeldUser`).
         context.setServerHeldUser(.unknown)
-        return .posted(postIdentity(userId: userId, sendIf: identifySendGuard(resetToken: resetToken)))
+        if registrationTooFarOffForIdentify() {
+            // The app's label is kept, so events carry the user and the periodic retry binds the
+            // row once the device registers; this call settles now instead of waiting a day.
+            diagnosticBus.emit(
+                .info,
+                .identity,
+                code: "identity.identify_deferred",
+                message: "identify() not sent: this device is not registered yet and registration is backed off",
+                data: ["reason": AnyCodable("not_registered")]
+            )
+            // Never sent, so never bound: the next server config ends the switch (`IdentitySwitch`).
+            // Owed now: a poll answered 304 applies nothing and would leave the switch armed.
+            if experimentManager.identityBindSettledWithoutAck(
+                switchToken, afterFetch: configSync.fetchesStarted.current) {
+                // Weak and guarded: a refetch outliving `destroy()` writes config to shared storage.
+                Task { [weak self] in
+                    guard let self, !self.destroyedFlag.value else { return }
+                    await self.configSync.refetchUnconditionally(deviceId: self.context.deviceId)
+                }
+            }
+            return .notSent
+        }
+        return .posted(postIdentity(
+            userId: userId,
+            sendIf: identifySendGuard(resetToken: resetToken),
+            identitySwitchToken: switchToken
+        ))
+    }
+
+    /// IDENTIFY_WAIT_BUDGET (`RegistrationPolicy.identifyWaitBudgetSeconds`): true when the current
+    /// device is not registered in this scope and the persisted window still open is longer than an
+    /// identify may wait. A shorter window is waited out through `registrationGate`.
+    private func registrationTooFarOffForIdentify() -> Bool {
+        guard !registrationPolicy.isRegistered(context.deviceId),
+              let window = registrationPolicy.openWindow() else { return false }
+        return window > RegistrationPolicy.identifyWaitBudgetSeconds
     }
 
     /// `identify()` with the user the app already names. No-op while the row is known to hold them,
@@ -1336,7 +1659,9 @@ public final class SheepitClient: @unchecked Sendable {
             reason = nil
         } else if identifyRejected(for: userId) {
             reason = "rejected"
-        } else if deviceRegistrationBackoffActive() {
+        } else if registrationTooFarOffForIdentify() {
+            reason = "not_registered"
+        } else if registrationPolicy.isRegistered(context.deviceId), deviceRegistrationBackoffActive() {
             reason = "backoff"
         } else if identifyExhausted(for: userId) {
             reason = "recently_exhausted"
@@ -1425,6 +1750,7 @@ public final class SheepitClient: @unchecked Sendable {
         userId: String,
         onlyIfIdle: Bool = false,
         sendIf: (@Sendable () -> Bool)? = nil,
+        identitySwitchToken: UInt64? = nil,
         beforeSendForTesting: (@Sendable () -> Void)? = nil
     ) -> UInt64 {
         identifyLock.lock()
@@ -1521,9 +1847,21 @@ public final class SheepitClient: @unchecked Sendable {
             }
             // Nothing sent leaves the label alone: after a `reset()` it is the fresh device's.
             if result.attempts > 0 { self.context.markServerHeldUserUnknown() }
-            // On a replacement device now, but unbound: the config held is the dead device's.
-            if result.deviceId != startDeviceId, result.outcome != .stale {
-                Task { [configSync] in await configSync.refetchUnconditionally(deviceId: result.deviceId) }
+            // Unbound (or unanswered): the next server fetch started after this ends the identity
+            // switch this POST was sent for, so a bind that never succeeds cannot keep device-kind
+            // claims unattributed for the session. That fetch is made below: a 304 poll applies
+            // nothing. A retry or same-user POST carries no token: it settles nothing.
+            let settled = identitySwitchToken.map {
+                self.experimentManager.identityBindSettledWithoutAck(
+                    $0, afterFetch: self.configSync.fetchesStarted.current)
+            } ?? false
+            // On a replacement device now, but unbound: the config held is the dead device's. Not
+            // when settled: the settle's own refetch below fetches for that same device.
+            if result.deviceId != startDeviceId, result.outcome != .stale, !settled {
+                Task { [weak self] in
+                    guard let self, !self.destroyedFlag.value else { return }
+                    await self.configSync.refetchUnconditionally(deviceId: result.deviceId)
+                }
             }
             switch result.outcome {
             case .rejected:
@@ -1540,6 +1878,9 @@ public final class SheepitClient: @unchecked Sendable {
             }
             self.reportIdentifyResult(result)
             self.identifyWaiters.identifyFailed(userId, sequence: sequence)
+            if settled, !self.destroyedFlag.value {
+                await self.configSync.refetchUnconditionally(deviceId: self.context.deviceId)
+            }
         }
         return sequence
     }
@@ -1685,7 +2026,20 @@ public final class SheepitClient: @unchecked Sendable {
         identifyWaiters.resetHappened()
         // Read before anything is cleared: whether a user is, or may be, on the server's row.
         let rotateDevice = deviceRotation.deviceMayBeBound()
-        context.resetIdentity(mintSession: appState.isForeground)
+        let mintSession = appState.isForeground
+        let crashPublished = exposureDecisionGate.withLock {
+            // THIS clear is the one that matters for receipts: it ends the receipt in the same critical
+            // section as the identity, so no capture pairs the logged-out receipt with the cleared user.
+            // The second one below (inside the config gate, with the evaluated flags and the disk clear)
+            // is defence in depth for anything applied between the two; it is not load-bearing alone.
+            experimentManager.clearForLogout()
+            context.resetIdentity(mintSession: mintSession)
+            // After the identity is cleared, still inside the gate: a span or frame window captured
+            // before this point carries an older epoch; one captured after reads the cleared identity.
+            performanceMonitor?.identityDidChange()
+            return publishCrashIdentityLocked()
+        }
+        defer { crashReporter?.recordIdentityPublication(crashPublished) }
         sessionDidChange()
         // 🔴 Clearing locally is not enough: `/v1/config` evaluates the SERVER's device row, which
         // stays bound to the logged-out user (there is no unbind), so the next fetch re-delivered
@@ -1724,18 +2078,23 @@ public final class SheepitClient: @unchecked Sendable {
         // first, and it deleted whatever cache was on disk when it finally ran, including one
         // written after this reset (measured deleting a cache seeded 42 µs later).
         configResetGate.reset {
-            experimentManager.clearForLogout()
-            flagManager.clearEvaluated()
+            exposureDecisionGate.withLock {
+                experimentManager.clearForLogout()
+                _ = publishCrashIdentityLocked()
+                flagManager.clearEvaluated()
+            }
             identifyWaiters.configCleared()
             // 🔴 The on-disk copy goes SYNCHRONOUSLY, here. A user who logs out and immediately
             // force-quits (or is killed by the OS) must not leave `gt_config` on disk for the next
-            // launch to re-apply via `loadFromCache()` — precisely the case this exists to prevent,
-            // and the one where inclusion in device backups matters most. sdk-js clears
+            // launch to re-apply via `applyLaunchCache(deviceId:)` — precisely the case this
+            // exists to prevent, and the one where inclusion in device backups matters most. sdk-js clears
             // synchronously; this keeps the two platforms honest.
             storage.removeObject(forKey: StorageKeys.sdkConfig)
             storage.removeObject(forKey: StorageKeys.sdkConfigCachedAt)
             storage.removeObject(forKey: StorageKeys.sdkConfigFetchedUnder)
+            storage.removeObject(forKey: StorageKeys.sdkConfigResolvedFor)
             configFreshness.clear()
+            provisionalConfigApplied.value = false
         }
         // Queued feedback carries the logged-out user's words, email and id: deleted now, on this
         // thread, like the cached config above, under every key and environment.
@@ -1748,7 +2107,8 @@ public final class SheepitClient: @unchecked Sendable {
     /// Returns the span object. Call `endSpan(_:)` with the same name to complete it.
     public func startSpan(_ name: String, attributes: [String: String] = [:]) {
         guard !destroyedFlag.value else { return }
-        Task { await performanceMonitor?.startSpan(name, attributes: attributes) }
+        let snapshot = performanceMonitor?.spanSnapshot()
+        Task { await performanceMonitor?.startSpan(name, attributes: attributes, snapshot: snapshot) }
     }
 
     /// End a previously started performance span by name.
@@ -1828,6 +2188,15 @@ public final class SheepitClient: @unchecked Sendable {
     static let screenEventName = "$screen"
     static let screenPropertyKey = "screen"
 
+    /// A `track` breadcrumb's message: the event name, and for `$screen` the screen too
+    /// (`"$screen: Checkout"`) — otherwise a crash's trail read "$screen" for every navigation.
+    static func trackBreadcrumbMessage(_ name: String, _ properties: [String: Any]?) -> String {
+        guard name == screenEventName, let screen = properties?[screenPropertyKey] as? String, !screen.isEmpty else {
+            return name
+        }
+        return "\(name): \(screen)"
+    }
+
     /// `name` trimmed, with every U+0000 removed, then cut to `SDKDefaults.screenNameMaxUTF8Bytes`
     /// on a character boundary and trimmed again (so `bound(bound(x)) == bound(x)`). The C crash context is written with `strlen` and truncated by
     /// BYTE: a NUL would end it early while the event carried the whole string, and a byte cut
@@ -1872,14 +2241,20 @@ public final class SheepitClient: @unchecked Sendable {
 
     /// Adds `config_source` and `config_age_ms` to an exposure event: whether the value came from
     /// the server or the on-device cache, and how old that config was, so an analysis can separate
-    /// evaluations made offline from a stale cache. Adds nothing when no config is applied.
+    /// evaluations made offline from a stale cache. `config_source: "unresolved"` (no age) for a body
+    /// the server could not resolve this device for, applied to memory only, so an analysis can drop
+    /// those untargeted defaults. Adds nothing when no config is applied.
     private func withConfigFreshness(_ properties: [String: Any]) -> [String: Any] {
-        guard let freshness = configFreshness.snapshot(now: now(), staleAfter: configLimits.staleAfter) else {
-            return properties
+        guard let stamp = configFreshness.exposureStamp(now: now()) else {
+            guard provisionalConfigApplied.value else { return properties }
+            var merged = properties
+            merged["config_source"] = "unresolved"
+            return merged
         }
         var merged = properties
-        merged["config_source"] = freshness.source.rawValue
-        merged["config_age_ms"] = Int(freshness.age * 1000)
+        merged["config_source"] = stamp.source.rawValue
+        // Absent when the age is unknown (a launch cache stamped later than the device clock).
+        if let ageMs = stamp.ageMs { merged["config_age_ms"] = ageMs }
         return merged
     }
 
@@ -1892,7 +2267,7 @@ public final class SheepitClient: @unchecked Sendable {
         }
         return SDKStatus.Identity(
             serverUser: serverUser,
-            deviceRegistered: isRegisteredInThisScope(),
+            deviceRegistered: storage.string(forKey: StorageKeys.deviceRegistered) == context.deviceId,
             lastIdentifyRejection: lastIdentifyRejection()
         )
     }
@@ -1957,6 +2332,12 @@ public final class SheepitClient: @unchecked Sendable {
             }
         }
         if let reporter = crashReporter {
+            // Detached HERE, synchronously, before stop() unmaps the crash context: a config apply
+            // still in flight would otherwise write into the unmapped page. Clearing waits out a
+            // delivery in progress (the observer lock spans it), and breaks the reporter ↔
+            // manager reference cycle.
+            flagManager.setValuesObserver(nil)
+            experimentManager.setVariantsObserver(nil)
             Task { await reporter.stop() }
         }
         let feedback = feedbackSender
@@ -2032,6 +2413,17 @@ public final class SheepitClient: @unchecked Sendable {
             reportScopeAdoption(adoption)
         }
         context.persistOnBeginWork()
+        // Every launch, not only the one that carried the legacy id over (`retireLegacyDeviceId`).
+        StorageScope.retireLegacyDeviceId(raw: rawStorage, scoped: storage)
+        if context.replacedUnusableDeviceId {
+            diagnosticBus.emit(
+                .warn,
+                .identity,
+                code: "identity.device_id_replaced_unusable",
+                message: "The stored device id cannot be sent, so a fresh one was minted",
+                data: ["reason": AnyCodable(context.unusableDeviceIdReason ?? "unknown")]
+            )
+        }
         experimentManager.dropLegacyStickyMap()
         didBeginWork = true
         SheepitClient.beginWorkCallCountLock.lock()
@@ -2041,8 +2433,12 @@ public final class SheepitClient: @unchecked Sendable {
         log.debug("SDK initialized (env: \(config.environment))")
         // After `start()`, so a host `onDiagnostic` that calls `destroy()` here is caught by the
         // same re-check below as one fired from inside `start()`.
-        if let notice = config.activeInfoPlistNotice {
-            log.notice(notice)
+        // `.fault`, not a console line: a self-hosted app that lost `SheepitAPIURL` sends its
+        // events to the hosted API without any error, so the unified log must say so. Only for the
+        // absent-key case (`activeInfoPlistNotice`): an app that names the hosted API in code or in
+        // its plist chose it, and gets no fault.
+        if let notice = config.hostedDefaultNotice {
+            log.fault(notice)
             diagnosticBus.emit(.info, .config, code: InfoPlistReader.hostedDefaultCode, message: notice)
         }
         for warning in config.activeInfoPlistWarnings {
@@ -2134,87 +2530,44 @@ public final class SheepitClient: @unchecked Sendable {
 
     private func start() {
         connectivity.start()
-        // Register device if this install has never had a successful registration.
-        // Capture the task so identify() can await it.
+        // Register this device unless this scope already registered the CURRENT id with the
+        // installed app version (`RegistrationPolicy.isRegistered`). Contract:
+        // `Docs/Technical/SDK_DEVICE_REGISTRATION_CONTRACT.md`.
         //
-        // 🔴 This used to guard on `storage.string(forKey: StorageKeys.deviceId) == nil` —
-        // reading state its OWN CALLER had written one statement earlier, invisible in a
-        // diff of either function alone: `beginWork()` calls `context.persistOnBeginWork()`
-        // right before calling this, and that write always leaves `gt_device_id` non-nil by
-        // the time `start()` runs. So the guard was never true and `registrationTask` was
-        // never created — `POST /v1/devices/register` never fired, and `/v1/config` could
-        // never resolve the device.
+        // 🔴 "Client proposes, server disposes": the id `ContextManager` loaded or minted (and
+        // `persistOnBeginWork()` just wrote) is proposed as `device_id` on every attempt — never
+        // nil. It is already the id on every event, crash and `/v1/config` request, so when the
+        // server honours it (always, for a well-formed proposal) nothing changes hands: no
+        // re-stamp, no device-id change callback, no config refetch. 0.9.x sent nil on a fresh
+        // install, so the server minted `dev_…` and every launch's pre-registration events and
+        // config fetch named an id the server never issued.
         //
-        // Guarding on "did registration ever SUCCEED" instead of "did we mint an id" also
-        // matters for the failure case the obvious fix misses: a device whose FIRST
-        // registration attempt fails (no network at first launch) still gets a locally-minted
-        // id persisted either way — guarding on the id's presence would make that device look
-        // permanently "already registered" and never retry.
+        // 🔴 Guarded on "did registration SUCCEED" (the scoped marker), never on whether an id
+        // exists: `beginWork()` always writes one before this runs, so that guard was never true
+        // and registration never fired in any version before 0.4.
         //
-        // 🔴 A second, distinct bug shipped alongside the fix above: this call always sent
-        // `existingDeviceId: nil`. Harmless while registration was dead code — but the guard
-        // above was NEVER satisfiable in ANY published version either (verified against
-        // `swift-v0.3.0` and the SDK's very first commit: `ContextManager.init` has
-        // unconditionally persisted `gt_device_id` before `start()` ever ran since day one),
-        // so `POST /v1/devices/register` has never fired in the field. That means every real
-        // existing install already carries a LOCALLY-MINTED UUID — never a server-assigned
-        // `dev_…` id — stamped on however many months of event history it has. Sending `nil`
-        // unconditionally would make the server mint a FRESH `dev_…` id for every one of
-        // them (`apps/api/src/routes/v1/devices.ts:139`) and upsert a NEW `device_assignments`
-        // row keyed on it, orphaning that entire event history from the device profile the
-        // moment registration starts working for real — the harm D-1 exists to prevent, one
-        // step later in the pipeline than the dead-guard bug itself.
-        //
-        // The fix is NOT "always send `context.deviceId`" either — `beginWork()` calls
-        // `context.persistOnBeginWork()` before `start()`, and `ContextManager.init` always
-        // mints a fresh UUID when storage is empty, so `context.deviceId` is non-nil on every
-        // launch including a genuinely fresh install. Sending it unconditionally would mean
-        // the server never mints a `dev_…` id for anyone, contradicting the adopt-the-
-        // server-assigned-id design this whole registration flow exists to implement.
-        //
-        // The real discriminator is `context.didMintDeviceId` — "was this id loaded from
-        // storage, or generated fresh THIS launch" — which `deviceRegistered` cannot answer:
-        //
-        // | storage at launch                              | didMint | sends       | server does                            |
-        // |--------------------------------------------------|---------|-------------|-----------------------------------------|
-        // | fresh install                                     | true    | nil         | mints `dev_…`; SDK adopts it            |
-        // | every real existing install (locally-minted UUID) | false   | that UUID   | upserts under it; event history kept    |
-        // | a device already holding a server-assigned id     | false   | the `dev_…` | upserts the SAME row (forward-looking — |
-        // |   (once registration succeeds, some LATER bug     |         |             | no install is in this state TODAY)      |
-        // |   re-triggers a second attempt)                   |         |             |                                          |
-        // | previous register attempt failed                  | false   | persisted id| retries idempotently                    |
-        //
-        // 🔴 A third bug, found alongside the two above: `deviceManager.register()` used to
-        // treat EVERY failure identically — network hiccup, 5xx, and a PERMANENTLY rejected
-        // key (401/403) or device-cap ceiling (422) all just logged and returned nil, so a
-        // revoked key re-hit this endpoint on every single cold start forever, silently
-        // (`log.warn` only — nothing on `diagnosticBus`, so neither the host app's own
-        // `onDiagnostic` nor GoaTech itself could ever see it happening). `register()` now
-        // returns a `RegistrationOutcome` that tells the two apart; see
-        // `deviceRegistrationBackoffActive()` for how a terminal failure is remembered
-        // without being confused for success.
-        //
-        // 🔴 The slot holds the id it registered, not "1": the device id is shared by every scope, so
-        // a `reset()` in another scope can rotate it, and this scope must then register the new one.
-        if !isRegisteredInThisScope(), !deviceRegistrationBackoffActive() {
-            registrationTask = Task { [weak self] in
-                guard let self else { return }
-                // Captured BEFORE the round trip: this is the id every event enqueued during
-                // this window (the SDK's own `$session_start`, or an eager host `track()`
-                // call) gets stamped with, via `context.eventContext()`. `restampDeviceId`
-                // below needs the exact value it read at THAT time, not whatever
-                // `context.deviceId` happens to hold once this Task resumes.
-                let preRegistrationDeviceId = self.context.deviceId
-                await self.attemptLaunchRegistration(
-                    preRegistrationDeviceId: preRegistrationDeviceId,
-                    failures: 0
-                )
+        // A persisted backoff window still open defers the first attempt to its end instead of
+        // skipping the launch: nothing is sent inside it, and the gate is NOT armed for it, so
+        // `identify()` and the auto-flush do not wait out a window of up to 24 h.
+        if !registrationPolicy.isRegistered(context.deviceId) {
+            let proposal = context.deviceId
+            if let window = registrationPolicy.openWindow() {
+                scheduleNextLaunchRegistrationAttempt(proposal: proposal, after: window)
+                // Within IDENTIFY_WAIT_BUDGET an identify waits for this attempt; past it the gate
+                // stays unarmed and `identify()` settles "not registered yet" instead of waiting.
+                if window <= RegistrationPolicy.identifyWaitBudgetSeconds {
+                    registrationGate.setTask(registrationTask)
+                }
+            } else {
+                registrationTask = Task { [weak self] in
+                    await self?.attemptLaunchRegistration(proposal: proposal)
+                }
+                // Published synchronously, right alongside `registrationTask` itself — a
+                // closure built earlier in `init` (the app-background flush handler) cannot
+                // capture `self` to read `registrationTask` directly, so it awaits this
+                // instead. See `RegistrationGate`'s doc.
+                registrationGate.setTask(registrationTask)
             }
-            // Published synchronously, right alongside `registrationTask` itself — a
-            // closure built earlier in `init` (the app-background flush handler) cannot
-            // capture `self` to read `registrationTask` directly, so it awaits this
-            // instead. See `RegistrationGate`'s doc.
-            registrationGate.setTask(registrationTask)
         }
 
         // 🔴 Every identified launch re-sends its identify POST once, whatever the label says. The
@@ -2233,13 +2586,41 @@ public final class SheepitClient: @unchecked Sendable {
         // 🔴 Guarded like the retry: it waits for registration, and a `reset()` in that window ("session
         // expired" at launch) must not bind the logged-out user to the row again.
         let launchResetToken = configResetGate.current
-        if let userId = context.userId {
+        let launchUserId = context.userId
+        if launchUserId != nil {
             context.setServerHeldUser(.unknown)
-            postIdentity(
-                userId: userId,
-                sendIf: automaticIdentifySendGuard(userId: userId, resetToken: launchResetToken)
-            )
         }
+
+        // 🔴 The cached config is applied HERE, synchronously, before `create(config:)` /
+        // `initialize(config:)` return: a flag read on the app's next line must answer with the
+        // cached value even when the server is unreachable. Applied from inside the `Task` below,
+        // it raced the app's first reads, and an app that reads its flags once at launch kept the
+        // defaults for the session. Race-free off the actor: see
+        // `ConfigSync.applyLaunchCache(deviceId:)`.
+        //
+        // 🔴 Between the `.unknown` mark and the launch POST: the mark decides the label the cache
+        // is applied under, and the POST, the one writer that can move that label to a USER, is not
+        // queued yet, so no answer to it can land first. The app cannot call `identify()` either:
+        // the client has not been handed back. One other writer is already running: the launch
+        // registration above, which on a REPLACED id labels the fresh row `.known(nil)`
+        // (`adoptLaunchRegistration`). Its answer landing before this line needs a full round trip
+        // inside a few synchronous calls; if it does, the label it writes is true of the row (no
+        // user), never another user's.
+        configSync.applyLaunchCache(deviceId: context.deviceId)
+
+        if let userId = launchUserId {
+            // Past IDENTIFY_WAIT_BUDGET the POST could only 404: the periodic retry binds once the
+            // device has registered (`retryIdentityIfUnknown`).
+            if !registrationTooFarOffForIdentify() {
+                postIdentity(
+                    userId: userId,
+                    sendIf: automaticIdentifySendGuard(userId: userId, resetToken: launchResetToken)
+                )
+            }
+        }
+
+        // F-2: bind an identified install's C5 replacement at once, through the same retry.
+        deviceRotation.onIdentifiedDeviceReplaced.value = { [weak self] in self?.retryIdentityIfUnknown() }
 
         // Start config sync
         Task { [self] in
@@ -2311,6 +2692,10 @@ public final class SheepitClient: @unchecked Sendable {
         lifecycleObserver.onForeground = { [weak self] in
             await self?.handleWillEnterForeground()
         }
+        lifecycleObserver.onEnterBackground = { [weak self] in
+            guard let self, !self.destroyedFlag.value else { return }
+            self.context.touchSessionIfLive()
+        }
         lifecycleObserver.register()
 
         // Announce a fresh install or an app upgrade, if either is owed. This call is
@@ -2351,227 +2736,189 @@ public final class SheepitClient: @unchecked Sendable {
         }
     }
 
-    /// One launch-registration attempt, recursing with backoff for `transientFailure`/
-    /// `capReached`/`rateLimited` instead of giving up until the next cold start. Fix round 1
-    /// (PR #1170 review), item 16: before this, `case .transientFailure: break` meant a device
-    /// with no network at launch had NO device id — and so no flags, no config, nothing — until
-    /// the app was relaunched, even if connectivity returned a second later. Mirrors
-    /// `DeviceRotation.register()`'s while-loop shape, as a recursive async function instead
-    /// since this path has no `generation` counter of its own — `preRegistrationDeviceId`
-    /// already serves as this call chain's supersession guard, exactly as it did before this
-    /// method existed.
-    private func attemptLaunchRegistration(preRegistrationDeviceId: String, failures: Int) async {
-        switch await self.deviceManager.register(
-            anonymousId: self.context.anonymousId,
-            existingDeviceId: self.context.didMintDeviceId ? nil : self.context.deviceId
-        ) {
+    /// One launch-registration attempt of `proposal`, the id in use when the chain started. Every
+    /// failure is persisted by `RegistrationPolicy` and the next attempt scheduled after the window
+    /// it returns, until the launch's attempt budget is spent or the answer is terminal.
+    /// `proposal` is also the chain's supersession guard: once `reset()` rotates to another device
+    /// (`DeviceRotation`), nothing this chain learns is applied.
+    private func attemptLaunchRegistration(proposal: String) async {
+        guard context.deviceId == proposal, !Task.isCancelled, !destroyedFlag.value else { return }
+        guard registrationPolicy.takeAttempt() else { return }
+        let outcome = await deviceManager.register(anonymousId: context.anonymousId, proposedDeviceId: proposal)
+        // 🔴 A logout rotation ran while this was in flight: the answer is about the device the
+        // logout abandoned. Adopting it would put the logged-out user's row back in use, and a
+        // failure says nothing about the new device, so it must not back it off either.
+        guard context.deviceId == proposal else {
+            diagnosticBus.emit(
+                .debug,
+                .identity,
+                code: "identity.device_registration_superseded",
+                message: "Launch registration answered after reset() switched devices — discarded"
+            )
+            return
+        }
+        switch outcome {
         case .success(let deviceId):
-            // 🔴 A logout rotation ran while this was in flight (`DeviceRotation`): the
-            // device this request registered is the one the logout abandoned. Adopting it
-            // would put the logged-out user's row back in use.
-            guard self.context.deviceId == preRegistrationDeviceId else {
-                self.diagnosticBus.emit(
-                    .debug,
-                    .identity,
-                    code: "identity.device_registration_superseded",
-                    message: "Launch registration answered after reset() switched devices — discarded"
-                )
+            adoptLaunchRegistration(deviceId, proposal: proposal)
+        case .transientFailure(let reason, let retryAfter):
+            guard !Task.isCancelled else { return }
+            launchRegistrationFailed(.transient, outcome: reason, data: [:], retryAfter: retryAfter, proposal: proposal)
+        case .terminalFailure(let rejection):
+            launchRegistrationFailed(
+                .terminal,
+                outcome: Self.terminalFailureOutcome(for: rejection),
+                data: rejection.diagnosticData,
+                proposal: proposal
+            )
+        case .capReached(let rejection, let retryAfter):
+            guard !Task.isCancelled else { return }
+            launchRegistrationFailed(
+                .cap,
+                outcome: "device_cap_reached",
+                data: rejection.diagnosticData,
+                retryAfter: retryAfter,
+                proposal: proposal
+            )
+        case .rateLimited(let retryAfter):
+            guard !Task.isCancelled else { return }
+            launchRegistrationFailed(
+                .rateLimited,
+                outcome: "rate_limited",
+                data: ["status_code": AnyCodable(429)],
+                retryAfter: retryAfter,
+                proposal: proposal
+            )
+        }
+    }
+
+    /// The answer's `device_id` becomes this device's. Equal to the proposal (the normal case):
+    /// the registered marker is written, and config is refetched unless a body the server resolved
+    /// for this device already applies (`ConfigSync.refetchAfterRegistration`). Replaced by the server: the swap machinery runs —
+    /// persist the adopted id FIRST, then re-stamp both queues, then adopt it in memory
+    /// (compare-and-set), label the new row, refresh the crash context and refetch config. So no
+    /// re-stamped event can leave, or sit on disk, before the id it names is durable. A public
+    /// `flush()` landing between the persist and the in-memory re-stamp still sends the queued events
+    /// under the proposal: the accepted cost of persisting first (listed for the PR body).
+    ///
+    /// Residuals of the replaced case, both structural (see PENDING_WORK.md): a `track()` racing
+    /// this block reads the old id and enqueues it after the re-stamp; and a request already in
+    /// flight that then fails persists its LIVE old-id events after the re-stamp ran.
+    private func adoptLaunchRegistration(_ deviceId: String, proposal: String) {
+        if deviceId != proposal {
+            context.persistDeviceIdAhead(deviceId)
+            queue.restampDeviceId(from: proposal, to: deviceId)
+            offlineQueue.restampDeviceId(from: proposal, to: deviceId)
+            deviceIdWillChange()
+            guard context.replaceDeviceId(proposal, with: deviceId) else {
+                // A rotation won the race: put its id back on disk.
+                context.persistDeviceIdAhead(context.deviceId)
                 return
             }
-            // 🔴 Re-stamp both queues FIRST, then adopt the id.
-            //
-            // Since S3b every event sends its OWN `device.id`
-            // (`Transport.context(for:)`), so any queued event still carrying the
-            // pre-registration id files under an id the server never issued.
-            // `flush()` is public and deliberately ungated (it never awaits
-            // registration settlement), and `destroy()` fires one. Re-stamping
-            // first means a flush landing between these statements sends only
-            // re-stamped events; adopting first would not change what is queued.
-            // `OfflineQueue` is re-stamped too because 429s and 5xx now persist
-            // there (S3c).
-            //
-            // Residuals, both structural (see PENDING_WORK.md): a `track()` racing
-            // this block reads the old id and enqueues it after the re-stamp; and a
-            // request already in flight that then fails persists its LIVE old-id
-            // events after the re-stamp ran. Persisted events it carried stay on disk
-            // and are re-stamped.
-            if deviceId != preRegistrationDeviceId {
-                self.queue.restampDeviceId(from: preRegistrationDeviceId, to: deviceId)
-                self.offlineQueue.restampDeviceId(from: preRegistrationDeviceId, to: deviceId)
-                // A changed id only comes back when none was sent, and the route then
-                // mints `dev_<uuid>` on its create path: a new row, holding no user (the
-                // register request carries no user field). Recorded before the id is
-                // adopted, so no config is fetched for the new row under the old label.
-                self.context.setServerHeldUser(.known(nil))
-            }
-            self.context.setDeviceId(deviceId)
-            self.storage.set(deviceId, forKey: StorageKeys.deviceRegistered)
-            RegistrationBackoff.clear(storage: self.storage)
-            self.deviceIdDidChange()
-        case .transientFailure:
-            guard self.context.deviceId == preRegistrationDeviceId, !Task.isCancelled else { return }
-            let delay = DeviceRotation.retryDelay(afterFailures: failures)
-            self.diagnosticBus.emit(
+            // After the compare-and-set, so a lost race never relabels the rotation's device. A
+            // replaced id is a row the server created for this request: it holds no user.
+            context.setServerHeldUser(.known(nil))
+        }
+        registrationPolicy.recordSuccess(deviceId)
+        diagnosticBus.emit(
+            .info,
+            .identity,
+            code: "identity.device_registered",
+            message: deviceId == proposal
+                ? "Device registered under its own id"
+                : "Device registered; the server replaced the proposed id",
+            data: ["outcome": AnyCodable(deviceId == proposal ? "proposed" : "replaced")]
+        )
+        let replaced = deviceId != proposal
+        if replaced { deviceIdDidChange() }
+        // The launch fetch started alongside this registration, so on a fresh install it named a
+        // device with no row and was refused; nothing else refetches until the next poll.
+        guard !destroyedFlag.value else { return }
+        let configSync = self.configSync
+        let isCurrent: @Sendable () -> Bool = { [weak self] in
+            guard let self else { return false }
+            return !self.destroyedFlag.value && self.context.deviceId == deviceId
+        }
+        Task {
+            await configSync.refetchAfterRegistration(
+                deviceId: deviceId, replaced: replaced, isCurrent: isCurrent)
+        }
+    }
+
+    /// Persists the failure, reports it, and schedules the next attempt unless the answer was
+    /// terminal. Every failure class reaches here: there is no return path without a write.
+    private func launchRegistrationFailed(
+        _ failure: RegistrationPolicy.FailureClass,
+        outcome: String,
+        data: [String: AnyCodable],
+        retryAfter: TimeInterval? = nil,
+        proposal: String
+    ) {
+        let wait = registrationPolicy.recordFailure(failure, retryAfter: retryAfter)
+        var payload = data
+        payload["outcome"] = AnyCodable(outcome)
+        if let wait { payload["retry_in_ms"] = AnyCodable(Int(wait * 1000)) }
+        switch failure {
+        case .terminal:
+            diagnosticBus.emit(
+                .error,
+                .identity,
+                code: "identity.device_registration_terminal_failure",
+                message: "Device registration permanently rejected — backing off 24 h rather than retrying every launch",
+                data: payload
+            )
+        case .cap, .rateLimited:
+            diagnosticBus.emit(
+                .warn,
+                .identity,
+                code: "identity.device_registration_cap_reached",
+                message: "Device registration throttled (\(outcome)) — retrying with backoff",
+                data: payload
+            )
+        case .transient:
+            diagnosticBus.emit(
                 .warn,
                 .identity,
                 code: "identity.device_registration_failed",
                 message: "Device registration failed — retrying with backoff",
-                data: [
-                    "attempt": AnyCodable(failures + 1),
-                    "outcome": AnyCodable("retrying"),
-                    "retry_in_ms": AnyCodable(Int(delay / .milliseconds(1))),
-                ]
-            )
-            self.scheduleNextLaunchRegistrationAttempt(
-                preRegistrationDeviceId: preRegistrationDeviceId,
-                failures: failures,
-                after: delay
-            )
-        case .terminalFailure(let rejection):
-            // Same guard as the success branch: a rejection answered after `reset()` moved
-            // to another device says nothing about that device, and must not back it off.
-            guard self.context.deviceId == preRegistrationDeviceId else {
-                self.diagnosticBus.emit(
-                    .debug,
-                    .identity,
-                    code: "identity.device_registration_superseded",
-                    message: "Launch registration rejected after reset() switched devices — discarded"
-                )
-                return
-            }
-            RegistrationBackoff.record(storage: self.storage, now: self.now())
-            var data = rejection.diagnosticData
-            data["outcome"] = AnyCodable(Self.terminalFailureOutcome(for: rejection.statusCode))
-            self.diagnosticBus.emit(
-                .error,
-                .identity,
-                code: "identity.device_registration_terminal_failure",
-                message: "Device registration permanently rejected (\(rejection.statusCode)) — " +
-                    "backing off rather than retrying every launch",
-                data: data
-            )
-        case .capReached(let rejection):
-            // Fix round 1 (PR #1170 review), item 16: does NOT give up — keeps retrying
-            // in-session on the longer, jittered `RegistrationRetryPolicy` schedule (up to
-            // 1h). `RegistrationBackoff` is still written on every occurrence (harmless to
-            // repeat) so a kill-and-relaunch mid-wait doesn't hammer either.
-            guard self.context.deviceId == preRegistrationDeviceId, !Task.isCancelled else { return }
-            RegistrationBackoff.record(
-                storage: self.storage,
-                now: self.now(),
-                duration: SDKDefaults.deviceRegistrationCapBackoff
-            )
-            let delay = RegistrationRetryPolicy.delay(afterFailures: failures, retryAfter: nil)
-            self.diagnosticBus.emit(
-                .warn,
-                .identity,
-                code: "identity.device_registration_cap_reached",
-                message: "Device registration rejected (\(rejection.statusCode), cap reached) — " +
-                    "retrying with backoff",
-                data: rejection.diagnosticData.merging([
-                    "outcome": AnyCodable("device_cap_reached"),
-                    "retry_in_ms": AnyCodable(Int(delay / .milliseconds(1))),
-                ]) { _, new in new }
-            )
-            self.scheduleNextLaunchRegistrationAttempt(
-                preRegistrationDeviceId: preRegistrationDeviceId,
-                failures: failures,
-                after: delay
-            )
-        case .rateLimited(let retryAfter):
-            // Same shape as `.capReached` above, but the delay honors the server's own
-            // `Retry-After` when it asks for longer than the jittered exponential value.
-            //
-            // Fix round 2 (PR #1170 review), item 12: does NOT call `RegistrationBackoff.record`
-            // — see `DeviceRotation.swift`'s identical case for the full rationale. A 429 must
-            // not persist the 1h cap window that gates the NEXT cold start's `start()` guard and
-            // `retryIdentityIfUnknown()`; the in-session retry below already paces itself.
-            guard self.context.deviceId == preRegistrationDeviceId, !Task.isCancelled else { return }
-            let delay = RegistrationRetryPolicy.delay(afterFailures: failures, retryAfter: retryAfter)
-            self.diagnosticBus.emit(
-                .warn,
-                .identity,
-                code: "identity.device_registration_cap_reached",
-                message: "Device registration rate limited (429) — retrying with backoff",
-                data: [
-                    "outcome": AnyCodable("rate_limited"),
-                    "retry_in_ms": AnyCodable(Int(delay / .milliseconds(1))),
-                ]
-            )
-            self.scheduleNextLaunchRegistrationAttempt(
-                preRegistrationDeviceId: preRegistrationDeviceId,
-                failures: failures,
-                after: delay
+                data: payload
             )
         }
+        guard let wait else { return }
+        scheduleNextLaunchRegistrationAttempt(proposal: proposal, after: wait)
     }
 
     /// Spawns the NEXT launch-registration attempt as its OWN unstructured `Task` instead of
-    /// recursing inline within the currently-executing one. `registrationGate` (and therefore
-    /// `awaitDeviceIdSettlementForAutoFlush`) was fed `registrationTask` — the task created once,
-    /// in `start()` — so as long as a retry chain recursed *inside* that same task, the gate (and
-    /// every auto-flush / `identify()` waiting on it) stayed blocked for the chain's ENTIRE real-time
-    /// duration: up to 1h for `.capReached`/`.rateLimited`. `testATransientRegistrationFailureStillUnblocksTheAutoFlush`
-    /// caught this — a single 500 with `retryAttempts: 1` left the auto-flush waiting on a task
-    /// that no longer settled after one failure, once item 16 (fix round 1) added the retry.
-    /// Reassigning `registrationTask` here (but never re-arming `registrationGate`) keeps `destroy()`
-    /// able to cancel whichever attempt is currently in flight, without re-blocking the gate on it.
+    /// recursing inline within the current one. `registrationGate` (and so every auto-flush and
+    /// `identify()` waiting on it) was fed the FIRST attempt's task only; a retry chain recursing
+    /// inside that task would keep them blocked for the whole chain (up to an hour per wait).
+    /// Reassigning `registrationTask` here (but never re-arming the gate) keeps `destroy()` able to
+    /// cancel whichever attempt is pending.
     ///
-    /// Fix round 2 (PR #1170 review, item 10): checks `destroyedFlag` BEFORE scheduling, not
-    /// just inside the spawned `Task` after its sleep. Without this check here, a `destroy()`
-    /// racing this exact moment — after `performTeardown()`'s `registrationTask?.cancel()` has
-    /// already run, but conceptually "at the same time" as a call arriving here from the
-    /// previous attempt's `.catch` — could still have this method publish a BRAND NEW task that
-    /// `destroy()` never gets another chance to cancel. `destroyedFlag.testAndSet()` in
-    /// `destroy()` flips before `performTeardown()` runs a single line, so this check is safe
-    /// against that ordering: once `destroyedFlag.value` reads `true`, teardown is already
-    /// underway and will not schedule anything new.
-    private func scheduleNextLaunchRegistrationAttempt(
-        preRegistrationDeviceId: String,
-        failures: Int,
-        after delay: Duration
-    ) {
+    /// Checks `destroyedFlag` BEFORE scheduling: `destroy()` flips it before `performTeardown()`
+    /// cancels `registrationTask`, so a task published after that point would never be cancelled.
+    private func scheduleNextLaunchRegistrationAttempt(proposal: String, after seconds: TimeInterval) {
         guard !destroyedFlag.value else { return }
+        let delay = launchRegistrationRetryDelayForTesting?(seconds) ?? .seconds(seconds)
         registrationTask = Task { [weak self] in
-            guard let self else { return }
             try? await Task.sleep(for: delay)
-            guard
-                self.context.deviceId == preRegistrationDeviceId,
-                !Task.isCancelled,
-                !self.destroyedFlag.value
-            else { return }
-            await self.attemptLaunchRegistration(
-                preRegistrationDeviceId: preRegistrationDeviceId,
-                failures: failures + 1
-            )
+            guard let self, !Task.isCancelled, !self.destroyedFlag.value else { return }
+            await self.attemptLaunchRegistration(proposal: proposal)
         }
     }
 
-    /// Whether this scope registered the CURRENT device id (`StorageKeys.deviceRegistered`).
-    private func isRegisteredInThisScope() -> Bool {
-        storage.string(forKey: StorageKeys.deviceRegistered) == context.deviceId
-    }
-
-    /// True while a registration failure — TERMINAL (400/401/403, `.terminalFailure`) or
-    /// CAP-REACHED (422, `.capReached`, a shorter window) — is still inside the backoff window
-    /// `RegistrationBackoff.record` wrote for it. Checked alongside — never in place of —
-    /// `StorageKeys.deviceRegistered` in `start()`'s guard: that flag means "succeeded," this
-    /// one means "gave up for now." Conflating them would either retry a doomed/capped request
-    /// on every single cold start (no backoff) or permanently strand a device that never
-    /// actually registered once its key gets fixed or capacity frees up (treating backoff as
-    /// success). A device with neither flag set — the ordinary case — always attempts
-    /// registration, matching the code before this method existed.
+    /// True while a persisted registration backoff window is open (`RegistrationPolicy`). It means
+    /// "gave up for now", never "succeeded": the two are separate keys.
     private func deviceRegistrationBackoffActive() -> Bool {
-        RegistrationBackoff.isActive(storage: storage, now: now())
+        registrationPolicy.openWindow() != nil
     }
-
     /// One `outcome` value per terminal HTTP status, matching this repo's bug-fix
     /// observability convention (CLAUDE.md "Bug-fix observability rule") of a distinct
     /// enum-shaped value per failure mode rather than a single generic string. 422 is NOT
     /// here — it is `.capReached`, not `.terminalFailure`, and its own branch above stamps
     /// `"device_cap_reached"` directly.
-    private static func terminalFailureOutcome(for statusCode: Int) -> String {
-        switch statusCode {
+    private static func terminalFailureOutcome(for rejection: RegistrationRejection) -> String {
+        if rejection.reason == RegistrationRejection.validationError { return "invalid_request" }
+        switch rejection.statusCode {
         case 400: return "invalid_request"
         case 401: return "revoked_key"
         case 403: return "forbidden"
@@ -2619,8 +2966,18 @@ public final class SheepitClient: @unchecked Sendable {
     /// here, but `takeNewSessionFlag()` has already consumed the flag by then,
     /// so the inner call returns immediately. `rolloverIfExpired()` on that
     /// inner pass is likewise a no-op, having just reset `sessionLastSeen`.
+    ///
+    /// Also announces the session that just aged out (`$session_end`), BEFORE the start of its
+    /// successor. Both are taken first so the nested `track()` calls find nothing owed.
     internal func emitSessionStartIfOwed() {
-        guard context.takeNewSessionFlag() else { return }
+        guard !destroyedFlag.value else { return }
+        let ended = context.takeEndedSession()
+        let startOwed = context.takeNewSessionFlag()
+        if let ended {
+            trackSessionEnd(ended)
+            context.markSessionEndQueued(ended.id)
+        }
+        guard startOwed else { return }
         track("$session_start", properties: ["is_first_session": context.takeIsFirstSession()])
     }
 

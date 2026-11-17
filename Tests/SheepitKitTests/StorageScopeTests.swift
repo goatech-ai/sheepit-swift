@@ -35,7 +35,8 @@ final class StorageScopeTests: XCTestCase {
 
         XCTAssertEqual(base.string(forKey: "\(StorageKeys.deviceRegistered):abc"), "1")
         XCTAssertNil(base.string(forKey: StorageKeys.deviceRegistered))
-        XCTAssertEqual(base.string(forKey: StorageKeys.deviceId), "device", "the device id is shared by every scope")
+        XCTAssertEqual(base.string(forKey: "\(StorageKeys.deviceId):abc"), "device", "the device id is scoped (0.10.0, like sdk-js)")
+        XCTAssertNil(base.string(forKey: StorageKeys.deviceId))
         for key in [StorageKeys.anonymousId, StorageKeys.identity, StorageKeys.sessionId, StorageKeys.installedAppVersion] {
             XCTAssertEqual(scoped.resolve(key), key)
         }

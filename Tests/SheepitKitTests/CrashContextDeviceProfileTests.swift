@@ -16,14 +16,8 @@ import SheepitCrashHandler
 /// returning — the window where handlers are live never overlaps an actual fault and never
 /// leaks into another test's process state.
 final class CrashContextDeviceProfileTests: XCTestCase {
-    func testUpdateContextFillsTheDeviceProfileFieldsCrashReportReaderAlreadyExpects() throws {
-        let url = FileManager.default.temporaryDirectory
-            .appendingPathComponent("sheepit-crash-device-profile-\(UUID().uuidString).bin")
-        defer { try? FileManager.default.removeItem(at: url) }
-
-        XCTAssertEqual(sheepit_crash_handler_install(url.path), 0, "precondition: handler must install")
-        defer { sheepit_crash_handler_uninstall() }
-
+    func testUpdateContextFillsTheDeviceProfileFieldsCrashReportReaderAlreadyExpects() async throws {
+        let directory = CrashFixtures.tempDirectory("crash-device-profile")
         let reporter = CrashReporter(
             http: HTTPClient(
                 config: SheepitConfig(
@@ -37,8 +31,12 @@ final class CrashContextDeviceProfileTests: XCTestCase {
             appVersionOverride: "7.4.0-override",
             storage: InMemoryStorage(),
             log: Logger(debug: false),
-            appState: AppForegroundState(launchedInBackground: false, tracksAppState: true)
+            appState: AppForegroundState(launchedInBackground: false, tracksAppState: true),
+            crashDirectory: directory
         )
+        await reporter.start()
+        addTeardownBlock { await reporter.stop(); try? FileManager.default.removeItem(at: directory) }
+        let url = URL(fileURLWithPath: reporter.crashFilePath)
         reporter.updateContext()
 
         // updateContext() only stamps the CONTEXT sub-struct's own magic — a real crash

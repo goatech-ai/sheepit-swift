@@ -30,7 +30,7 @@ final class ConfigCacheBypassTests: XCTestCase {
             refreshInterval: 3600,
             log: Logger(debug: false),
             identityProvider: { (.fetchedUnder("user-a"), 0) },
-            onConfig: { _, _ in }
+            onConfig: { _, _, _ in }
         )
 
         await sync.refetchUnconditionally(deviceId: "device-1")

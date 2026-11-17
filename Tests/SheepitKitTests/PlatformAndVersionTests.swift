@@ -51,7 +51,7 @@ final class PlatformAndVersionTests: XCTestCase {
             .deletingLastPathComponent() // Tests
             .deletingLastPathComponent() // sdk-swift
             .deletingLastPathComponent() // packages
-            .appendingPathComponent("shared/src/schemas/platform.ts")
+            .appendingPathComponent("shared/src/schemas/platform-surface.ts")
         guard let source = try? String(contentsOf: schema, encoding: .utf8) else {
             throw XCTSkip("packages/shared is not next to this package (standalone checkout)")
         }
@@ -82,7 +82,7 @@ final class PlatformAndVersionTests: XCTestCase {
 
         let body = try JSONSerialization.jsonObject(with: JSONEncoder().encode(
             DeviceManager.registrationRequest(
-                anonymousId: "anon", existingDeviceId: nil, appVersionOverride: nil, locale: Locale(identifier: "en_US")
+                anonymousId: "anon", proposedDeviceId: "dev-1", appVersionOverride: nil, locale: Locale(identifier: "en_US")
             )
         )) as? [String: Any]
         XCTAssertEqual(body?["platform"] as? String, DeviceProfile.platform)
@@ -113,7 +113,7 @@ final class PlatformAndVersionTests: XCTestCase {
             XCTAssertEqual(TrackSnapshot.capture(appVersion: override).appVersion, resolved, override)
             let body = try JSONSerialization.jsonObject(with: JSONEncoder().encode(
                 DeviceManager.registrationRequest(
-                    anonymousId: "anon", existingDeviceId: nil, appVersionOverride: override,
+                    anonymousId: "anon", proposedDeviceId: "dev-1", appVersionOverride: override,
                     locale: Locale(identifier: "en_US")
                 )
             )) as? [String: Any]

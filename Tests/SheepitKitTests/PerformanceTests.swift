@@ -40,7 +40,7 @@ final class PerformanceTests: XCTestCase {
 
     func testSheepitConfigIncludesPerformance() {
         let config = SheepitConfig(
-            apiKey: "lp_pub_test_0000000000000000000000000000000000000000000000000000000000000000",
+            apiKey: "lp_pub_tst_0000000000000000000000000000000000000000000000000000000000000000",
             performance: PerformanceConfig(enabled: true)
         )
         XCTAssertTrue(config.performance.enabled)
@@ -48,7 +48,7 @@ final class PerformanceTests: XCTestCase {
 
     func testSheepitConfigDefaultPerformanceDisabled() {
         let config = SheepitConfig(
-            apiKey: "lp_pub_test_0000000000000000000000000000000000000000000000000000000000000000"
+            apiKey: "lp_pub_tst_0000000000000000000000000000000000000000000000000000000000000000"
         )
         XCTAssertFalse(config.performance.enabled)
     }
@@ -220,8 +220,7 @@ final class PerformanceTests: XCTestCase {
             deviceId: "dev_xyz",
             country: "US",
             networkType: nil,
-            activeFlags: nil,
-            activeExperiments: nil
+            activeFlags: nil
         )
 
         let request = PerfBatchRequest(

@@ -21,9 +21,9 @@ final class DeviceRegistrationTests: XCTestCase {
     /// suite cares about around each test, not swapping in a fresh store.
     private func clearDeviceStorage() {
         guard let defaults = UserDefaults(suiteName: suiteName) else { return }
-        defaults.removeObject(forKey: StorageKeys.deviceId)
+        SharedSDKStorage.remove(StorageKeys.deviceId, from: defaults)
         SharedSDKStorage.remove(StorageKeys.deviceRegistered, from: defaults)
-        SharedSDKStorage.remove(StorageKeys.deviceRegistrationBackoffUntil, from: defaults)
+        SharedSDKStorage.remove(StorageKeys.deviceRegistrationBackoff, from: defaults)
         defaults.removeObject(forKey: StorageKeys.sessionId)
         defaults.removeObject(forKey: StorageKeys.sessionLastSeen)
         // A prior run of `testSuccessfulRegistrationAdoptsTheServerIdAndIdentifyAwaitsIt`
@@ -70,6 +70,13 @@ final class DeviceRegistrationTests: XCTestCase {
         "config":{"flush_interval_ms":1000,"flush_size":20}}}
         """
     }
+
+    /// The API's own 422 / 402 cap envelopes: a bare 402/422 (no envelope) is transient.
+    private static let deviceCapBody = #"{"error":{"code":"LIMIT_REACHED","message":"Device limit reached."}}"#
+    private static let dailyCapBody = #"{"error":{"code":"PREVIEW_LIMIT_EXCEEDED","message":"Daily cap reached."}}"#
+
+    /// The API's own 401 envelope: only this is terminal (a bare 401 from a proxy is transient).
+    private static let revokedKeyBody = #"{"error":{"code":"API_KEY_REVOKED","message":"This API key was revoked."}}"#
 
     private let configSuccessBody = """
     {"data":{"config_version":"1","etag":"e1","flags":{},"experiments":{}}}
@@ -196,18 +203,16 @@ final class DeviceRegistrationTests: XCTestCase {
         )
     }
 
-    // MARK: - 2.2 Fresh install — no device id sent
+    // MARK: - 2.2 Fresh install — proposes its own id (contract § 1)
 
-    /// `DeviceRegisterRequest.deviceId` is `String?`; Swift's synthesized `Encodable` omits a
-    /// nil optional via `encodeIfPresent` rather than encoding a JSON `null`. Assert the key
-    /// is ABSENT, not merely nil-typed, since the two are observably different on the wire
-    /// and the server branches on `providedDeviceId ?? mintNew()`
-    /// (`apps/api/src/routes/v1/devices.ts:139`).
-    func testFreshInstallSendsNoDeviceIdKey() async {
-        // No `gt_device_id` seeded — `clearDeviceStorage()` in `setUp()` already guarantees this.
+    /// "Client proposes, server disposes": a fresh install proposes the UUID it minted and is
+    /// already using. 0.9.x omitted `device_id` here, so the server minted `dev_…` and every
+    /// pre-registration event and config fetch named an id the server never issued. Fails against
+    /// that code: the key was absent.
+    func testFreshInstallProposesTheIdItIsAlreadyUsing() async {
         RegistrationStubURLProtocol.setResponder { method, path in
             if method == "POST", path == SDKEndpoints.deviceRegister {
-                return .status(200, body: self.registerSuccessBody(deviceId: "dev_fresh"))
+                return .status(500, body: "{}")
             }
             return .status(200, body: self.configSuccessBody)
         }
@@ -218,27 +223,16 @@ final class DeviceRegistrationTests: XCTestCase {
             urlProtocolClasses: [RegistrationStubURLProtocol.self]
         )
         defer { client.destroy() }
+        let minted = client.status().deviceId
 
         await waitUntil {
             RegistrationStubURLProtocol.requests(method: "POST", path: SDKEndpoints.deviceRegister).count >= 1
         }
-
-        let registerRequests = RegistrationStubURLProtocol.requests(
-            method: "POST", path: SDKEndpoints.deviceRegister
-        )
-        guard
-            let body = registerRequests.first?.body,
-            let json = try? JSONSerialization.jsonObject(with: body) as? [String: Any]
-        else {
-            XCTFail("register request must carry a JSON body")
-            return
-        }
-
-        XCTAssertNil(
-            json["device_id"],
-            "a fresh install must send no device_id key at all, so the server mints one — a " +
-            "present (even null) key would defeat server-side id assignment"
-        )
+        let body = RegistrationStubURLProtocol.requests(method: "POST", path: SDKEndpoints.deviceRegister).first?.body
+        let json = body.flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] }
+        XCTAssertEqual(json?["device_id"] as? String, minted, "the first attempt proposes the minted id, never nil")
+        XCTAssertEqual(UserDefaults(suiteName: suiteName)?.string(forKey: SharedSDKStorage.slot(StorageKeys.deviceId)), minted,
+                       "the minted id is persisted before registration answers")
     }
 
     // MARK: - 2.3 A locally-minted id — the state EVERY real existing install is actually in
@@ -553,7 +547,7 @@ final class DeviceRegistrationTests: XCTestCase {
     func testTerminalFailureBacksOffWithoutClaimingSuccessAndEmitsADiagnostic() async {
         RegistrationStubURLProtocol.setResponder { method, path in
             if method == "POST", path == SDKEndpoints.deviceRegister {
-                return .status(401, body: "{}")
+                return .status(401, body: Self.revokedKeyBody)
             }
             return .status(200, body: self.configSuccessBody)
         }
@@ -577,16 +571,12 @@ final class DeviceRegistrationTests: XCTestCase {
             "a terminal failure must never be recorded as a success"
         )
 
-        guard
-            let raw = UserDefaults(suiteName: suiteName)?.string(
-                forKey: SharedSDKStorage.slot(StorageKeys.deviceRegistrationBackoffUntil)
-            ),
-            let until = TimeInterval(raw)
-        else {
+        guard let until = SharedSDKStorage.backoffRecord()?.until else {
             XCTFail("a terminal failure must record a backoff window")
             return
         }
-        XCTAssertGreaterThan(until, fixedNow.timeIntervalSince1970, "the window must be in the future")
+        XCTAssertEqual(until, fixedNow.timeIntervalSince1970 + SDKDefaults.deviceRegistrationTerminalBackoff,
+                       "a terminal answer is a flat 24 h window")
 
         let diagnostic = client.getRecentDiagnostics().first {
             $0.code == "identity.device_registration_terminal_failure"
@@ -603,7 +593,7 @@ final class DeviceRegistrationTests: XCTestCase {
     func testTerminalFailureDoesNotRetryWithinTheBackoffWindow() async {
         RegistrationStubURLProtocol.setResponder { method, path in
             if method == "POST", path == SDKEndpoints.deviceRegister {
-                return .status(401, body: "{}")
+                return .status(401, body: Self.revokedKeyBody)
             }
             return .status(200, body: self.configSuccessBody)
         }
@@ -642,7 +632,7 @@ final class DeviceRegistrationTests: XCTestCase {
     func testTerminalFailureRetriesAfterTheBackoffWindowElapses() async {
         RegistrationStubURLProtocol.setResponder { method, path in
             if method == "POST", path == SDKEndpoints.deviceRegister {
-                return .status(401, body: "{}")
+                return .status(401, body: Self.revokedKeyBody)
             }
             return .status(200, body: self.configSuccessBody)
         }
@@ -660,10 +650,7 @@ final class DeviceRegistrationTests: XCTestCase {
         // for the POST to have been sent. The `waitUntil` above only proves the request
         // left; the response still has to come back and be written. A fixed 50ms sleep
         // raced that write and failed ~20% of runs.
-        await waitUntil {
-            UserDefaults(suiteName: self.suiteName)?
-                .string(forKey: SharedSDKStorage.slot(StorageKeys.deviceRegistrationBackoffUntil)) != nil
-        }
+        await waitUntil { SharedSDKStorage.backoffRecord() != nil }
         first.destroy()
 
         RegistrationStubURLProtocol.setResponder { method, path in
@@ -701,17 +688,13 @@ final class DeviceRegistrationTests: XCTestCase {
 
     // MARK: - 7b. 422 (environment device cap) is CAPPED, not TERMINAL (client-trust hardening, 2026-09-29)
 
-    /// 🔴 A 422 used to share `RegistrationOutcome.terminalFailure`'s flat 24h backoff with a
-    /// revoked key (401/403) — but unlike those, this device did nothing wrong: the
-    /// environment's `MAX_DEVICES_PER_ENVIRONMENT` ceiling is operator-raisable, and hosted's
-    /// default (100,000) means a device landing on it is plausibly close to being under it
-    /// again soon. Split into its own `.capReached` case with a SHORTER window
-    /// (`SDKDefaults.deviceRegistrationCapBackoff`, 1h) — this test pins that it is NOT the
-    /// 24h terminal window, and that it gets its own diagnostic code and outcome.
+    /// 🔴 A 422 is not a revoked key: the environment ceiling is operator-raisable, so it gets the
+    /// cap class (full jitter under a 1 h cap), never the flat 24 h terminal window, and its own
+    /// diagnostic code. First failure: `failures_total` before it is 0, so the window is the 1 s floor.
     func testDeviceCapBacksOffOnAShorterWindowThanATerminalFailure() async {
         RegistrationStubURLProtocol.setResponder { method, path in
             if method == "POST", path == SDKEndpoints.deviceRegister {
-                return .status(422, body: "{}")
+                return .status(422, body: Self.deviceCapBody)
             }
             return .status(200, body: self.configSuccessBody)
         }
@@ -724,37 +707,15 @@ final class DeviceRegistrationTests: XCTestCase {
         )
         defer { client.destroy() }
 
-        await waitUntil {
-            RegistrationStubURLProtocol.requests(method: "POST", path: SDKEndpoints.deviceRegister).count >= 1
-        }
-        try? await Task.sleep(for: .milliseconds(50))
+        await waitUntil { SharedSDKStorage.backoffRecord() != nil }
 
         XCTAssertNil(
             UserDefaults(suiteName: suiteName)?.string(forKey: SharedSDKStorage.slot(StorageKeys.deviceRegistered)),
             "a capped registration must never be recorded as a success"
         )
-
-        guard
-            let raw = UserDefaults(suiteName: suiteName)?.string(
-                forKey: SharedSDKStorage.slot(StorageKeys.deviceRegistrationBackoffUntil)
-            ),
-            let until = TimeInterval(raw)
-        else {
-            XCTFail("a 422 must record a backoff window")
-            return
-        }
-        let remaining = until - fixedNow.timeIntervalSince1970
-        XCTAssertEqual(
-            remaining,
-            SDKDefaults.deviceRegistrationCapBackoff,
-            accuracy: 1,
-            "the window must be the SHORTER cap backoff, not the 24h terminal one"
-        )
-        XCTAssertLessThan(
-            SDKDefaults.deviceRegistrationCapBackoff,
-            SDKDefaults.deviceRegistrationTerminalBackoff,
-            "the cap backoff must be strictly shorter than the terminal one — the whole point of the split"
-        )
+        let record = SharedSDKStorage.backoffRecord()
+        XCTAssertTrue((1...2).contains((record?.until ?? 0) - fixedNow.timeIntervalSince1970), "the first cap window is jittered in [1 s, 2 s]")
+        XCTAssertEqual(record?.failuresTotal, 1)
 
         let diagnostic = client.getRecentDiagnostics().first {
             $0.code == "identity.device_registration_cap_reached"
@@ -762,41 +723,31 @@ final class DeviceRegistrationTests: XCTestCase {
         XCTAssertNotNil(diagnostic, "a 422 gets its own diagnostic code, distinct from a terminal failure")
     }
 
-    /// A device inside the cap-backoff window must not retry on the next cold start — same
-    /// "don't hammer the endpoint" guarantee `testTerminalFailureDoesNotRetryWithinTheBackoffWindow`
-    /// pins for a terminal failure, over the shorter window.
+    /// A launch inside a persisted cap window sends nothing — same "don't hammer" guarantee
+    /// `testTerminalFailureDoesNotRetryWithinTheBackoffWindow` pins for a terminal failure.
     func testDeviceCapDoesNotRetryWithinItsBackoffWindow() async {
         RegistrationStubURLProtocol.setResponder { method, path in
             if method == "POST", path == SDKEndpoints.deviceRegister {
-                return .status(422, body: "{}")
+                return .status(422, body: Self.deviceCapBody)
             }
             return .status(200, body: self.configSuccessBody)
         }
-
         let fixedNow = Date(timeIntervalSince1970: 1_700_000_000)
-        let first = SheepitClient.createForTesting(
-            config: makeConfig(),
-            now: { fixedNow },
-            urlProtocolClasses: [RegistrationStubURLProtocol.self]
-        )
-        await waitUntil {
-            RegistrationStubURLProtocol.requests(method: "POST", path: SDKEndpoints.deviceRegister).count >= 1
-        }
-        try? await Task.sleep(for: .milliseconds(50))
-        first.destroy()
+        // An escalated cap window, as several earlier capped launches leave it.
+        SharedSDKStorage.seedBackoff(until: fixedNow.addingTimeInterval(1_800), failuresTotal: 11)
 
-        let second = SheepitClient.createForTesting(
+        let client = SheepitClient.createForTesting(
             config: makeConfig(),
-            now: { fixedNow.addingTimeInterval(60) }, // one minute later — inside the 1h window
+            now: { fixedNow.addingTimeInterval(60) },
             urlProtocolClasses: [RegistrationStubURLProtocol.self]
         )
-        defer { second.destroy() }
-        try? await Task.sleep(for: .milliseconds(100))
+        defer { client.destroy() }
+        try? await Task.sleep(for: .milliseconds(200))
 
         XCTAssertEqual(
             RegistrationStubURLProtocol.requests(method: "POST", path: SDKEndpoints.deviceRegister).count,
-            1,
-            "a second launch inside the cap-backoff window must not retry"
+            0,
+            "a launch inside the cap-backoff window must not retry"
         )
     }
 
@@ -807,7 +758,7 @@ final class DeviceRegistrationTests: XCTestCase {
     func test402AlsoMapsToCapReachedWithItsOwnBackoffWindow() async {
         RegistrationStubURLProtocol.setResponder { method, path in
             if method == "POST", path == SDKEndpoints.deviceRegister {
-                return .status(402, body: "{}")
+                return .status(402, body: Self.dailyCapBody)
             }
             return .status(200, body: self.configSuccessBody)
         }
@@ -830,55 +781,46 @@ final class DeviceRegistrationTests: XCTestCase {
         }
         XCTAssertNotNil(diagnostic, "402 gets the cap-reached diagnostic, same as 422")
 
-        guard
-            let raw = UserDefaults(suiteName: suiteName)?.string(
-                forKey: SharedSDKStorage.slot(StorageKeys.deviceRegistrationBackoffUntil)
-            ),
-            let until = TimeInterval(raw)
-        else {
+        guard let until = SharedSDKStorage.backoffRecord()?.until else {
             XCTFail("402, like 422, must record a backoff window")
             return
         }
-        XCTAssertEqual(
-            until - fixedNow.timeIntervalSince1970,
-            SDKDefaults.deviceRegistrationCapBackoff,
-            accuracy: 1
-        )
+        XCTAssertTrue((1...2).contains(until - fixedNow.timeIntervalSince1970))
     }
 
-    /// 429 gets its own `.rateLimited` outcome — fix round 2, item 12: unlike 402/422, it must
-    /// NOT persist the cross-cold-start backoff window (a rate limit is not a durable capacity
-    /// fact the way a device/daily cap is).
-    func test429MapsToRateLimitedAndDoesNotPersistABackoffWindow() async {
+    /// 429 gets its own `rate_limited` outcome and, since 0.10.0, persists its window like every
+    /// failure (contract § 3): 0.9.x persisted nothing, so a relaunch inside the server's
+    /// `Retry-After` re-sent at once. A longer `Retry-After` wins over the jittered value.
+    func test429PersistsARateLimitWindowHonouringRetryAfter() async {
         RegistrationStubURLProtocol.setResponder { method, path in
             if method == "POST", path == SDKEndpoints.deviceRegister {
-                return .status(429, body: "{}")
+                return .withHeaders(429, body: "{}", headers: ["Retry-After": "120"])
             }
             return .status(200, body: self.configSuccessBody)
         }
 
+        let fixedNow = Date(timeIntervalSince1970: 1_700_000_000)
         let client = SheepitClient.createForTesting(
             config: makeConfig(),
-            now: { Date() },
+            now: { fixedNow },
             urlProtocolClasses: [RegistrationStubURLProtocol.self]
         )
         defer { client.destroy() }
 
         await waitUntil {
-            RegistrationStubURLProtocol.requests(method: "POST", path: SDKEndpoints.deviceRegister).count >= 1
+            client.getRecentDiagnostics().contains {
+                $0.code == "identity.device_registration_cap_reached" &&
+                    ($0.data?["outcome"]?.value as? String) == "rate_limited"
+            }
         }
-        try? await Task.sleep(for: .milliseconds(50))
 
         let diagnostic = client.getRecentDiagnostics().first {
             $0.code == "identity.device_registration_cap_reached" &&
                 ($0.data?["outcome"]?.value as? String) == "rate_limited"
         }
         XCTAssertNotNil(diagnostic, "429 gets its own outcome value, distinct from a 402/422")
-
-        XCTAssertNil(
-            UserDefaults(suiteName: suiteName)?.string(forKey: SharedSDKStorage.slot(StorageKeys.deviceRegistrationBackoffUntil)),
-            "a 429 must NOT persist the cross-cold-start backoff window — only 402/422 do"
-        )
+        XCTAssertEqual((SharedSDKStorage.backoffRecord()?.until ?? 0) - fixedNow.timeIntervalSince1970, 120, accuracy: 0.001,
+                       "the 429's Retry-After is persisted as the window")
     }
 
     /// The in-session retry chain actually reaches success after a transient cap failure —
@@ -893,7 +835,7 @@ final class DeviceRegistrationTests: XCTestCase {
         let attempts = LockedCounter()
         RegistrationStubURLProtocol.setResponder { method, path in
             if method == "POST", path == SDKEndpoints.deviceRegister {
-                if attempts.incrementAndGet() == 1 { return .status(422, body: "{}") }
+                if attempts.incrementAndGet() == 1 { return .status(422, body: Self.deviceCapBody) }
                 return .status(200, body: self.registerSuccessBody(deviceId: "dev_after_cap_retry"))
             }
             return .status(200, body: self.configSuccessBody)
@@ -906,9 +848,8 @@ final class DeviceRegistrationTests: XCTestCase {
         )
         defer { client.destroy() }
 
-        // The first (failing) attempt is real-time-bounded at ~1s by
-        // `RegistrationRetryPolicy` at failures=0 — see `RegistrationRetryPolicyTests`. Poll
-        // well past that, but nowhere near the 1h ceiling this chain would otherwise use.
+        // The first (failing) attempt waits the 1 s floor (`RegistrationPolicy`, failures before
+        // it = 0). Poll well past that, but nowhere near the 1h ceiling.
         await waitUntil(timeout: 3.0) {
             RegistrationStubURLProtocol.requests(method: "POST", path: SDKEndpoints.deviceRegister).count >= 2
         }
@@ -917,7 +858,7 @@ final class DeviceRegistrationTests: XCTestCase {
         }
         XCTAssertEqual(client.status().deviceId, "dev_after_cap_retry")
         XCTAssertNil(
-            UserDefaults(suiteName: suiteName)?.string(forKey: SharedSDKStorage.slot(StorageKeys.deviceRegistrationBackoffUntil)),
+            SharedSDKStorage.backoffRecord(),
             "a chain that eventually succeeds must clear whatever backoff the failed attempt recorded"
         )
     }
@@ -928,7 +869,7 @@ final class DeviceRegistrationTests: XCTestCase {
     func testInSessionRetryChainStopsOnTeardown() async {
         RegistrationStubURLProtocol.setResponder { method, path in
             if method == "POST", path == SDKEndpoints.deviceRegister {
-                return .status(422, body: "{}") // never succeeds
+                return .status(422, body: Self.deviceCapBody) // never succeeds
             }
             return .status(200, body: self.configSuccessBody)
         }
@@ -966,7 +907,7 @@ final class DeviceRegistrationTests: XCTestCase {
     func testIdentifyIsNotBlockedByTheInSessionRetryChain() async {
         RegistrationStubURLProtocol.setResponder { method, path in
             if method == "POST", path == SDKEndpoints.deviceRegister {
-                return .status(422, body: "{}") // never succeeds within this test's window
+                return .status(422, body: Self.deviceCapBody) // never succeeds within this test's window
             }
             if method == "POST", path.contains("/identify") {
                 return .status(200, body: "{}")
@@ -1015,8 +956,13 @@ final class DeviceRegistrationTests: XCTestCase {
     /// `awaitDeviceIdSettlementForAutoFlush`, which only the AUTO-flush path goes through), so
     /// a flush landing between the two statements is reachable in production, not just here.
     ///
-    /// The seam: `ContextManager.setDeviceId` writes `StorageKeys.deviceId` to `UserDefaults`
-    /// WHILE HOLDING its own non-recursive lock, and `UserDefaults` KVO fires INLINE — on the
+    /// 0.10.0 ordering guard (device registration contract § 1 (c)): a server-replaced id is
+    /// written to disk BEFORE any queued event is re-stamped to it, so no event naming the adopted
+    /// id can leave the device while the id itself is not durable. The KVO seam fires on that first
+    /// disk write of "dev_race" (`ContextManager.persistDeviceIdAhead`); a flush landing right there
+    /// must still ship the PRE-registration id. Re-stamping first (0.9.x's order) ships "dev_race".
+    ///
+    /// The seam: the first write of the adopted id to `UserDefaults`, and `UserDefaults` KVO fires INLINE — on the
     /// calling thread, before `set(_:forKey:)` returns — verified empirically before writing
     /// this test (a throwaway `swift` script; also holds across two separately-created
     /// `UserDefaults(suiteName:)` instances for the same suite, matching production: the SDK's
@@ -1037,7 +983,7 @@ final class DeviceRegistrationTests: XCTestCase {
     /// microseconds before a real network round trip could, even a stubbed one — silently
     /// passing either order and defeating the whole point of this test. Every wait below is
     /// bounded so a broken seam fails the assertion rather than hanging the suite.
-    func testRestampBeforeAdoptOrderingMeansAFlushDuringRegistrationShipsTheNewId() async {
+    func testTheAdoptedIdIsPersistedBeforeAnyQueuedEventIsReStampedToIt() async {
         // Deliberately slower than an ordinary local-stub response — see `Stub.delayed`'s
         // doc, and `testAutoFlushWaitsForRegistrationSoTheWireBatchCarriesTheAdoptedId`
         // above, which uses the same technique for the same reason. Measured with temporary
@@ -1088,7 +1034,7 @@ final class DeviceRegistrationTests: XCTestCase {
         // `$session_start` (enqueued synchronously in `start()`) was stamped with.
         guard
             let preRegistrationDeviceId = UserDefaults(suiteName: suiteName)?
-                .string(forKey: StorageKeys.deviceId)
+                .string(forKey: SharedSDKStorage.slot(StorageKeys.deviceId))
         else {
             XCTFail("client must have persisted a device id by the time createForTesting() returns")
             return
@@ -1123,8 +1069,8 @@ final class DeviceRegistrationTests: XCTestCase {
             _ = flushLanded.wait(timeout: .now() + 15.0)
         }
         let observerDefaults = UserDefaults(suiteName: suiteName)!
-        observerDefaults.addObserver(observer, forKeyPath: StorageKeys.deviceId, options: [.new], context: nil)
-        defer { observerDefaults.removeObserver(observer, forKeyPath: StorageKeys.deviceId) }
+        observerDefaults.addObserver(observer, forKeyPath: SharedSDKStorage.slot(StorageKeys.deviceId), options: [.new], context: nil)
+        defer { observerDefaults.removeObserver(observer, forKeyPath: SharedSDKStorage.slot(StorageKeys.deviceId)) }
 
         let flushThread = Thread {
             guard kvoFired.wait(timeout: .now() + 10.0) == .success else { return }
@@ -1181,11 +1127,10 @@ final class DeviceRegistrationTests: XCTestCase {
         )
         XCTAssertEqual(
             shippedDeviceId,
-            "dev_race",
-            "a flush landing between restampDeviceId and setDeviceId must still ship the NEW " +
-            "server-assigned id — restampDeviceId runs FIRST, so every queued head is already " +
-            "re-stamped by the time setDeviceId's KVO write fires. A failure here means the " +
-            "two statements in SheepitClient's `case .success(let deviceId):` were reordered."
+            preRegistrationDeviceId,
+            "the adopted id is persisted before the queues are re-stamped: a flush at that first " +
+            "disk write must not yet see any event re-stamped to an id that is not durable. A " +
+            "failure here means `adoptLaunchRegistration` re-stamps before `persistDeviceIdAhead`."
         )
     }
 }
@@ -1193,7 +1138,7 @@ final class DeviceRegistrationTests: XCTestCase {
 /// Signals a caller-supplied closure synchronously from `UserDefaults`'s KVO callback. Kept
 /// to a single responsibility (fire a closure, nothing else) so the deadlock-hazard doc on
 /// its one call site stays accurate — see
-/// `testRestampBeforeAdoptOrderingMeansAFlushDuringRegistrationShipsTheNewId`.
+/// `testTheAdoptedIdIsPersistedBeforeAnyQueuedEventIsReStampedToIt`.
 private final class DeviceIdKVOObserver: NSObject {
     private let expectedNewValue: String
     private let onChange: () -> Void
@@ -1234,6 +1179,9 @@ final class RegistrationStubURLProtocol: URLProtocol, @unchecked Sendable {
 
     enum Stub {
         case status(Int, body: String)
+        case withHeaders(Int, body: String, headers: [String: String])
+        /// The transport fails with `error` (no response at all).
+        case failure(Error)
         /// Answers after `seconds` on a background `Task` rather than synchronously inside
         /// `startLoading()`. Needed to make the auto-flush-ordering tests deterministic: a
         /// same-thread synchronous stub resolves "registration" faster than any
@@ -1326,8 +1274,12 @@ final class RegistrationStubURLProtocol: URLProtocol, @unchecked Sendable {
     private func deliver(_ stub: Stub, url: URL) {
         switch stub {
         case .status(let code, let body):
+            deliver(.withHeaders(code, body: body, headers: [:]), url: url)
+        case .failure(let error):
+            client?.urlProtocol(self, didFailWithError: error)
+        case .withHeaders(let code, let body, let headers):
             guard let response = HTTPURLResponse(
-                url: url, statusCode: code, httpVersion: "HTTP/1.1", headerFields: [:]
+                url: url, statusCode: code, httpVersion: "HTTP/1.1", headerFields: headers
             ) else {
                 client?.urlProtocol(self, didFailWithError: URLError(.badServerResponse))
                 return

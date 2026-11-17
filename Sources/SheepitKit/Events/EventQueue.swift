@@ -27,14 +27,15 @@ struct EnrichedEvent: Codable, Sendable {
     /// decodes it as `nil`, and `Transport` then OMITS those dimensions — it never fills
     /// them in from whatever app and OS happen to be running at flush.
     let snapshot: TrackSnapshot?
-    /// Every experiment assignment active when this event was tracked, keyed by experiment key
-    /// (the ingest correctness design, §2.3). Frozen here for the same reason as `snapshot`: an
-    /// event flushed after a new `/v1/config`, an `identify()` or a relaunch must still name the
-    /// arm it was produced under. `nil` when none were active, and for every event queued by an
-    /// SDK that predates this field; `Transport` then sends no experiment context at all.
-    ///
-    /// 🔴 Optional for the decode-safety reason on `snapshot`.
-    let assignments: [String: EventAssignment]?
+    /// Receipt from the applied config at capture time. Legacy assignment maps are ignored
+    /// while decoding old queues and never written or reconstructed during replay.
+    let assignmentReceipt: AssignmentReceipt?
+
+    // Legacy maps are intentionally ignored on decode and never persisted again.
+    enum CodingKeys: String, CodingKey {
+        case eventId, eventName, eventProperties, deviceId, anonymousId, sessionId, userId
+        case platform, sdkVersion, locale, timezone, timestamp, snapshot, assignmentReceipt
+    }
 
     init(
         eventId: String,
@@ -50,7 +51,7 @@ struct EnrichedEvent: Codable, Sendable {
         timezone: String,
         timestamp: String,
         snapshot: TrackSnapshot? = nil,
-        assignments: [String: EventAssignment]? = nil
+        assignmentReceipt: AssignmentReceipt? = nil
     ) {
         self.eventId = eventId
         self.eventName = eventName
@@ -65,13 +66,13 @@ struct EnrichedEvent: Codable, Sendable {
         self.timezone = timezone
         self.timestamp = timestamp
         self.snapshot = snapshot
-        self.assignments = assignments
+        self.assignmentReceipt = assignmentReceipt
     }
 
     /// Every field copied except `deviceId`. Used ONLY by
     /// `EventQueue.restampDeviceId(from:to:)` — see its doc for why a queued event's
     /// device id is ever rewritten after enqueue. That restamp is the ONLY identity repair
-    /// §2.2 allows: user, session, snapshot and assignments are copied verbatim, never
+    /// §2.2 allows: user, session, snapshot and receipt are copied verbatim, never
     /// refreshed.
     func withDeviceId(_ newDeviceId: String) -> EnrichedEvent {
         EnrichedEvent(
@@ -88,7 +89,10 @@ struct EnrichedEvent: Codable, Sendable {
             timezone: timezone,
             timestamp: timestamp,
             snapshot: snapshot,
-            assignments: assignments
+            // A receipt is bound to the device row it was issued for; the re-stamped event names another,
+            // which the server would resolve as `subject_mismatch`. It keeps an explicit `identity_changed`
+            // status and loses its token: no claim.
+            assignmentReceipt: assignmentReceipt.map { AssignmentReceipt(token: nil, identityChanged: $0.status != nil) }
         )
     }
 }

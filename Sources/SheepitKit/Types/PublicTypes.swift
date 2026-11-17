@@ -27,19 +27,21 @@ public struct SheepitConfig: Sendable {
     /// `TimeInterval.sanitizedForSleep()` (finding MF-1).
     public var configRefreshInterval: TimeInterval
     /// The age past which a successful fetch was expected to have replaced the cached config.
-    /// An older cache is still applied (up to `configOfflineMaxAge`) and reported stale in
-    /// `status().configFreshness`. Default 24 hours. Must be finite and positive; it is lowered to
-    /// `configOfflineMaxAge` when larger. Validated again where it is used, since this is a `var`.
+    /// An older cache is still applied and reported stale in `status().configFreshness`; it only
+    /// reports, it deletes nothing. Default 24 hours. `.infinity` means never stale by age. Zero,
+    /// negative and NaN use the default; it is lowered to `configOfflineMaxAge` when larger.
+    /// Validated again where it is used, since this is a `var`.
     public var configStaleAfter: TimeInterval
     /// The oldest cached config applied at launch, measured from when the server last sent or
-    /// confirmed it (a 304). Checked at launch only. A device that cannot reach the server keeps the
-    /// flags and experiment assignments it last fetched for up to this long; past it the cache is
-    /// deleted and flags read their defaults until a fetch lands. A failed fetch never deletes the
-    /// cache, a successful one replaces it, and `reset()` deletes it. Default 7 days. Must be finite
-    /// and positive; an invalid value uses the default.
+    /// confirmed it (a 304). Default `.infinity`: no limit. A device that cannot reach the server
+    /// keeps the flags and experiment assignments it last fetched, whatever their age, until a
+    /// successful fetch replaces them or `reset()` deletes them (logout, so the next user of the
+    /// device never sees them). A failed fetch never deletes the cache.
     ///
-    /// Set it equal to `configStaleAfter` (`86_400`) for the behaviour of 0.8.0 and earlier, where
-    /// a cache more than 24 hours old was deleted at launch.
+    /// Set a finite number of seconds to bound how long a device that stops fetching serves old
+    /// targeting: checked at launch only, past it the cache is deleted and flags read their
+    /// defaults until a fetch lands. `604_800` (7 days) is the behaviour of 0.9.0 to 0.10.1;
+    /// `86_400` that of 0.8.0 and earlier. Zero, negative and NaN use the default.
     public var configOfflineMaxAge: TimeInterval
     /// Clamped to a floor of 1 here AND at the actual consumer, `EventQueue.init` — this is a
     /// public `var`, so `var cfg = ...; cfg.maxQueueSize = 0` bypasses this initializer clamp
@@ -50,6 +52,9 @@ public struct SheepitConfig: Sendable {
     /// `create()` (2026-09 security follow-up, round 2, finding M2; the mutation bypass is
     /// round 3, finding MF-1).
     public var maxQueueSize: Int
+    /// HTTP attempts per request for the SDK requests that retry in-line. Since 0.10.0 it does NOT
+    /// affect device registration, which sends one request per attempt under its own policy
+    /// (`Docs/Technical/SDK_DEVICE_REGISTRATION_CONTRACT.md` § 3).
     public var retryAttempts: Int
     public var debug: Bool
     public var onEvent: (@Sendable (String, [String: Any]?) -> Void)?
@@ -113,13 +118,17 @@ public struct SheepitConfig: Sendable {
     /// default; a started client logs which host that is. See `activeInfoPlistNotice`.
     var apiURLDefaultedFromInfoPlist = false
 
+    /// `init(apiKey:…)` was called without `apiUrl`, so it fell to the hosted default. Not set by
+    /// the Info.plist path, which passes its own value (`apiURLDefaultedFromInfoPlist`).
+    var apiURLWasOmitted = false
+
     /// Non-fatal Info.plist problems a started client logs. See `activeInfoPlistWarnings`.
     var infoPlistWarnings: [String] = []
 
     public init(
         apiKey: String,
         environment: String = "production",
-        apiUrl: String = SheepitConfig.defaultAPIUrl,
+        apiUrl: String? = nil,
         flushInterval: TimeInterval = 5.0,
         flushSize: Int = 20,
         configRefreshInterval: TimeInterval = 300,
@@ -136,11 +145,12 @@ public struct SheepitConfig: Sendable {
         allowFlagOverrides: Bool? = nil,
         requestTelemetryHosts: [String] = [],
         configStaleAfter: TimeInterval = 86_400,
-        configOfflineMaxAge: TimeInterval = 604_800
+        configOfflineMaxAge: TimeInterval = .infinity
     ) {
         self.apiKey = apiKey
         self.environment = environment
-        self.apiUrl = apiUrl
+        self.apiUrl = apiUrl ?? SheepitConfig.defaultAPIUrl
+        self.apiURLWasOmitted = apiUrl == nil
         self.flushInterval = flushInterval.sanitizedForSleep()
         self.flushSize = flushSize
         self.configRefreshInterval = configRefreshInterval.sanitizedForSleep()
@@ -435,7 +445,7 @@ enum SDKDefaults {
     /// `publish-sdk-swift.yml` refuses to release on a mismatch. The package
     /// is deliberately on `0.x` while the API settles, and `2.0.0` is reserved
     /// for the first stable release — see the CHANGELOG's "Version policy".
-    static let sdkVersion = "0.9.0"
+    static let sdkVersion = "0.11.0"
     /// Stamped on every ingest batch (`context.sdk.name`) so the dashboard can filter /
     /// triage by which SDK sent a given event. Follows the monorepo directory-name
     /// convention (`sdk-js`, `sdk-server`, `sdk-swift`) and is pinned by
@@ -468,8 +478,15 @@ enum SDKDefaults {
     static let sessionTimeoutSeconds: TimeInterval = 30 * 60
     /// `SheepitConfig.configStaleAfter`'s default. 0.8.0 and earlier deleted the cache here.
     static let configStaleAfter: TimeInterval = 24 * 60 * 60
-    /// `SheepitConfig.configOfflineMaxAge`'s default.
-    static let configOfflineMaxAge: TimeInterval = 7 * 24 * 60 * 60
+    /// `SheepitConfig.configOfflineMaxAge`'s default: no limit (0.10.2). 0.9.0 to 0.10.1 deleted a
+    /// cache older than 7 days at launch, so an app that could not reach the server lost its flags.
+    static let configOfflineMaxAge: TimeInterval = .infinity
+
+    /// The largest `/v1/config` body written to UserDefaults, and the largest read back at
+    /// launch (512 KiB). The cache is decoded on the launch thread and no longer expires, so an
+    /// outsized body would cost every launch for good; a flag/experiment set that fits in one
+    /// config response is far below this. Over it, the body is applied in memory only.
+    static let configCacheMaxBytes = 512 * 1024
     static let offlineQueueMax = 500
     static let eventNameMaxLength = 200
     /// `screen(_:)`'s name cap: the crash context's `screen_name[256]` C buffer less its NUL
@@ -486,21 +503,11 @@ enum SDKDefaults {
         let exponent = Double(min(max(failures, 1), 10) - 1)
         return min(300, 5 * pow(2, exponent))
     }
-    /// How long `start()` withholds a RETRY after a terminal (401/403) registration
-    /// failure, before treating the device as eligible to try again. Matches
-    /// `configStaleAfter`'s once-a-day cadence — long enough that a permanently revoked key
-    /// does not hammer the endpoint on every cold start, short enough that a fix shipped
-    /// in a later build is picked up within a day rather than never.
+    /// The flat backoff after a terminal registration answer (400 `VALIDATION_ERROR`, 401, 403),
+    /// and the longest stored window ever honoured (`RegistrationBackoff`). Long enough that a
+    /// revoked key does not hammer the endpoint every launch, short enough that a fixed build or
+    /// key is picked up within a day. Other windows: `RegistrationPolicy`.
     static let deviceRegistrationTerminalBackoff: TimeInterval = 24 * 60 * 60
-    /// How long `start()` withholds a retry after a 422 (`RegistrationOutcome.capReached` —
-    /// the environment's `MAX_DEVICES_PER_ENVIRONMENT` ceiling), before trying again.
-    /// Client-trust hardening (2026-09-29): deliberately SHORTER than
-    /// `deviceRegistrationTerminalBackoff` — unlike a revoked key, this device did nothing
-    /// wrong, the ceiling is an environment-wide number an operator can raise at any time, and
-    /// hosted's default (100,000/environment) is high enough that a device landing on it is
-    /// plausibly close to being under it again soon. A whole day is an excessive wait for
-    /// something that isn't this device's fault.
-    static let deviceRegistrationCapBackoff: TimeInterval = 60 * 60
     /// How many COUNTED upload attempts a queued crash report gets before it is dropped — at
     /// most one per launch. Only a 5xx counts (`CrashReporter.spendsAttempt`): offline,
     /// timeouts, 401/402/403/404 and 429 do not. So this bound is for a report the server keeps
@@ -523,6 +530,8 @@ enum SDKDefaults {
     static let crashClockFloor = Date(timeIntervalSince1970: 1_767_225_600)
     /// How far past `now` a first-seen time may be before it is treated as a skewed clock.
     static let crashClockFutureTolerance: TimeInterval = 24 * 60 * 60
+    /// How often the crash context's `free_memory_mb` is refreshed (also on every memory warning).
+    static let crashMemorySampleInterval: TimeInterval = 30
 }
 
 /// Persistence keys. `gt_*` since the LaunchPad → GoaTech rename, matching
@@ -549,6 +558,10 @@ enum StorageKeys {
     /// The `ServerHeldUser` label the cached `sdkConfig` body was fetched under, as JSON. Absent
     /// or unreadable means unknown: the body's assignments are then applied as `.unknown`.
     static let sdkConfigFetchedUnder = "gt_config_fetched_under"
+    /// The device id the cached `sdkConfig` body was answered `resolved` for (contract § 7, C5).
+    /// Written only for a resolved 2xx; absent (a header-less body, or a cache written before this
+    /// key) means not resolved, so an erased device is not detected from that cache.
+    static let sdkConfigResolvedFor = "gt_config_resolved_for"
     /// The `ServerHeldUser` state, as JSON with an explicit `state`. Not cleared by `reset()`:
     /// logout does not change the server's device row. It is what `reset()` reads to decide
     /// whether to switch to a fresh device (`DeviceRotation`).
@@ -556,6 +569,16 @@ enum StorageKeys {
     static let offlineQueue = "gt_offline_queue"
     static let sessionId = "gt_session_id"
     static let sessionLastSeen = "gt_session_last_seen"
+    /// When the stored session began, as epoch seconds; absent for a session an older SDK stored
+    /// (it then ends without a `$session_end`, as there is no duration to report).
+    static let sessionStartedAt = "gt_session_started_at"
+    /// The last stored session id a `$session_end` was queued for, so a launch that dies before
+    /// opening a new session does not announce the same end twice.
+    static let sessionEndedId = "gt_session_ended_id"
+    /// The app version and build the stored session began under ("" for none), so its `$session_end`
+    /// is attributed to that release even if the app was updated since.
+    static let sessionAppVersion = "gt_session_app_version"
+    static let sessionAppBuild = "gt_session_app_build"
     static let experimentAssignments = "gt_exp_assignments"
     /// Set only after a SUCCESSFUL `POST /v1/devices/register` round trip — not merely
     /// once a device id has been minted locally. See `SheepitClient.start()`'s guard. Holds the
@@ -567,15 +590,19 @@ enum StorageKeys {
     /// treats the device as possibly bound and rotates it (`DeviceRotation`). NOT scoped: it
     /// describes the shared device, so a bind under any key makes `reset()` under every key rotate.
     static let deviceBindAttempted = "gt_device_bind_attempted"
-    /// Epoch-seconds string. Set only after a TERMINAL registration failure (400/401/403/422 —
-    /// see `RegistrationOutcome`), never after success or a transient failure. Deliberately
-    /// NOT the same key as `deviceRegistered`: a revoked key that gets fixed in a later
-    /// build must still be retried eventually, just not on every single cold start while
-    /// it's broken. See `SheepitClient.start()`'s guard.
-    static let deviceRegistrationBackoffUntil = "gt_device_registration_backoff_until"
-    /// `SDKDefaults.sdkVersion` of the build that wrote `deviceRegistrationBackoffUntil`. A
-    /// backoff from any other build is ignored — see `RegistrationBackoff`.
-    static let deviceRegistrationBackoffSDKVersion = "gt_device_registration_backoff_sdk"
+    /// The wire app version (`DeviceProfile.wireAppVersion`, "" for none) the device was last
+    /// registered with, per scope, beside `deviceRegistered`. A different installed version
+    /// registers again so the row's app/os versions stay current
+    /// (`Docs/Technical/SDK_DEVICE_REGISTRATION_CONTRACT.md` § 6). Absent counts as different.
+    static let deviceRegisteredAppVersion = "gt_device_registered_app_version"
+    /// The ONE registration backoff record, a JSON string with `until`, `failures_total` and `sdk_version`
+    /// (`RegistrationBackoff`). Written on every failed registration, cleared by a success.
+    /// Deliberately NOT the same key as `deviceRegistered`: "gave up for now" is not "succeeded".
+    static let deviceRegistrationBackoff = "gt_device_registration_backoff"
+    /// 0.9.x and earlier: the backoff as two keys. Read by nothing; removed whenever the record is
+    /// written or cleared.
+    static let legacyDeviceRegistrationBackoffUntil = "gt_device_registration_backoff_until"
+    static let legacyDeviceRegistrationBackoffSDKVersion = "gt_device_registration_backoff_sdk"
     /// The app version (`CFBundleShortVersionString`) recorded the last time
     /// `SheepitClient.emitAppInstallOrUpdateIfOwed()` ran. Absent on every install that
     /// predates 0.4.0 — its absence is what triggers the backfill-without-emitting path on

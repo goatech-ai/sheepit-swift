@@ -66,6 +66,13 @@ final class ANRWatchdog: @unchecked Sendable {
     private var watchdogThread: Thread?
     private var isRunning = false
     private var state = ANRWatchdogState(freezeStartedAt: nil)
+    private let captureContext: @Sendable () -> PerfBatchContext?
+    private var freezeContext: PerfBatchContext?
+    /// The reset epoch the freeze was detected under: a freeze that ends after `reset()` must not
+    /// report the logged-out user's identity or receipt (`IdentityEpoch.current`).
+    private var freezeEpoch: UInt64 = 0
+    private let epoch: IdentityEpoch
+    private let unattributedContext: @Sendable () -> PerfBatchContext?
 
     private(set) var anrCount = 0
 
@@ -94,7 +101,13 @@ final class ANRWatchdog: @unchecked Sendable {
     /// thread responsiveness once an hour.
     private static let maxThresholdMs: Double = 600_000
 
-    init(thresholdMs: Double, onMetric: @escaping @Sendable (PerformanceMetric) -> Void) {
+    init(thresholdMs: Double, captureContext: @escaping @Sendable () -> PerfBatchContext? = { nil },
+         epoch: IdentityEpoch = IdentityEpoch(),
+         unattributedContext: @escaping @Sendable () -> PerfBatchContext? = { nil },
+         onMetric: @escaping @Sendable (PerformanceMetric) -> Void) {
+        self.captureContext = captureContext
+        self.epoch = epoch
+        self.unattributedContext = unattributedContext
         self.thresholdMs = min(Self.maxThresholdMs, max(Self.minThresholdMs, thresholdMs))
         self.onMetric = onMetric
     }
@@ -126,6 +139,10 @@ final class ANRWatchdog: @unchecked Sendable {
         let checkInterval = thresholdMs / 1000.0
 
         while isRunning && !Thread.current.isCancelled {
+            // Epoch FIRST, then the sample: a reset during the ping wait (up to the threshold) moves the
+            // epoch past the one the sample was taken under, and `handle` then ships it unattributed.
+            let sampleEpoch = epoch.current
+            let pingContext = captureContext()
             let responded = pingMainThread(timeout: checkInterval)
 
             // Audit R-004: never call DispatchQueue.main.sync from this
@@ -145,31 +162,43 @@ final class ANRWatchdog: @unchecked Sendable {
             )
             state = next
 
-            switch tick {
-            case .none:
-                break
-            case .detected(let thresholdMs):
-                anrCount += 1
-                onMetric(PerformanceMetric(
-                    metricType: "anr",
-                    metricName: "anr_detected",
-                    valueMs: thresholdMs,
-                    statusCode: nil,
-                    isError: true,
-                    timestamp: ISO8601DateFormatter().string(from: Date())
-                ))
-            case .recovered(let durationMs):
-                onMetric(PerformanceMetric(
-                    metricType: "anr",
-                    metricName: "anr_recovered",
-                    valueMs: durationMs,
-                    statusCode: nil,
-                    isError: false,
-                    timestamp: ISO8601DateFormatter().string(from: Date())
-                ))
-            }
+            handle(tick, pingContext: pingContext, sampleEpoch: sampleEpoch)
 
             Thread.sleep(forTimeInterval: checkInterval)
+        }
+    }
+
+    /// Emits what a tick asks for. Internal so a test can drive detection and recovery around a reset.
+    func handle(_ tick: ANRWatchdogTick, pingContext: PerfBatchContext?, sampleEpoch: UInt64) {
+        switch tick {
+        case .none:
+            break
+        case .detected(let thresholdMs):
+            anrCount += 1
+            // A sample older than a reset names the logged-out user: detection and recovery both ship without it.
+            freezeContext = sampleEpoch == epoch.current ? pingContext : (unattributedContext() ?? pingContext?.anonymized())
+            freezeEpoch = sampleEpoch
+            onMetric(PerformanceMetric(
+                metricType: "anr",
+                metricName: "anr_detected",
+                valueMs: thresholdMs,
+                statusCode: nil,
+                isError: true,
+                timestamp: ISO8601DateFormatter().string(from: Date()),
+                context: freezeContext
+            ))
+        case .recovered(let durationMs):
+            // The freeze's identity is only good while the identity it was captured under is.
+            let sameIdentity = freezeEpoch == epoch.current
+            onMetric(PerformanceMetric(
+                metricType: "anr",
+                metricName: "anr_recovered",
+                valueMs: durationMs,
+                statusCode: nil,
+                isError: false,
+                timestamp: ISO8601DateFormatter().string(from: Date()),
+                context: sameIdentity ? freezeContext : (unattributedContext() ?? freezeContext?.anonymized())
+            ))
         }
     }
 

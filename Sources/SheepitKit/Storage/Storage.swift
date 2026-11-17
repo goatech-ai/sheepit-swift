@@ -7,6 +7,13 @@ protocol StorageProvider: Sendable {
     func data(forKey key: String) -> Data?
     func set(_ value: Data?, forKey key: String)
     func removeObject(forKey key: String)
+    /// Flushes pending writes to disk; false when the store says they were not saved. Used after
+    /// writes that must survive an immediate kill (the device id, the registration record).
+    func synchronize() -> Bool
+}
+
+extension StorageProvider {
+    func synchronize() -> Bool { true }
 }
 
 /// UserDefaults-backed storage for production use.
@@ -35,6 +42,10 @@ final class UserDefaultsStorage: StorageProvider, @unchecked Sendable {
 
     func removeObject(forKey key: String) {
         defaults.removeObject(forKey: key)
+    }
+
+    func synchronize() -> Bool {
+        defaults.synchronize()
     }
 }
 

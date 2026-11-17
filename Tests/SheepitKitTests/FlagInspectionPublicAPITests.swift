@@ -11,7 +11,7 @@ final class FlagInspectionPublicAPITests: XCTestCase {
     // Raw UserDefaults.standard key the SDK persists debug overrides
     // under (see packages/sdk-swift/Sources/SheepitKit/Flags/FlagManager.swift).
     private static let overridesKey = "lp_debug_overrides"
-    private static let apiKey = "lp_pub_xxx_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    private static let apiKey = "lp_pub_xxx_" + String(repeating: "a", count: 64)
 
     override func setUp() {
         super.setUp()

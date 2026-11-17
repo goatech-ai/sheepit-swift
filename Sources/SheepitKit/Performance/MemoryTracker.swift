@@ -54,7 +54,7 @@ final class MemoryTracker: @unchecked Sendable {
     }
 
     /// Report current memory as a metric.
-    func reportMetric() {
+    func reportMetric(context: PerfBatchContext? = nil) {
         sample()
         let mb = Double(currentMemoryBytes) / (1024 * 1024)
         onMetric(PerformanceMetric(
@@ -63,7 +63,8 @@ final class MemoryTracker: @unchecked Sendable {
             valueMs: mb,
             statusCode: nil,
             isError: false,
-            timestamp: ISO8601DateFormatter().string(from: Date())
+            timestamp: ISO8601DateFormatter().string(from: Date()),
+            context: context
         ))
     }
 

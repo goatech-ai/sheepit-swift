@@ -10,9 +10,16 @@
 // 2. Populate the crash context and breadcrumb regions from Swift (between crashes).
 // 3. On crash, the signal handler writes signal info + thread backtraces into
 //    the mmap'd region. The kernel persists it to disk on process exit.
+//    Capture beyond the frozen struct (trap-site registers, the crash-annotation
+//    message, per-image detail) goes to the supplement file — see
+//    include/SheepitCrashSupplement.h. Image and thread capture live in
+//    sheepit_crash_threads.c, the frame walk in sheepit_crash_walk.c.
 // 4. On next launch, Swift reads the file and uploads the report.
 
 #include "SheepitCrashHandler.h"
+#include "SheepitCrashCapture.h"
+#include "SheepitCrashSupplement.h"
+#include "sheepit_crash_internal.h"
 
 #include <signal.h>
 #include <stdlib.h>
@@ -52,16 +59,6 @@ static volatile atomic_bool s_nsexception_caught = false;
 
 // ── Async-Signal-Safe Helpers ───────────────────────────────────────
 
-static void safe_strlcpy(char *dst, const char *src, size_t size) {
-    if (size == 0) return;
-    size_t i = 0;
-    while (i < size - 1 && src[i] != '\0') {
-        dst[i] = src[i];
-        i++;
-    }
-    dst[i] = '\0';
-}
-
 static const char *signal_name(int sig) {
     switch (sig) {
         case SIGABRT: return "SIGABRT";
@@ -80,168 +77,6 @@ static uint64_t timestamp_ms(void) {
     return (uint64_t)tv.tv_sec * 1000 + (uint64_t)tv.tv_usec / 1000;
 }
 
-// ── Thread Capture (Mach APIs, async-signal-safe on Apple) ──────────
-
-#if defined(__APPLE__)
-
-static void capture_thread_backtrace(thread_t thread, sheepit_thread_state_t *state) {
-    state->frame_count = 0;
-
-#if defined(__arm64__) || defined(__aarch64__)
-    arm_thread_state64_t thread_state;
-    mach_msg_type_number_t count = ARM_THREAD_STATE64_COUNT;
-    kern_return_t kr = thread_get_state(thread, ARM_THREAD_STATE64,
-                                         (thread_state_t)&thread_state, &count);
-    if (kr != KERN_SUCCESS) return;
-
-    // Record PC as first frame
-    uintptr_t pc = (uintptr_t)__darwin_arm_thread_state64_get_pc(thread_state);
-    uintptr_t fp = (uintptr_t)__darwin_arm_thread_state64_get_fp(thread_state);
-
-    if (pc != 0) {
-        state->frames[state->frame_count++] = pc;
-    }
-
-    // Walk frame pointers: fp[0] = previous fp, fp[1] = return address
-    while (fp != 0 && state->frame_count < SHEEPIT_MAX_FRAMES) {
-        uintptr_t *frame = (uintptr_t *)fp;
-        uintptr_t next_fp = frame[0];
-        uintptr_t lr = frame[1];
-
-        if (lr == 0) break;
-        state->frames[state->frame_count++] = lr;
-
-        // Sanity: fp must move forward (toward higher addresses on stack)
-        if (next_fp <= fp) break;
-        fp = next_fp;
-    }
-#elif defined(__x86_64__)
-    x86_thread_state64_t thread_state;
-    mach_msg_type_number_t count = x86_THREAD_STATE64_COUNT;
-    kern_return_t kr = thread_get_state(thread, x86_THREAD_STATE64,
-                                         (thread_state_t)&thread_state, &count);
-    if (kr != KERN_SUCCESS) return;
-
-    uintptr_t pc = (uintptr_t)thread_state.__rip;
-    uintptr_t fp = (uintptr_t)thread_state.__rbp;
-
-    if (pc != 0) {
-        state->frames[state->frame_count++] = pc;
-    }
-
-    while (fp != 0 && state->frame_count < SHEEPIT_MAX_FRAMES) {
-        uintptr_t *frame = (uintptr_t *)fp;
-        uintptr_t next_fp = frame[0];
-        uintptr_t lr = frame[1];
-
-        if (lr == 0) break;
-        state->frames[state->frame_count++] = lr;
-        if (next_fp <= fp) break;
-        fp = next_fp;
-    }
-#endif
-}
-
-static void capture_all_threads(sheepit_thread_capture_t *capture, thread_t crashed_thread) {
-    capture->thread_count = 0;
-
-    thread_act_array_t threads;
-    mach_msg_type_number_t thread_count;
-    kern_return_t kr = task_threads(mach_task_self(), &threads, &thread_count);
-    if (kr != KERN_SUCCESS) return;
-
-    uint32_t max = thread_count < SHEEPIT_MAX_THREADS ? thread_count : SHEEPIT_MAX_THREADS;
-
-    for (uint32_t i = 0; i < max; i++) {
-        sheepit_thread_state_t *state = &capture->threads[capture->thread_count];
-        memset(state, 0, sizeof(sheepit_thread_state_t));
-
-        state->thread_id = (uint64_t)threads[i];
-        state->is_crashed_thread = (threads[i] == crashed_thread);
-
-        // Get thread name
-        thread_extended_info_data_t ext_info;
-        mach_msg_type_number_t info_count = THREAD_EXTENDED_INFO_COUNT;
-        if (thread_info(threads[i], THREAD_EXTENDED_INFO,
-                        (thread_info_t)&ext_info, &info_count) == KERN_SUCCESS) {
-            safe_strlcpy(state->name, ext_info.pth_name, sizeof(state->name));
-        }
-
-        if (threads[i] == crashed_thread) {
-            // Crashed thread: backtrace from signal context (already in report via fp walk)
-            capture_thread_backtrace(threads[i], state);
-        } else {
-            // Suspend, capture, resume other threads
-            thread_suspend(threads[i]);
-            capture_thread_backtrace(threads[i], state);
-            thread_resume(threads[i]);
-        }
-
-        capture->thread_count++;
-    }
-
-    // Deallocate the thread list (vm_deallocate is signal-safe on Mach)
-    vm_deallocate(mach_task_self(), (vm_address_t)threads,
-                  thread_count * sizeof(thread_act_t));
-}
-
-static void capture_binary_images(sheepit_binary_image_list_t *list) {
-    list->image_count = 0;
-    uint32_t count = _dyld_image_count();
-    uint32_t max = count < SHEEPIT_MAX_IMAGES ? count : SHEEPIT_MAX_IMAGES;
-
-    for (uint32_t i = 0; i < max; i++) {
-        const char *name = _dyld_get_image_name(i);
-        const struct mach_header *header = _dyld_get_image_header(i);
-        if (!name || !header) continue;
-
-        sheepit_binary_image_t *img = &list->images[list->image_count];
-        memset(img, 0, sizeof(sheepit_binary_image_t));
-
-        // Store just the filename, not the full path
-        const char *slash = name;
-        const char *p = name;
-        while (*p) {
-            if (*p == '/') slash = p + 1;
-            p++;
-        }
-        safe_strlcpy(img->name, slash, sizeof(img->name));
-        img->load_address = (uintptr_t)header;
-
-        // Walk load commands to find LC_UUID and segment size
-        if (header->magic == MH_MAGIC_64) {
-            const struct mach_header_64 *h64 = (const struct mach_header_64 *)header;
-            const uint8_t *cmd_ptr = (const uint8_t *)(h64 + 1);
-            for (uint32_t j = 0; j < h64->ncmds; j++) {
-                const struct load_command *cmd = (const struct load_command *)cmd_ptr;
-                if (cmd->cmd == LC_UUID) {
-                    const struct uuid_command *uuid_cmd = (const struct uuid_command *)cmd;
-                    const uint8_t *u = uuid_cmd->uuid;
-                    // Format as UUID string (async-signal-safe, just pointer arithmetic)
-                    static const char hex[] = "0123456789ABCDEF";
-                    char *out = img->uuid;
-                    for (int k = 0; k < 16; k++) {
-                        *out++ = hex[u[k] >> 4];
-                        *out++ = hex[u[k] & 0xF];
-                        if (k == 3 || k == 5 || k == 7 || k == 9) *out++ = '-';
-                    }
-                    *out = '\0';
-                } else if (cmd->cmd == LC_SEGMENT_64) {
-                    const struct segment_command_64 *seg = (const struct segment_command_64 *)cmd;
-                    if (seg->vmsize > img->size) {
-                        img->size = (uintptr_t)seg->vmsize;
-                    }
-                }
-                cmd_ptr += cmd->cmdsize;
-            }
-        }
-
-        list->image_count++;
-    }
-}
-
-#endif // __APPLE__
-
 // ── Signal Handler ──────────────────────────────────────────────────
 
 static void sheepit_signal_handler(int sig, siginfo_t *info, void *ucontext) {
@@ -253,23 +88,52 @@ static void sheepit_signal_handler(int sig, siginfo_t *info, void *ucontext) {
     s_report->fault_address = info ? (uintptr_t)info->si_addr : 0;
     s_report->timestamp_ms = timestamp_ms();
 
+    sheepit_crash_supplement_t *supp = sheepit_internal_supplement();
+
     // Exception type/message — unless NSException handler already set them
     if (!atomic_load(&s_nsexception_caught)) {
-        safe_strlcpy(s_report->mechanism, "signal", sizeof(s_report->mechanism));
-        safe_strlcpy(s_report->exception_type, signal_name(sig),
-                     sizeof(s_report->exception_type));
-        // Build a minimal message
-        s_report->exception_message[0] = '\0';
+        sheepit_internal_strlcpy(s_report->mechanism, "signal", sizeof(s_report->mechanism));
+        sheepit_internal_strlcpy(s_report->exception_type, signal_name(sig),
+                                 sizeof(s_report->exception_type));
     }
 
 #if defined(__APPLE__)
-    // Capture all threads
-    thread_t crashed = mach_thread_self();
-    capture_all_threads(&s_report->threads, crashed);
+    // Images first: the stack walk validates every candidate frame against them, and the
+    // annotation sections were located while they were captured.
+    sheepit_image_scan_t scan = sheepit_internal_capture_images(&s_report->images, supp);
+    sheepit_internal_capture_threads(&s_report->threads, &s_report->images, scan, ucontext, supp);
 
-    // Capture binary images
-    capture_binary_images(&s_report->images);
+    if (!atomic_load(&s_nsexception_caught)) {
+        // The crash-annotation message (a Swift fatal error's text, an abort() reason), from
+        // allowlisted images only. The supplement keeps up to 1023 bytes; the frozen 512-byte
+        // field gets a whole-character prefix so a build that predates the supplement still
+        // shows the reason.
+        static sheepit_annotation_source_t sources[SHEEPIT_MAX_IMAGES];
+        uint32_t source_count = sheepit_internal_annotation_sources(&s_report->images, sources,
+                                                                    SHEEPIT_MAX_IMAGES);
+        if (supp) {
+            size_t len = sheepit_read_crash_annotation_message(sources, source_count,
+                                                               supp->exception_message,
+                                                               sizeof(supp->exception_message));
+            if (len > 0) supp->flags |= SHEEPIT_SUPPLEMENT_HAS_ANNOTATION;
+            sheepit_internal_strlcpy(s_report->exception_message, supp->exception_message,
+                                     sizeof(s_report->exception_message));
+        } else {
+            sheepit_read_crash_annotation_message(sources, source_count, s_report->exception_message,
+                                                  sizeof(s_report->exception_message));
+        }
+        sheepit_internal_utf8_trim(s_report->exception_message, strlen(s_report->exception_message));
+    }
 #endif
+
+    // The supplement is stamped with the report's timestamp and marked valid first, so a
+    // report never claims a supplement that is still being written.
+    if (supp) {
+        sheepit_internal_capture_cohort();
+        supp->report_timestamp_ms = s_report->timestamp_ms;
+        supp->magic = SHEEPIT_SUPPLEMENT_MAGIC;
+        sheepit_internal_supplement_sync();
+    }
 
     // Mark report as valid
     s_report->magic = SHEEPIT_CRASH_REPORT_MAGIC;
@@ -307,7 +171,7 @@ chain:
 int sheepit_crash_handler_install(const char *crash_file_path) {
     if (s_report) return -1;  // Already installed
 
-    safe_strlcpy(s_crash_file_path, crash_file_path, sizeof(s_crash_file_path));
+    sheepit_internal_strlcpy(s_crash_file_path, crash_file_path, sizeof(s_crash_file_path));
     s_mmap_size = sizeof(sheepit_crash_report_t);
 
     // Create/open the crash file
@@ -364,6 +228,7 @@ void sheepit_crash_handler_uninstall(void) {
         close(s_mmap_fd);
         s_mmap_fd = -1;
     }
+    sheepit_internal_supplement_uninstall();
 }
 
 sheepit_crash_context_t *sheepit_get_crash_context(void) {
@@ -385,8 +250,8 @@ void sheepit_add_breadcrumb(const char *category, const char *message) {
 
     sheepit_breadcrumb_t *entry = &ring->entries[idx];
     entry->timestamp_ms = timestamp_ms();
-    safe_strlcpy(entry->category, category, sizeof(entry->category));
-    safe_strlcpy(entry->message, message, sizeof(entry->message));
+    sheepit_internal_strlcpy(entry->category, category, sizeof(entry->category));
+    sheepit_internal_strlcpy(entry->message, message, sizeof(entry->message));
 
     uint32_t old_count = __atomic_load_n(&ring->count, __ATOMIC_RELAXED);
     if (old_count < SHEEPIT_MAX_BREADCRUMBS) {
@@ -450,11 +315,19 @@ void sheepit_clear_pending_crash_report(const char *crash_file_path) {
 void sheepit_set_nsexception_info(const char *name, const char *reason) {
     if (!s_report) return;
 
-    safe_strlcpy(s_report->mechanism, "nsexception", sizeof(s_report->mechanism));
-    safe_strlcpy(s_report->exception_type, name ? name : "NSException",
+    sheepit_internal_strlcpy(s_report->mechanism, "nsexception", sizeof(s_report->mechanism));
+    sheepit_internal_strlcpy(s_report->exception_type, name ? name : "NSException",
                  sizeof(s_report->exception_type));
-    safe_strlcpy(s_report->exception_message, reason ? reason : "",
+    sheepit_internal_strlcpy(s_report->exception_message, reason ? reason : "",
                  sizeof(s_report->exception_message));
+    sheepit_internal_utf8_trim(s_report->exception_message, strlen(s_report->exception_message));
+    sheepit_crash_supplement_t *supp = sheepit_internal_supplement();
+    if (supp) {
+        // The reason in full (up to 1023 bytes); the frozen field above holds 511.
+        sheepit_internal_strlcpy(supp->exception_message, reason ? reason : "",
+                                 sizeof(supp->exception_message));
+        sheepit_internal_utf8_trim(supp->exception_message, strlen(supp->exception_message));
+    }
 
     atomic_store(&s_nsexception_caught, true);
 }

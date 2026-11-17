@@ -25,6 +25,13 @@ final class Logger: Sendable {
         os_log(.default, log: osLog, "[Sheepit] %{public}@", message)
     }
 
+    /// `.fault` level: persisted by the unified log and surfaced by Console and sysdiagnose
+    /// without a debug build. For text the SDK composed itself that carries no credential, and
+    /// only for a configuration an app almost certainly did not intend.
+    func fault(_ message: String) {
+        os_log(.fault, log: osLog, "[Sheepit] %{public}@", message)
+    }
+
     func error(_ message: String, _ context: Any?...) {
         // %{private}@ — error messages can carry host/attacker-influenced strings (e.g. a
         // rejected apiUrl's rejection reason), and the redaction regex protecting that one

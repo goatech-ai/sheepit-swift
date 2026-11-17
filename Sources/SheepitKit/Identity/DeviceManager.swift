@@ -1,34 +1,22 @@
 import Foundation
 
-/// Outcome of a `DeviceManager.register()` attempt. A plain `String?` cannot distinguish
-/// "the network hiccupped, try again next launch" from "the server will reject this key or
-/// this device forever until a human fixes something" — and those two need different
-/// handling: the former is silently retried every cold start (the existing, correct
-/// behaviour), the latter must stop hammering the endpoint and tell someone.
+/// Outcome of one `DeviceManager.register()` attempt. Classes per
+/// `Docs/Technical/SDK_DEVICE_REGISTRATION_CONTRACT.md` § 3; every non-success lands in a class
+/// `RegistrationPolicy` persists.
 enum RegistrationOutcome: Sendable {
     case success(deviceId: String)
-    /// Network error, 5xx, or a 400 without the API's `VALIDATION_ERROR` envelope — retried
-    /// with a short (≤60s, no jitter) backoff, unchanged by this PR.
-    case transientFailure
-    /// 400 `VALIDATION_ERROR`/401/403 — a body the API rejects or a revoked/rejected API key.
-    /// Retrying on EVERY cold start cannot fix any of these; only a human action can (ship a
-    /// corrected build or rotate the key). The caller backs this off rather than retrying
-    /// every launch, but must NOT treat it as permanent success either — see
-    /// `SheepitClient.start()`'s backoff-window doc for why.
+    /// Network error, timeout, 5xx, any unexpected throw, a 2xx whose body does not decode or
+    /// whose `device_id` is unusable, a 400/401/403 without the API's error envelope (a WAF, proxy
+    /// or captive portal said it, not our API), or any other status. `reason` is the diagnostic
+    /// `outcome` value; `retryAfter` the server's `Retry-After`, when it sent one (a 503 does).
+    case transientFailure(reason: String, retryAfter: TimeInterval? = nil)
+    /// 400 `VALIDATION_ERROR`, or 401/403 carrying the API's own `{error: {code, message}}`
+    /// envelope: retrying cannot fix these, only a corrected build or key.
     case terminalFailure(RegistrationRejection)
-    /// 402 (hosted daily registration cap) or 422 (environment `MAX_DEVICES_PER_ENVIRONMENT`
-    /// ceiling). Split out from `terminalFailure` 2026-09-29 (client-trust hardening): unlike
-    /// a revoked key, this device did nothing wrong — a daily cap resets at UTC midnight, and
-    /// the environment ceiling is operator-raisable. Fix round 1 (PR #1170 review): 402 joined
-    /// 422 here (was falling into `transientFailure`, retried every ≤60s with no jitter — fine
-    /// for a network hiccup, wrong for a cap that only clears at midnight). Backs off up to an
-    /// HOUR with full jitter (`RegistrationRetryPolicy`), never `SDKDefaults.
-    /// deviceRegistrationTerminalBackoff`'s 24h.
-    case capReached(RegistrationRejection)
-    /// 429 — rate limited. Fix round 1 (PR #1170 review): used to fall into `transientFailure`
-    /// (retried every ≤60s with no jitter, ignoring the server's own `Retry-After`). Backs off
-    /// like `capReached`, but `retryAfter` (parsed by `HTTPClient`, RFC 7231 §7.1.3) dominates
-    /// the jittered value when the server asked for longer.
+    /// 402 (hosted daily registration cap) or 422 (environment device ceiling). This device did
+    /// nothing wrong; the cap clears on its own. `retryAfter` is the server's `Retry-After`.
+    case capReached(RegistrationRejection, retryAfter: TimeInterval?)
+    /// 429.
     case rateLimited(retryAfter: TimeInterval?)
 }
 
@@ -45,12 +33,13 @@ struct RegistrationRejection: Sendable, Equatable {
     /// Sorted names of the fields a 400 rejected. Empty for every other status.
     var rejectedFields: [String] = []
 
-    /// Parses the API's error envelope. A body that is not the envelope yields no reason and no
-    /// fields rather than an error: the status alone is enough to back off.
-    static func fromBadRequest(body: String) -> RegistrationRejection {
-        var rejection = RegistrationRejection(statusCode: 400)
+    /// A `VALIDATION_ERROR` envelope's code and the names of the rejected body fields (from
+    /// `details.fieldErrors`), never the server's messages. A body that is not the envelope yields
+    /// no reason and no fields.
+    static func fromValidationError(status: Int, body: Data) -> RegistrationRejection {
+        var rejection = RegistrationRejection(statusCode: status)
         guard
-            let json = try? JSONSerialization.jsonObject(with: Data(body.utf8)) as? [String: Any],
+            let json = try? JSONSerialization.jsonObject(with: body) as? [String: Any],
             let error = json["error"] as? [String: Any]
         else { return rejection }
         rejection.reason = apiErrorCode(in: error)
@@ -72,6 +61,18 @@ struct RegistrationRejection: Sendable, Equatable {
               code.allSatisfy({ $0.isASCII && ($0.isUppercase || $0.isNumber || $0 == "_") })
         else { return nil }
         return code
+    }
+
+    /// The `error.code` of a body that is our API's full `{error: {code, message}}` envelope, or nil.
+    /// Stricter than `apiErrorCode(body:)`: a message is required too, so a proxy page that happens
+    /// to carry an upper-case `code` is not mistaken for our API.
+    static func apiErrorCode(envelope body: Data) -> String? {
+        guard
+            let json = try? JSONSerialization.jsonObject(with: body) as? [String: Any],
+            let error = json["error"] as? [String: Any],
+            error["message"] is String
+        else { return nil }
+        return apiErrorCode(in: error)
     }
 
     /// `apiErrorCode(in:)` for a whole response body; nil when the body is not the envelope.
@@ -100,16 +101,27 @@ actor DeviceManager {
     /// `SheepitConfig.appVersion`; see `DeviceProfile.wireAppVersion(override:)`.
     private let appVersionOverride: String?
 
-    /// 401 (revoked/invalid key), 403 (forbidden) — the statuses `HTTPClient` throws as
-    /// `.httpError` that no amount of retrying will ever turn into success. A 400 is terminal
-    /// too but arrives as `.badRequest` (its own catch below). 402/422 (cap reached) and 429
-    /// (rate limited) are their OWN cases (caught separately below) — not in this set — since
-    /// 2026-09-29 (client-trust hardening): every other 4xx/5xx/network error is
-    /// `transientFailure`.
     private static let terminalStatusCodes: Set<Int> = [401, 403]
-    /// The hosted daily cap (402) and the environment device-cap (422) — split from
-    /// `terminalStatusCodes` above. Fix round 1 (PR #1170 review): 402 joined 422 here.
     private static let capStatusCodes: Set<Int> = [402, 422]
+
+    /// USABLE (contract § 1): what the SDK may store, send and adopt — 1–256 characters of
+    /// printable ASCII `0x21`–`0x7E`, and not `.` or `..` (dot segments collapse in a URL path).
+    /// Deliberately wider than what the SDK mints (STRICT, a lowercase UUIDv4,
+    /// `ContextManager.mintDeviceId`): the server honours legacy rows of any shape, so a stored or
+    /// returned `legacy:odd` is kept verbatim. A 2xx with an unusable id is transient and never
+    /// adopted; a stored unusable id is replaced before the first send. Path use is safe either way:
+    /// `SDKEndpoints.pathSegment` percent-encodes every byte outside `A-Za-z0-9-_~`.
+    static func isUsableDeviceId(_ id: String) -> Bool {
+        unusableDeviceIdReason(id) == nil
+    }
+
+    /// Why `id` is not USABLE (`empty` | `too_long` | `dot_segment` | `invalid_character`), or nil.
+    static func unusableDeviceIdReason(_ id: String) -> String? {
+        if id.isEmpty { return "empty" }
+        if id.utf8.count > 256 { return "too_long" }
+        if id == "." || id == ".." { return "dot_segment" }
+        return id.unicodeScalars.allSatisfy { (0x21...0x7E).contains($0.value) } ? nil : "invalid_character"
+    }
 
     init(http: HTTPClient, log: Logger, appVersionOverride: String?) {
         self.http = http
@@ -117,61 +129,105 @@ actor DeviceManager {
         self.appVersionOverride = appVersionOverride
     }
 
-    /// Register this device with the API.
-    ///
-    /// - Parameter maxAttempts: overrides `config.retryAttempts` (`HTTPClient.postRaw`). `1` for a
-    ///   caller that something else is waiting on (the identify ladder's replacement device).
-    func register(
-        anonymousId: String,
-        existingDeviceId: String?,
-        maxAttempts: Int? = nil
-    ) async -> RegistrationOutcome {
+    /// One registration request, proposing `proposedDeviceId` ("client proposes, server
+    /// disposes"): the server honours a well-formed proposal and the SDK adopts whatever
+    /// `device_id` comes back. The proposal is unchanged on every retry, so it is also the
+    /// idempotency key. Exactly ONE HTTP attempt (`postOnceRaw`): `RegistrationPolicy` is the only
+    /// retry layer. Contract: `Docs/Technical/SDK_DEVICE_REGISTRATION_CONTRACT.md`.
+    func register(anonymousId: String, proposedDeviceId: String) async -> RegistrationOutcome {
         let request = Self.registrationRequest(
             anonymousId: anonymousId,
-            existingDeviceId: existingDeviceId,
+            proposedDeviceId: proposedDeviceId,
             appVersionOverride: appVersionOverride,
             locale: Locale.current
         )
-
+        let data: Data
+        let response: HTTPURLResponse
         do {
-            let response: DeviceRegisterResponse = try await http.post(
-                path: SDKEndpoints.deviceRegister,
-                body: request,
-                maxAttempts: maxAttempts
+            (data, response) = try await http.postOnceRaw(
+                path: SDKEndpoints.deviceRegister, body: request,
+                timeout: RegistrationPolicy.registerRequestTimeoutSeconds
             )
-            log.debug("Device registered: \(response.deviceId)")
-            return .success(deviceId: response.deviceId)
-        } catch SDKError.badRequest(let body) {
-            // 🔴 `HTTPClient` throws `.badRequest` for a 400, never `.httpError(400)`, so before this
-            // branch a 400 fell through to `transientFailure`: re-sent on every launch, and every
-            // 60 s for the life of the process during a logout rotation. The same body gets the
-            // same answer, so it is terminal.
-            let rejection = RegistrationRejection.fromBadRequest(body: body)
-            // Only the API's own validation verdict is terminal. A 400 with no API envelope comes
-            // from something in between (a proxy, a load balancer, a captive portal) and says
-            // nothing about this body, so it is retried next launch like any other transient.
-            guard rejection.reason == RegistrationRejection.validationError else {
-                log.warn("Device registration got a 400 without the API's error envelope — retrying next launch")
-                return .transientFailure
+        } catch {
+            log.warn("Device registration failed: \(error.localizedDescription)")
+            return .transientFailure(reason: "network_error", retryAfter: nil)
+        }
+        return Self.classify(status: response.statusCode, body: data, response: response, log: log)
+    }
+
+    /// The outcome for one answered request. Static so the mapping is testable on its own.
+    static func classify(status: Int, body: Data, response: HTTPURLResponse?, log: Logger) -> RegistrationOutcome {
+        let retryAfter = HTTPClient.parseRetryAfter(response?.value(forHTTPHeaderField: "Retry-After"))
+        switch status {
+        case 200..<300:
+            guard let decoded = try? JSONDecoder().decode(ApiDataResponse<DeviceRegisterResponse>.self, from: body) else {
+                log.warn("Device registration answered \(status) with a body that does not decode — retrying")
+                return .transientFailure(reason: "malformed_response", retryAfter: retryAfter)
             }
+            guard isUsableDeviceId(decoded.data.deviceId) else {
+                log.warn("Device registration answered an unusable device_id — not adopted, retrying")
+                return .transientFailure(reason: "unusable_device_id", retryAfter: retryAfter)
+            }
+            log.debug("Device registered: \(decoded.data.deviceId)")
+            return .success(deviceId: decoded.data.deviceId)
+        case 429:
+            // Row 5: a rate limit, with or without our envelope.
+            log.warn("Device registration rate limited (429) — backing off, honoring Retry-After")
+            return .rateLimited(retryAfter: retryAfter)
+        case 400..<500:
+            return classifyClientError(status: status, body: body, retryAfter: retryAfter, log: log)
+        case 500...:
+            log.warn("Device registration failed (\(status)) — retrying")
+            return .transientFailure(reason: "server_error", retryAfter: retryAfter)
+        default:
+            log.warn("Device registration answered \(status) — retrying")
+            return .transientFailure(reason: "unexpected_status", retryAfter: retryAfter)
+        }
+    }
+
+    /// A 4xx other than 429. The class is decided by OUR envelope (`{error: {code, message}}`), not
+    /// by the status alone — a cross-SDK rule (`Docs/Technical/SDK_DEVICE_REGISTRATION_CONTRACT.md`
+    /// § 3), applied in this order:
+    ///   2. `VALIDATION_ERROR` on any 4xx (400, 422) → terminal 24 h;
+    ///   3. 401/403 with an envelope → terminal 24 h;
+    ///   4. 402/422 with an envelope, any other code (`PREVIEW_LIMIT_EXCEEDED`, `LIMIT_REACHED`) → cap;
+    ///   6. anything else, including every 4xx without our envelope (a WAF, proxy or captive
+    ///      portal said it, not our API) → transient.
+    private static func classifyClientError(
+        status: Int,
+        body: Data,
+        retryAfter: TimeInterval?,
+        log: Logger
+    ) -> RegistrationOutcome {
+        guard let code = RegistrationRejection.apiErrorCode(envelope: body) else {
+            log.warn("Device registration got a \(status) without the API's error envelope — retrying")
+            let reason: String
+            switch status {
+            case 400: reason = "bad_request_unrecognized"
+            case 401, 403: reason = "auth_rejected_unrecognized"
+            case 402, 422: reason = "cap_unrecognized"
+            default: reason = "unexpected_status"
+            }
+            return .transientFailure(reason: reason, retryAfter: retryAfter)
+        }
+        if code == RegistrationRejection.validationError {
+            let rejection = RegistrationRejection.fromValidationError(status: status, body: body)
             log.warn(
-                "Device registration rejected (400 \(rejection.reason ?? "unknown")); fields: " +
+                "Device registration rejected (\(status) \(code)); fields: " +
                     (rejection.rejectedFields.isEmpty ? "none named" : rejection.rejectedFields.joined(separator: ", "))
             )
             return .terminalFailure(rejection)
-        } catch SDKError.rateLimited(let retryAfter) {
-            log.warn("Device registration rate limited (429) — backing off, honoring Retry-After")
-            return .rateLimited(retryAfter: retryAfter)
-        } catch SDKError.httpError(let statusCode) where Self.capStatusCodes.contains(statusCode) {
-            log.warn("Device registration rejected (\(statusCode), cap reached) — backing off, not every launch")
-            return .capReached(RegistrationRejection(statusCode: statusCode))
-        } catch SDKError.httpError(let statusCode) where Self.terminalStatusCodes.contains(statusCode) {
-            log.warn("Device registration permanently rejected (\(statusCode)) — will not retry every launch")
-            return .terminalFailure(RegistrationRejection(statusCode: statusCode))
-        } catch {
-            log.warn("Device registration failed: \(error.localizedDescription)")
-            return .transientFailure
         }
+        if terminalStatusCodes.contains(status) {
+            log.warn("Device registration permanently rejected (\(status) \(code)) — backing off 24 h")
+            return .terminalFailure(RegistrationRejection(statusCode: status, reason: code))
+        }
+        if capStatusCodes.contains(status) {
+            log.warn("Device registration rejected (\(status) \(code), cap reached) — backing off")
+            return .capReached(RegistrationRejection(statusCode: status, reason: code), retryAfter: retryAfter)
+        }
+        log.warn("Device registration answered \(status) \(code) — retrying")
+        return .transientFailure(reason: "unexpected_status", retryAfter: retryAfter)
     }
 
     /// The register body. Every field is bounded to `deviceRegisterSchema`
@@ -179,12 +235,12 @@ actor DeviceManager {
     /// request, and a device that cannot register is dead for flags and identity.
     static func registrationRequest(
         anonymousId: String,
-        existingDeviceId: String?,
+        proposedDeviceId: String,
         appVersionOverride: String?,
         locale: Locale
     ) -> DeviceRegisterRequest {
         DeviceRegisterRequest(
-            deviceId: existingDeviceId,
+            deviceId: proposedDeviceId,
             anonymousId: anonymousId,
             platform: DeviceProfile.platform,
             deviceModel: DeviceProfile.deviceModel(),

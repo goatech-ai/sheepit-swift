@@ -1,13 +1,14 @@
 import XCTest
 @testable import SheepitKit
 
-/// The cached `/v1/config` at launch, by age (`CachedConfigLimits`): applied up to
-/// `configOfflineMaxAge`, reported stale past `configStaleAfter`, deleted past the offline limit
-/// and only then, never by a failed fetch.
+/// The cached `/v1/config` at launch, by age (`CachedConfigLimits`, `LaunchConfigCache`): applied
+/// whatever its age by default, reported stale past `configStaleAfter`, deleted past a host-set
+/// `configOfflineMaxAge` and only then, never by a failed fetch.
 ///
-/// 🔴 0.8.0 deleted any cache older than 24 hours at launch, so a device launched offline a day
-/// after its last fetch read every flag at its compiled-in default and moved members out of their
-/// experiment arms. Every age here is set on an injected clock.
+/// 🔴 0.8.0 deleted any cache older than 24 hours at launch, and 0.9.0 to 0.10.1 any older than 7
+/// days, so a device that could not reach the server (the pilot's app, off its VPN) read every flag
+/// at its compiled-in default and moved members out of their experiment arms. Every age here is set
+/// on an injected clock.
 final class CachedConfigAgeTests: XCTestCase {
     private static let hour: TimeInterval = 3600
     private static let launch = Date(timeIntervalSince1970: 1_800_000_000)
@@ -15,6 +16,8 @@ final class CachedConfigAgeTests: XCTestCase {
     {"data":{"config_version":"7","etag":"\"v7\"","flags":{"native_home":true},"experiments":{
       "pricing_test":{"variant_key":"treatment","payload":{},"experiment_id":"11111111-1111-4111-8111-111111111111","subject_kind":"user","bucketing_version":1,"assignment_revision":"7"}}}}
     """#
+    /// 0.9.0 to 0.10.1's default, now only by configuration.
+    private static let sevenDayLimit = CachedConfigLimits(staleAfter: 86_400, offlineMaxAge: 7 * 24 * 3600)
     private static let newerBody = #"{"data":{"config_version":"8","etag":"\"v8\"","flags":{"native_home":false},"experiments":{}}}"#
 
     override func setUp() {
@@ -68,7 +71,7 @@ final class CachedConfigAgeTests: XCTestCase {
             now: { clock.get() },
             freshness: freshness,
             identityProvider: identity,
-            onConfig: { response, identity in
+            onConfig: { response, identity, _ in
                 applied.mutate { $0.append(Applied(flags: response.flags, identity: identity)) }
             }
         )
@@ -115,23 +118,44 @@ final class CachedConfigAgeTests: XCTestCase {
         XCTAssertEqual(status.fetchedAt, Self.launch.addingTimeInterval(-30 * Self.hour))
     }
 
-    func testACacheAtSixDays23HoursIsStillApplied() async throws {
+    /// A host-set 7-day limit (0.9.0 to 0.10.1's default): one hour inside it is applied.
+    func testACacheAtSixDays23HoursIsAppliedUnderASevenDayLimit() async throws {
         let storage = InMemoryStorage()
         try seed(storage, ageHours: 7 * 24 - 1)
         let applied = LockedBox<[Applied]>([])
-        await launch(makeSync(storage: storage, clock: LockedBox(Self.launch),
+        await launch(makeSync(storage: storage, clock: LockedBox(Self.launch), limits: Self.sevenDayLimit,
                               protocolClass: OfflineURLProtocol.self, applied: applied))
 
         XCTAssertEqual(applied.get().count, 1)
     }
 
-    func testACacheOverTheOfflineLimitIsNotAppliedAndIsDeleted() async throws {
+    /// 🔴 The default has no limit (founder decision 2026-11-09): a 30-day cache is applied, reported
+    /// stale, and kept on disk. 0.10.1 deleted it at launch and every flag read its default.
+    func testA30DayCacheIsAppliedReportedStaleAndKeptUnderTheDefault() async throws {
         let storage = InMemoryStorage()
-        try seed(storage, ageHours: 7 * 24 + 1)
+        try seed(storage, ageHours: 30 * 24)
         let applied = LockedBox<[Applied]>([])
         let freshness = ConfigFreshnessRecorder()
         await launch(makeSync(storage: storage, clock: LockedBox(Self.launch), freshness: freshness,
                               protocolClass: OfflineURLProtocol.self, applied: applied))
+
+        XCTAssertEqual(applied.get().count, 1, "a 30-day cache was not applied under the default")
+        XCTAssertEqual(applied.get().first?.flags["native_home"]?.value as? Bool, true)
+        XCTAssertNotNil(storage.data(forKey: StorageKeys.sdkConfig), "a 30-day cache was deleted under the default")
+        let status = try XCTUnwrap(freshness.snapshot(now: Self.launch, staleAfter: CachedConfigLimits.default.staleAfter))
+        XCTAssertEqual(status.source, .cache)
+        XCTAssertTrue(status.isStale)
+        XCTAssertEqual(status.age, 30 * 24 * Self.hour, accuracy: 0.001)
+    }
+
+    /// A finite limit set by the host is still honoured: past it the cache is deleted at launch.
+    func testACacheOverAHostSetOfflineLimitIsNotAppliedAndIsDeleted() async throws {
+        let storage = InMemoryStorage()
+        try seed(storage, ageHours: 7 * 24 + 1)
+        let applied = LockedBox<[Applied]>([])
+        let freshness = ConfigFreshnessRecorder()
+        await launch(makeSync(storage: storage, clock: LockedBox(Self.launch), limits: Self.sevenDayLimit,
+                              freshness: freshness, protocolClass: OfflineURLProtocol.self, applied: applied))
 
         XCTAssertTrue(applied.get().isEmpty, "a cache past the offline limit was applied")
         XCTAssertNil(storage.data(forKey: StorageKeys.sdkConfig), "a cache past the offline limit was kept on disk")
@@ -153,15 +177,34 @@ final class CachedConfigAgeTests: XCTestCase {
         XCTAssertNil(storage.data(forKey: StorageKeys.sdkConfig))
     }
 
-    func testAFutureDatedCacheIsNotAppliedAndIsDeleted() async throws {
+    /// Under a host-set limit a future stamp (clock skew at write) cannot be checked against it.
+    func testAFutureDatedCacheIsNotAppliedAndIsDeletedUnderAHostSetLimit() async throws {
         let storage = InMemoryStorage()
         try seed(storage, ageHours: -1)
         let applied = LockedBox<[Applied]>([])
-        await launch(makeSync(storage: storage, clock: LockedBox(Self.launch),
+        await launch(makeSync(storage: storage, clock: LockedBox(Self.launch), limits: Self.sevenDayLimit,
                               protocolClass: OfflineURLProtocol.self, applied: applied))
 
-        XCTAssertTrue(applied.get().isEmpty, "a future stamp makes the age negative: a cache that never expires")
+        XCTAssertTrue(applied.get().isEmpty, "a future stamp makes the age negative: it would never pass the limit")
         XCTAssertNil(storage.data(forKey: StorageKeys.sdkConfig))
+    }
+
+    /// With no limit (the default) a future stamp is applied, and reported stale: its age is unknown
+    /// until a fetch replaces the entry.
+    func testAFutureDatedCacheIsAppliedAndReportedStaleUnderTheDefault() async throws {
+        let storage = InMemoryStorage()
+        try seed(storage, ageHours: -2)
+        let applied = LockedBox<[Applied]>([])
+        let freshness = ConfigFreshnessRecorder()
+        await launch(makeSync(storage: storage, clock: LockedBox(Self.launch), freshness: freshness,
+                              protocolClass: OfflineURLProtocol.self, applied: applied))
+
+        XCTAssertEqual(applied.get().count, 1, "a future-dated cache was dropped under the default")
+        XCTAssertNotNil(storage.data(forKey: StorageKeys.sdkConfig))
+        let status = try XCTUnwrap(freshness.snapshot(now: Self.launch, staleAfter: CachedConfigLimits.default.staleAfter))
+        XCTAssertEqual(status.source, .cache)
+        XCTAssertTrue(status.isStale, "a stamp later than the device clock has an unknown age: it must read stale")
+        XCTAssertEqual(status.age, 0)
     }
 
     func testAnInfiniteTimestampIsNotApplied() async throws {
@@ -225,8 +268,8 @@ final class CachedConfigAgeTests: XCTestCase {
         let manager = ExperimentManager(storage: InMemoryStorage(), diagnostics: DiagnosticBus())
         let decoded = try JSONDecoder().decode(ApiDataResponse<SDKConfigResponse>.self, from: Data(Self.body.utf8))
         manager.setAssignments(decoded.data.experiments, appliedUnder: first.identity)
-        XCTAssertEqual(manager.snapshot(eventUserId: "user-a")?["pricing_test"]?.subjectStatus,
-                       EventAssignment.identityChanged)
+        XCTAssertEqual(manager.receipt(eventUserId: "user-a").receipt.status,
+                       "identity_changed")
     }
 
     // MARK: - Fetch outcomes

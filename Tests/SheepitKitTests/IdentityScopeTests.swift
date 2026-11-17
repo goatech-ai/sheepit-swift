@@ -73,9 +73,11 @@ final class IdentityScopeTests: XCTestCase {
 
     // MARK: - (a) a new scope registers and binds, with no 404
 
-    func testANewScopeRegistersTheSharedDeviceAndBindsTheStoredUserWithoutA404() async throws {
+    /// Since 0.10.0 the device id is scoped (like sdk-js): a new scope registers its OWN device and
+    /// binds the stored user there, with no 404. Before, it registered the shared id.
+    func testANewScopeRegistersItsOwnDeviceAndBindsTheStoredUserWithoutA404() async throws {
         let user = "user-\(UUID().uuidString)"
-        let deviceId = try await bindInScopeA(user)
+        let deviceA = try await bindInScopeA(user)
         let registersBefore = AttributionCaptureProtocol.registerBodies.count
         let identifiesBefore = AttributionCaptureProtocol.identifyDeviceIds.count
         let configsBefore = AttributionCaptureProtocol.configDeviceIds.count
@@ -84,20 +86,21 @@ final class IdentityScopeTests: XCTestCase {
         let client = makeClient(Self.configB)
         defer { client.destroy() }
         await client.awaitIdentityPostForTesting()
+        let deviceB = client.context.deviceId
 
         let registers = Array(AttributionCaptureProtocol.registerBodies.dropFirst(registersBefore))
+        XCTAssertNotEqual(deviceB, deviceA, "each scope has its own device id")
         XCTAssertEqual(registers.count, 1, "B's slot holds no registration, so B registers")
-        XCTAssertEqual(registers.first?["device_id"] as? String, deviceId, "the shared device id, not a fresh one")
+        XCTAssertEqual(registers.first?["device_id"] as? String, deviceB, "B proposes its own id")
         XCTAssertEqual(AttributionCaptureProtocol.registerEnvironments.last, "production")
-        XCTAssertEqual(Array(AttributionCaptureProtocol.identifyDeviceIds.dropFirst(identifiesBefore)), [deviceId])
+        XCTAssertEqual(Array(AttributionCaptureProtocol.identifyDeviceIds.dropFirst(identifiesBefore)), [deviceB])
         XCTAssertEqual(AttributionCaptureProtocol.identifyNotFoundCount, 0, "0.7.0 answered this launch with a 404")
-        XCTAssertEqual(client.context.deviceId, deviceId)
         XCTAssertEqual(client.context.serverHeldUser.user, .known(user))
         // The bind's refetch: config for this device, labelled with the user.
         let seen = await waitUntil {
-            AttributionCaptureProtocol.configDeviceIds.dropFirst(configsBefore).contains(deviceId)
+            AttributionCaptureProtocol.configDeviceIds.dropFirst(configsBefore).contains(deviceB)
         }
-        XCTAssertTrue(seen, "B's config is fetched for the shared device")
+        XCTAssertTrue(seen, "B's config is fetched for B's device")
         XCTAssertEqual(client.status().identity?.serverUser, .user(user))
     }
 
@@ -207,8 +210,8 @@ final class IdentityScopeTests: XCTestCase {
         defaults.set(String(Date().timeIntervalSince1970), forKey: StorageKeys.sdkConfigCachedAt)
         defaults.set(held, forKey: StorageKeys.sdkConfigFetchedUnder)
         // An active backoff: on 0.7.0 it also kept registration from running.
-        defaults.set(String(Date().timeIntervalSince1970 + 3600), forKey: StorageKeys.deviceRegistrationBackoffUntil)
-        defaults.set(SDKDefaults.sdkVersion, forKey: StorageKeys.deviceRegistrationBackoffSDKVersion)
+        defaults.set(String(Date().timeIntervalSince1970 + 3600), forKey: StorageKeys.legacyDeviceRegistrationBackoffUntil)
+        defaults.set(SDKDefaults.sdkVersion, forKey: StorageKeys.legacyDeviceRegistrationBackoffSDKVersion)
         let queued = (0..<3).map { index in
             #"{"eventId":"legacy-\#(index)-\#(UUID().uuidString)","eventName":"legacy_queued_\#(index)","#
                 + #""deviceId":"\#(deviceId)","anonymousId":"a","sessionId":"s","platform":"ios","#
@@ -316,9 +319,13 @@ final class IdentityScopeTests: XCTestCase {
     func testAResetInOneLiveClientDoesNotStopAnotherFromRotating() async throws {
         let deviceId = "device-\(UUID().uuidString)"
         let defaults = try XCTUnwrap(UserDefaults(suiteName: SharedSDKStorage.suite))
-        defaults.set(deviceId, forKey: StorageKeys.deviceId)
         for config in [Self.configA, Self.configB] {
+            // Both scopes hold the same id (two pre-0.10.0 clients constructed together both carry
+            // the legacy id over); the device id itself is scoped since 0.10.0.
+            defaults.set(deviceId, forKey: SharedSDKStorage.key(StorageKeys.deviceId, for: config))
             defaults.set(deviceId, forKey: SharedSDKStorage.key(StorageKeys.deviceRegistered, for: config))
+            defaults.set(SharedSDKStorage.registeredAppVersion,
+                         forKey: SharedSDKStorage.key(StorageKeys.deviceRegisteredAppVersion, for: config))
         }
         AttributionCaptureProtocol.modelEnvironmentRows = false
         let clientA = makeClient(Self.configA)
@@ -346,9 +353,13 @@ final class IdentityScopeTests: XCTestCase {
     func testAReplacementInOneLiveClientDoesNotStopAnotherFromRotating() async throws {
         let deviceId = "device-\(UUID().uuidString)"
         let defaults = try XCTUnwrap(UserDefaults(suiteName: SharedSDKStorage.suite))
-        defaults.set(deviceId, forKey: StorageKeys.deviceId)
         for config in [Self.configA, Self.configB] {
+            // Both scopes hold the same id (two pre-0.10.0 clients constructed together both carry
+            // the legacy id over); the device id itself is scoped since 0.10.0.
+            defaults.set(deviceId, forKey: SharedSDKStorage.key(StorageKeys.deviceId, for: config))
             defaults.set(deviceId, forKey: SharedSDKStorage.key(StorageKeys.deviceRegistered, for: config))
+            defaults.set(SharedSDKStorage.registeredAppVersion,
+                         forKey: SharedSDKStorage.key(StorageKeys.deviceRegisteredAppVersion, for: config))
         }
         AttributionCaptureProtocol.modelEnvironmentRows = false
         AttributionCaptureProtocol.echoRegisteredDeviceId = false
@@ -382,9 +393,13 @@ final class IdentityScopeTests: XCTestCase {
     func testAReplacementInAnotherScopeDoesNotHideABindFromAnEarlierLaunch() async throws {
         let deviceId = "device-\(UUID().uuidString)"
         let defaults = try XCTUnwrap(UserDefaults(suiteName: SharedSDKStorage.suite))
-        defaults.set(deviceId, forKey: StorageKeys.deviceId)
         for config in [Self.configA, Self.configB] {
+            // Both scopes hold the same id (two pre-0.10.0 clients constructed together both carry
+            // the legacy id over); the device id itself is scoped since 0.10.0.
+            defaults.set(deviceId, forKey: SharedSDKStorage.key(StorageKeys.deviceId, for: config))
             defaults.set(deviceId, forKey: SharedSDKStorage.key(StorageKeys.deviceRegistered, for: config))
+            defaults.set(SharedSDKStorage.registeredAppVersion,
+                         forKey: SharedSDKStorage.key(StorageKeys.deviceRegisteredAppVersion, for: config))
         }
         AttributionCaptureProtocol.modelEnvironmentRows = false
         AttributionCaptureProtocol.echoRegisteredDeviceId = false
@@ -448,33 +463,28 @@ final class IdentityScopeTests: XCTestCase {
 
     // MARK: - The registered slot names the device (review R5)
 
-    /// A logout in B rotates the shared id; A's slot still names the old one, so A registers the new
-    /// id on its next launch, anonymously, and an identify then binds with no 404.
-    func testAScopeRegistersTheDeviceAnotherScopeRotatedTo() async throws {
-        _ = try await bindInScopeA("user-\(UUID().uuidString)")
+    /// Since 0.10.0 the device id is scoped: a logout in B rotates only B's slot. A's next launch
+    /// keeps A's own device, still registered, and sends no register at all. Before, B's rotation
+    /// moved the shared id under A, and A had to register it.
+    func testALogoutInAnotherScopeLeavesThisScopesDeviceAlone() async throws {
+        let deviceA = try await bindInScopeA("user-\(UUID().uuidString)")
         let clientB = makeClient(Self.configB)
         await clientB.awaitIdentityPostForTesting()
-        let fresh = "dev_fresh_\(UUID().uuidString)"
-        AttributionCaptureProtocol.registerDeviceId = fresh
         clientB.reset()
-        let rotated = await waitUntil { clientB.context.deviceId == fresh }
+        let fresh = clientB.context.deviceId
+        let rotated = await waitUntil { clientB.status().identity?.deviceRegistered == true && clientB.context.deviceId == fresh }
         XCTAssertTrue(rotated, "precondition: B rotated to a fresh device")
         clientB.destroy()
         let registersBefore = AttributionCaptureProtocol.registerBodies.count
 
         let clientA = makeClient(Self.configA)
         defer { clientA.destroy() }
-        let registered = await waitUntil { clientA.status().identity?.deviceRegistered == true }
+        try? await Task.sleep(for: .milliseconds(200))
 
-        XCTAssertTrue(registered, "the anonymous launch registers the new id in A")
-        XCTAssertEqual(AttributionCaptureProtocol.registerBodies.dropFirst(registersBefore).map { $0["device_id"] as? String }, [fresh])
-        XCTAssertEqual(AttributionCaptureProtocol.registerEnvironments.last, "staging")
-        let user = "user-\(UUID().uuidString)"
-        clientA.identify(userId: user)
-        await clientA.awaitIdentityPostForTesting()
-        XCTAssertEqual(AttributionCaptureProtocol.identifyNotFoundCount, 0)
-        XCTAssertEqual(AttributionCaptureProtocol.registerBodies.count, registersBefore + 1, "no replacement row")
-        XCTAssertEqual(clientA.context.serverHeldUser.user, .known(user))
+        XCTAssertEqual(clientA.context.deviceId, deviceA, "A's slot is untouched by B's rotation")
+        XCTAssertNotEqual(deviceA, fresh)
+        XCTAssertEqual(clientA.status().identity?.deviceRegistered, true)
+        XCTAssertEqual(AttributionCaptureProtocol.registerBodies.count, registersBefore, "A registers nothing")
     }
 
     // MARK: - identify() with the current user does not loop (review M3)
@@ -484,10 +494,12 @@ final class IdentityScopeTests: XCTestCase {
         let deviceId = "device-\(UUID().uuidString)"
         defaults.set(deviceId, forKey: StorageKeys.deviceId)
         defaults.set(deviceId, forKey: SharedSDKStorage.key(StorageKeys.deviceRegistered, for: Self.configA))
-        defaults.set(String(Date().timeIntervalSince1970 + 3600),
-                     forKey: SharedSDKStorage.key(StorageKeys.deviceRegistrationBackoffUntil, for: Self.configA))
-        defaults.set(SDKDefaults.sdkVersion,
-                     forKey: SharedSDKStorage.key(StorageKeys.deviceRegistrationBackoffSDKVersion, for: Self.configA))
+        defaults.set(SharedSDKStorage.registeredAppVersion,
+                     forKey: SharedSDKStorage.key(StorageKeys.deviceRegisteredAppVersion, for: Self.configA))
+        RegistrationBackoff.write(
+            RegistrationBackoffRecord(until: Date().timeIntervalSince1970 + 3600, failuresTotal: 1, writtenBy: SDKDefaults.sdkVersion),
+            storage: ScopedStorage(base: UserDefaultsStorage(suiteName: SharedSDKStorage.suite), scope: StorageScope.hash(for: Self.configA))
+        )
         let client = makeClient(Self.configA)
         defer { client.destroy() }
         let user = "user-\(UUID().uuidString)"

@@ -100,13 +100,16 @@ struct DeviceIdentifyResponse: Decodable, Sendable {
 /// GET /v1/config — response
 struct SDKConfigResponse: Decodable, Sendable {
     let configVersion: String
-    let etag: String
+    let rawAssignmentToken: AnyCodable?
+    var assignmentToken: String? { rawAssignmentToken?.value as? String }
+    let etag: String?
     let flags: [String: AnyCodable]
     let experiments: [String: SDKExperimentAssignment]
 
     enum CodingKeys: String, CodingKey {
         case etag, flags, experiments
         case configVersion = "config_version"
+        case rawAssignmentToken = "assignment_token"
     }
 }
 
@@ -183,6 +186,8 @@ struct IngestEvent: Encodable, Sendable {
 }
 
 struct IngestContext: Encodable, Sendable {
+    var assignmentToken: String? = nil
+    var assignmentStatus: String? = nil
     let app: IngestApp?
     // Which SDK sent this batch — matches ingestContextSchema's top-level `sdk` group
     // (packages/shared/src/schemas/platform.ts). Purely descriptive (dashboard
@@ -206,6 +211,8 @@ struct IngestContext: Encodable, Sendable {
 
     enum CodingKeys: String, CodingKey {
         case app, sdk, user, device, session, flags, experiments, account, revenue
+        case assignmentToken = "assignment_token"
+        case assignmentStatus = "assignment_status"
         case experimentAssignments = "experiment_assignments"
         case releaseId = "release_id"
     }

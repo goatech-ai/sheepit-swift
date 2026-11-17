@@ -27,7 +27,399 @@ package uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 > resolves `>=1.0.0 <2.0.0`, so **a consumer pinned to `1.0.x` will never
 > receive a `0.x` release.** They are frozen until they re-pin to `0.x`.
 
-## [0.9.0] - 2026-11-03
+## [Unreleased]
+
+## [0.11.0] - 2026-11-17
+
+### Changed — coordinated receipt cutover
+
+- **Requires a server with the assignment-token contract active before upgrading to 0.11.0.** Upgrade the target server/BYOC first.
+
+- Events and exposures carry one opaque assignment receipt captured with their applied config; legacy experiment maps and their byte-budget machinery are removed. Queued events retain their captured receipt across refreshes and restarts. An event re-stamped to a replacement device (C5, registration adoption) ships no token: a receipt is bound to the device row it was issued for.
+- Native crash uploads use the full identity and receipt saved together in N1's v3 cohort. Older tokenless crash/queue artifacts remain unattributed; uploading never borrows the current user's receipt.
+- Performance intervals and spans capture their receipt and identity when they start or are observed. Public `startSpan()` freezes that context before its actor task is queued, so a delayed actor cannot borrow a later identity or config; uploads retain the captured values.
+- Performance data follows the identity it was measured under. `reset()` ends it: a span still open across a logout, an ANR detected or recovered after one (including a logout during the main-thread ping wait), and a pending warm start ship without the logged-out user's identity or receipt (spans and ANRs keep their duration), and the cumulative frame summary restarts for the next user. A different user identifying on the same device restarts the frame summary and warm start too, while a span started under the first user stays theirs. A device-id change ends receipts before the new id is visible. A summary or warm start whose live user or device no longer matches (or is unknown) ships with no receipt, and a mixed frame window ships its counts with no identity. A contended sampling gate now ships the identity without a receipt instead of dropping the whole context, and the batch envelope names nobody (each metric carries its own context).
+- Invalid config receipts, including strings containing NUL, emit a structured diagnostic without their value and cannot replace valid flags or erase the saved full crash identity. Unknown or malformed persisted receipt status becomes unattributed without discarding unrelated queued events.
+- Pending exposure reads are released only by an eligible receipt for the current identity. Alias-only refresh preserves deduplication. Ordinary flags and the existing hosted 8,192-byte context limit remain unchanged; 500 experiment memberships are supported when ordinary context fits, while large ordinary flag snapshots can still be rejected.
+
+While the server's assignment-token contract is inactive, this version loses attribution it used to carry: events, exposures and performance metrics ship no assignment (they are counted but not tied to an experiment arm), and crash reports no longer carry `active_experiments` (always nil; the native cohort carries the receipt instead). Events already queued by 0.10.x when the app upgrades lose their experiment assignments once, because the legacy maps are not migrated; they send as tokenless events. Events re-stamped to a replacement device carry no token.
+
+Upgrade the target server/BYOC (assignment-token contract active) and verify durable key custody before adopting this minor. Existing older SDK events remain accepted without experiment attribution; release and activation gates remain separate.
+
+### Fixed
+
+- Crash snapshots retain full valid user, device and session identifiers in a versioned supplement, together with their optional capture-time receipt. Frozen report/v1 layouts and older readers remain supported.
+- Identity changes refresh the native crash identity synchronously. Interrupted or corrupt snapshots are unavailable instead of pairing a receipt with partial or repaired identity.
+- Unstarted and failed-install reporters cannot overwrite another reporter's live context. Structured diagnostics name unavailable capture/read outcomes without identifiers or receipt contents.
+- Malformed saved image counts are bounded before conversion on 32-bit targets.
+- Unreadable, unknown or mismatched saved sidecars cannot restore truncated legacy identity; valid old layouts and missing-sidecar compatibility remain supported.
+
+The merged N1 prerequisite retained its event wire contract; the receipt-only Swift port above is a separate coordinated cutover, with publication and activation still gated. The founder approved compiler IR evidence for only the two arm64_32 bound-before-conversion lines; watchOS runtime validation remains unexecuted, and 64-bit test success does not establish that target's overflow behavior. An existing watchOS `FrameTracker` typecheck limitation remains separately tracked in `PENDING_WORK.md`; this change does not certify watchOS or waive release gates.
+
+## [0.10.2] - 2026-11-09
+
+A device that cannot reach the server keeps the flags it last had, from the first line after
+`create`. Founder decision, 2026-11-09: the pilot's app reaches Sheepit only inside its VPN, and off
+it every launch read every flag at its default.
+
+### Upgrading from 0.10.1
+
+- **Pin `exact: "0.10.2"`.** No public API is removed or renamed. Added: `View.sheepitScreen(_:properties:client:)`
+  and `SheepitConfig.isUsingDefaultHost`; new event `$session_end`.
+- **`configOfflineMaxAge` now defaults to `.infinity` (no limit).** The cached config is applied at
+  launch whatever its age. To keep the previous behaviour set `configOfflineMaxAge: 604_800`
+  (7 days, 0.9.0 to 0.10.1) or `86_400` (24 hours, 0.8.0 and earlier).
+- **The launch cache is applied before `create(config:)` / `initialize(config:)` return.** If your
+  app waited (`awaitConfig`) only to get past the launch race, it no longer has to.
+- **`configOfflineMaxAge` reads `.infinity` by default, so `Int(config.configOfflineMaxAge)` in your
+  code traps.** Check `isFinite` before converting it, or compare it as a `TimeInterval`.
+- **`identify(userId:timeout:)` is never settled by the launch cache.** The cache is applied inside
+  `create`, before the server has confirmed any user this session, so the wait ends only when a
+  config fetched for that user lands. Offline it returns `.timedOut`, with the cached values in place.
+
+### Added (go-live)
+
+- **`$session_end` with `duration_ms`.** One per finished session, carrying the ended session's own
+  id and timestamped at its last activity. Queued when the idle window is found elapsed (next event,
+  foreground, or the next launch if the process died); not sent on every background, since a return
+  within 30 minutes continues the session. No background task is held. The server accepts any
+  `$`-prefixed event name, so no server change is needed.
+- **`.sheepitScreen("Checkout")` SwiftUI modifier**: `$screen` once per appearance, deduplicated
+  against repeated `onAppear`. Automatic UIKit tracking is not shipped.
+- **`SheepitConfig.isUsingDefaultHost`** (read-only; true for `api.sheepit.ai` and `api.goatech.ai`),
+  and a `.fault`-level unified-log line at `create(config:)` when `SheepitAPIURL` is absent from
+  Info.plist and events go to the hosted default. The default host is unchanged and `create` never
+  fails on it.
+- **The cached `/v1/config` body is capped at 512 KiB**, on write (applied in memory only; the older
+  cache is removed; `config.cache_too_large` diagnostic) and on read at launch (`oversize` drop
+  reason), since it is decoded on the launch thread and no longer expires.
+- `$session_end` is stamped with the app version and build its session began under, so an update
+  between the session and its end does not move it into the new release.
+- `reset()` queues the outgoing session's `$session_end` (no orphaned `$session_start` per logout).
+- New storage keys `gt_session_started_at`, `gt_session_ended_id`, `gt_session_app_version`,
+  `gt_session_app_build`.
+
+### Fixed
+
+- **A flag read on the line after `create` answers with the cached value.** The cache used to be
+  applied from a `Task` after the client was handed back, so a read on the next line raced it, and an
+  app that read its flags once at launch kept the compiled-in defaults for the whole session when the
+  server was unreachable. The cache (flags and experiment assignments) is now applied synchronously,
+  inside the same reset gate as before, so a `reset()` racing the launch still applies nothing. A
+  fetch that lands later, and its 304, behave exactly as before.
+- **An old cache is no longer deleted at launch.** A failed fetch (no network, a 5xx, a 403) never
+  deleted it; the 7-day launch limit did. The cache now goes only when a successful fetch replaces it,
+  when `reset()` runs, or past a finite `configOfflineMaxAge` the host sets.
+- **An identity change no longer puts one person in both arms of an experiment.** After an
+  `identify(userId:)` that switches users, every experiment entry on an event is sent as
+  `subject_status: "identity_changed"` and left out of `context.experiments`, whatever its
+  `subject_kind`. This lasts until the config for the new user lands. Before, only user-kind entries
+  were marked. But `/v1/config` reports the kind of the subject it bucketed, so a user-unit
+  experiment on an anonymous device arrives as `"device"`. Its events were credited to the device's
+  arm until the refetch re-bucketed the person by user (measured 2026-10-28). Ingest already sets
+  marked entries aside as unattributed claims, so nothing changes on the wire. Three bounds:
+  - Only a real switch arms this. A launch that re-sends the same user does not.
+  - A bind that fails, goes unanswered or is never sent ends the switch at the first server config
+    whose fetch started after the bind ended. The SDK starts that fetch right away, because a poll
+    answered 304 applies nothing, and if it fails every later poll skips the ETag until one
+    succeeds. After that only user-kind entries are marked, so a failed bind leaves every claim
+    unattributed only until a config fetch that the server resolves for this device succeeds. If
+    the server cannot resolve the device (for example its row was erased), the switch stays armed
+    and claims stay unattributed, never mis-attributed. The launch cache never ends a switch.
+  - An exposure (`$experiment_exposure` or `$flag_exposure`) sent while its claims are marked no
+    longer uses up the exposure dedup. The SDK releases it when the wait ends: the switch ends, or,
+    with no switch pending, a config lands under a different confirmed label (a user, or a
+    confirmed anonymous row, as after a device replacement). It also releases it right away if a
+    config landed between the read and the exposure. The next read then sends it again, marked
+    again if the new label still does not match the event's user. Each release allows one more
+    send, so a subject can send the same arm or flag more than twice. A re-sent
+    `$experiment_exposure` always carries `exposure_reason: "first"`. A re-sent `$flag_exposure`
+    carries `"first"`, or `"value_changed"` when the config that ended the wait also changed the
+    value. A dedup-regression query on repeated `first` exposures should not count a `first`
+    whose earlier copy was sent `identity_changed`.
+
+  A device-unit experiment also loses attribution during a switch, because the SDK cannot tell
+  unit from kind. The armed switch lives in memory: an app killed mid-switch relaunches without it,
+  and its device-kind entries are credited from the cache until the next config.
+
+- **`$flag_exposure` and `$experiment_exposure` carry the assignments their decision was made
+  under.** A config applied between `flag()` / `experiment()` and the exposure's `track` could
+  send an exposure that reported one arm and carried the next config's arm in
+  `context.experiments`. `flag()` now reads the value and the assignments under one lock, which the
+  config apply also holds. `experiment()` reads the variant and the assignments in one
+  `ExperimentManager` lock acquisition.
+- **An `unknown_device` answer clears the resolved record; nothing else does** (contract § 7).
+  The rule listed under 0.10.0 cleared it on any unresolved answer: a `lookup_error` (a server
+  failure) or an unrecognized value now leaves it. Only an answer to a request that started after that body
+  applied, with no `reset()` since, clears it: a stale one landing after a newer resolved body
+  leaves the record.
+- **A device whose server row was erased or purged now re-registers under a fresh id** (contract
+  § 7, C5). Before, a device that had a resolved config and was then answered `unknown_device` kept
+  its last real body, so a kill switch reached it only after its next re-registration, which also
+  re-created the erased id. Now it is replaced the way an identify 404 already was: a fresh
+  lowercase UUIDv4 is registered under the same backoff and launch budget, swapped in (queued
+  events re-stamped), and its config fetched at once. It fires only on `unknown_device` (never
+  `lookup_error` or an unrecognized value), only for the device a resolved body was recorded for
+  since the last `reset()`, and only for a response newer than the body applied; the record is
+  cleared as it fires, so it cannot loop, and it mints at most one device per launch and
+  `reset()` generation (a later trigger reports `reason: "capped"`); only a registration C5 itself
+  started and the server answered spends that cap, and a logout releases it. The replacement is
+  single-flight per device id: when the launch identify's 404 and C5 race for the same erased
+  device, one registration goes out, not two (C5 reports `reason: "joined"` and leaves the bind to
+  the identify). When nothing replaces the device (capped, failed or deferred), it keeps the
+  erased id but drops that row's values: the server's defaults, kill switches included, apply in
+  memory, and the stamp stays so the next launch retries. An anonymous install's flag and
+  experiment exposures fire again for the fresh id once its config is in (the subject was the
+  device; a read before that exposes nothing, never the erased device's arm). A stale answer
+  for an id the client already left (an identify 404 replaced it) reports and keeps nothing. An unknown resolution value, like
+  `lookup_error`, neither fires nor clears the record. An identified app re-sends its identify for the fresh
+  device right after the swap, as sdk-js does (a joined replacement leaves that to its identify). **Across launches too:** the config cache now carries a
+  resolved stamp (`gt_config_resolved_for`, the device id its body was answered `resolved` for),
+  so an erasure while the app was not running is caught by the first launch fetch. A cache written
+  by an earlier SDK has no stamp and is treated as not resolved: such an install is covered from
+  its first resolved fetch on this release.
+- **A second `reset()` during a logout rotation's registration no longer loses its device.** When
+  the server replaced the rotation's id, the replaced id was written over whatever device was
+  current by then, including the newer reset's. It is now a compare-and-set, as at launch.
+
+### Diagnostics
+
+- New: `config.device_replaced_unknown` (warn; `reason` `resolved_then_unknown`, `joined` when it
+  joined a replacement already registering, or `capped` when C5 already minted one since launch or
+  the last `reset()`) when a device the server resolved before is answered
+  `unknown_device`; the replacement itself
+  reports through the existing `identity.device_replaced_unknown` /
+  `identity.device_replacement_deferred` / `identity.device_replacement_failed`.
+
+### Changed
+
+- **`identify()` to a different known user deletes the cached config on disk.** With no age limit it
+  would otherwise outlive the user it was evaluated for: an offline relaunch showed user A's flags to
+  user B. Memory keeps answering until B's config lands; anonymous to known keeps the cache. Until a
+  config fetched for a row known to hold B lands, nothing is written to disk: a response already in
+  flight, or one fetched for any other user (an earlier identify can leave the row on a third user),
+  is applied to memory only. The disk copy goes before the new user id is saved, so an app killed in
+  between relaunches on defaults, not on the previous user's config.
+- **A device replaced because the server no longer knows it deletes the cached config on disk.**
+  After a successful replacement (C5 above, or an identify 404) the cached body belonged to the
+  erased row; with no age limit every offline launch on the fresh id applied it. Memory keeps
+  answering until the fresh device's config lands. A `/v1/config` answer still on the wire for the
+  replaced id is discarded when it lands, neither applied nor cached, so it cannot write the erased
+  row's body back. A failed or deferred replacement keeps the cache and its resolved stamp, so the
+  next launch retries.
+- **A 304 no longer re-stamps a cache after the server answered this device unresolved.** The server
+  answers 304 before it looks the device up, so the re-stamp kept a body it can no longer evaluate
+  for this device reported fresh. The stamp now stays until a body is applied again, and
+  `status().configFreshness.isStale` is `true` from that answer until a body is applied again.
+- **A cache stamped later than the device clock is applied, and reported stale** (its age is
+  unknown) under the default. Under a finite `configOfflineMaxAge` it is still deleted at launch.
+- **An exposure under a cache of unknown age carries no `config_age_ms`.** It sent `0`, the
+  clamped age, which reads as a config fetched that instant. `config_source` is still sent.
+- `configOfflineMaxAge`: `.infinity` is valid (no limit); NaN, zero and negative still fall back to
+  the default, with the `config.cache_limit_invalid` warning. `configStaleAfter` (24 hours by
+  default) now also accepts `.infinity`, meaning never stale by age; it still deletes nothing.
+
+### Added
+
+- Diagnostics `config.launch_cache_applied` (`config_age_ms`, `stale`, `age_unknown`,
+  `config_version`; info when stale) and `config.launch_cache_dropped` (warn, `reason` ∈
+  `unreadable` / `unstamped` / `past_max_age` / `future_dated`, and `offline_max_age_s`: the limit
+  as a `Double`, or `"none"`), so a device running on an old cache is visible to `onDiagnostic`.
+  Exposures keep `config_source` and `config_age_ms`.
+
+## [0.10.1] - 2026-11-09
+
+Crash reports name what crashed. Plan:
+[`Docs/Technical/CRASH_SYMBOLICATION_PLAN.md`](../../Docs/Technical/CRASH_SYMBOLICATION_PLAN.md) (M1).
+
+### Upgrading from 0.10.0
+
+- **Pin `exact: "0.10.1"`.** No public API is removed or renamed.
+- **Pending crash reports survive the upgrade and a downgrade.** The on-disk crash report is
+  unchanged; everything new is in a sidecar file (`current.supplement`, own magic and format
+  version) that an older build never opens. A report captured by 0.10.0 or earlier uploads as
+  before, without the new fields.
+- **A crash group's frames change.** Frame 0 is now the crashing code instead of the crash
+  handler, so new crashes group apart from the same crash captured by earlier versions.
+
+### Fixed
+
+- **The crashed thread is read from the signal's register state.** Before, it was read while it
+  was running the crash handler, so its top frames were the handler's own; the Mach port that read
+  took was also leaked. Frame-pointer records are read without dereferencing them, so a corrupt
+  stack ends the walk instead of faulting inside the handler and losing the report. Pointer-auth
+  bits are stripped, and a frame that matches no loaded image is dropped and counted
+  (`frames_dropped`). Frame 1 is the link register only while it still holds the caller (a
+  frameless leaf such as `objc_msgSend`), read from the image's compact unwind info.
+- **Swift runtime failures carry their message.** `fatalError`, `preconditionFailure` and
+  force-unwraps in debug builds reached the server as a bare `SIGTRAP`; `exception_message` now
+  holds the runtime's text (up to 1023 bytes; abort() reasons too). An optimized-build trap with
+  no text is titled `Swift runtime failure (brk #1)`. `exception_type` stays the signal name.
+  The text is read only from your app's executable and the system's shared-cache copies of the
+  Swift runtime, Swift concurrency, `libsystem`, `libc++abi`, `libobjc` and `libdispatch`, never
+  from another library. It is uploaded with the report: keep
+  secrets out of `fatalError` / `precondition` messages.
+- **A report from an app with more than 50 threads was dropped for good**: the server refuses
+  more than 50 `thread_info` entries with a 400, which the SDK treats as permanent. The payload
+  now carries at most 50, always including the crashed thread.
+- **`active_flags` and `active_experiments` were always empty** (nothing wrote them). They now hold
+  the flag values in force and each experiment's variant, kept current on every config, override
+  and logout, bounded to the 4 KB on-disk buffer by dropping whole entries.
+- **`free_memory_mb` was always empty.** It is sampled every 30 s and on every memory warning
+  (`os_proc_available_memory()`; iOS, tvOS, watchOS).
+- **`CrashConfig.breadcrumbCapacity` was ignored.** A report carries the newest that many
+  breadcrumbs (at most 32, the on-disk ring).
+- **A report whose body exceeded the server's 512 KiB limit was dropped for good** (a 413 is
+  permanent). Other threads' frames, then other threads, are trimmed until it fits 448 KiB; the
+  crashed thread and the exception are never trimmed. A corrupt `battery_level` is clamped to 100
+  instead of costing the report a 400.
+- **`$screen` breadcrumbs name the screen** (`$screen: Checkout`), not just the event.
+- **`is_app_frame` comes from the image's path** inside the app bundle, not a guess from its name
+  (an app framework called `libFoo` was a system frame). Reports from earlier versions keep the
+  name heuristic.
+- **An image's `size` is its `__TEXT` segment.** It was the largest segment: the main
+  executable's 4 GiB `__PAGEZERO`, which attributed system frames to the app. `dyld` is listed too,
+  so the last main-thread frame (`start`) is no longer dropped.
+
+### Added
+
+- Crash payload fields (optional; an API that does not know them ignores them): `sdk_version`
+  (the version that captured the crash), `os_build`, `arch`, `mach_exception_type`,
+  `crashed_thread_registers` (`pc`, `lr`, `fp`, `sp`), `frames_dropped`, `images_truncated` (more than 512 images were loaded, so frames were kept unchecked), and per image `cpu_type`,
+  `cpu_subtype`, `vmaddr_slide`, `is_app_image`.
+
+## [0.10.0] - 2026-11-05
+
+Device registration now follows the one contract every Sheepit SDK implements:
+[`Docs/Technical/SDK_DEVICE_REGISTRATION_CONTRACT.md`](../../Docs/Technical/SDK_DEVICE_REGISTRATION_CONTRACT.md).
+
+### Upgrading from 0.9.0
+
+- **Pin `exact: "0.10.0"`.** On `0.x` a minor may break you.
+- **No public API is removed or renamed.**
+- **`awaitConfig(timeout:)` on a fresh install now waits for the config fetched after
+  registration**, not the launch answer (which the server sends before the device has a row). Give
+  it a timeout that covers a registration round trip plus a config fetch: the README's example
+  uses 3 s. A server-side lookup failure on the fetch after `identify(userId:timeout:)` now ends
+  in `.timedOut`.
+- **The API key must have the exact minted shape** `{vendor}_pub_{slug}_{secret}`: a 3-character
+  lowercase alphanumeric slug and a 64-character lowercase hex secret. The vendor prefix (`lp`
+  today, `si` after the rename) is shape-checked only (`[A-Za-z0-9][A-Za-z0-9-]{0,15}`), the same
+  rule as sdk-js. Every key the server mints has that shape. Anything else (a 4-character slug, a
+  short or upper-case secret) makes the client inert, where 0.9.0 admitted it. **The slug and
+  secret alphabets are frozen from 0.10.0:** a published SheepitKit refuses any key whose slug is not
+  `[a-z0-9]{3}` or whose secret is not `[a-f0-9]{64}`, so the server must never mint another shape.
+- **`apiUrl` with credentials, a query string, a fragment or an out-of-range port makes the client
+  inert** (`status().rejectionReason`). Plain `http`, `localhost`, IP literals, Compose-style names
+  and path prefixes still work.
+- **Every existing install registers once more on its first launch of 0.10.0**, and again after
+  each app update, proposing the id it already has (the device row is updated, not duplicated).
+- **`retryAttempts` no longer applies to device registration**, which now sends one request per
+  attempt under its own policy.
+- **The device id is scoped per `apiUrl`, environment and key** (`gt_device_id:<scope>`, as in
+  sdk-js). An existing install's unscoped `gt_device_id` is carried into the first scope that
+  launches, byte-for-byte, and the unscoped key is then deleted, so an app on one host keeps its
+  device. A second scope on the same install (another key, environment or host, such as a Debug
+  build on a staging key) now mints and registers its own device instead of sharing one. The scope
+  hash uses the raw `apiUrl` string (byte-identical to sdk-js), so **editing `apiUrl` even by a
+  trailing slash moves the app to a new scope, and so to a new device id**. Keep the configured
+  value stable.
+
+### Changed
+
+- **The device id is proposed, never left for the server to mint.** A fresh install mints a
+  lowercase UUIDv4, persists it, uses it immediately for events, crashes and `/v1/config`, and
+  sends it as `device_id` on every registration attempt. 0.9.0 sent no id on a fresh install, so
+  the server minted `dev_…` and everything the app did before registration answered named an id
+  the server never issued. When the server keeps the proposal the id does not change: no
+  re-stamp, no change callback, and the held validator and cached body are kept. Config is still
+  refetched once, unconditionally, unless a body the server resolved for that device is already
+  applied (see Fixed). Only a replaced id runs the swap (persist, re-stamp the queues, refetch
+  config). The identify 404 replacement and the logout rotation propose a fresh id the same way. A stored id the server would refuse is replaced before the first send.
+- **Bounded, persisted registration backoff.** At most 6 consecutive failed attempts per launch
+  (a success resets the count), the first at once, each a single request (0.9.0 also retried
+  inside the HTTP client). Full jitter with a 1 s floor
+  in `[1 s, min(cap, 2 s · 2^failures)]` (so the first retry is 1–2 s, jittered): cap 60 s for
+  network errors, 5xx and malformed answers, 1 hour for 402/422/429. On every non-terminal answer,
+  5xx included, a longer `Retry-After` wins, clamped to 1 hour (0.9.0 dropped it for 402/422 and
+  persisted nothing for 429; an infinite or unparseable `Retry-After` is now ignored). **A 4xx is
+  classified by the API's own `{error: {code, message}}` envelope, not the status alone:**
+  `VALIDATION_ERROR` on any 4xx, or 401/403 with the envelope, is a flat 24 hours; 402/422 with the
+  envelope is the 1-hour cap class; 429 is rate limited either way; every other 4xx, including any
+  without the envelope (a WAF, proxy or captive portal), is transient, so fixing such a rule does
+  not leave every device waiting a day. Every
+  failure writes one record (`gt_device_registration_backoff`), so a relaunch inside the window
+  sends nothing and waits it out, and the failure count escalates launch over launch. A window
+  further out than 24 hours (a clock moved back) is clamped and rewritten, no longer ignored.
+- **`identify()` while registration is backed off (IDENTIFY_WAIT_BUDGET, 11 s).** On a device not
+  yet registered, a remaining window of at most 11 s is waited out (the identify goes out after the
+  registration); a longer one settles `identify(userId:timeout:)` with `.failed` at once and sends
+  nothing (`identity.identify_deferred`, `reason` `not_registered`). The app's user id is kept, so
+  events carry it and the SDK's periodic retry binds the row once the device registers. A shorter
+  caller timeout still wins.
+- **An answer whose `device_id` is unusable** (empty, over 256 characters, anything outside
+  printable ASCII, `.` or `..`) is retried, never adopted. A usable id of any other shape, such as
+  a legacy `legacy:odd`, is kept, sent and adopted verbatim; only the ids the SDK mints are strict.
+- **Path-interpolated device ids are percent-encoded** (`SDKEndpoints.deviceIdentify`), and the
+  joined URL is no longer encoded twice.
+- **The device id is flushed to disk** (`UserDefaults.synchronize()`) after it is minted or adopted.
+
+### Fixed
+
+- **A `/v1/config` 2xx the server could not resolve the device for is no longer treated as the
+  device's config.** The server answers with targeting skipped and every flag on its default when
+  `X-Sheepit-Device-Resolution` is anything but `resolved` (`unknown_device` before the device
+  registers, `lookup_error` on a server-side lookup failure). 0.9.0 and earlier applied that body
+  over the values already in memory and wrote it over a good cache, which an offline launch then
+  served for up to `configOfflineMaxAge`. Now such a body is never cached and its ETag is never
+  kept, nothing applied or on disk is touched, and an owed unconditional fetch stays owed. It is
+  applied to memory only when nothing is applied since launch or the last `reset()` (no cache
+  loaded, no resolved body), or when what is applied is itself memory-only, so a device that never registers still gets the server's
+  defaults, killed flags included; otherwise it is refused. Exposures read from such a body carry
+  `config_source: "unresolved"` (no `config_age_ms`). (Keeping its ETag could also 304-latch
+  the defaults, but only against servers older than the suffixed unresolved ETag.) The header is
+  split on commas and compared case-insensitively; it is resolved only when every value is
+  `resolved`. A response with no such header (a server older than the header) is applied as before.
+- **A fresh install no longer reads defaults until the next poll.** Config sync starts alongside
+  registration, so the first fetch names a device with no row yet. A registration the server
+  accepts (the proposed id kept) now refetches config once, at once and unconditionally, unless a
+  body the server answered `resolved` for that device, since the last `reset()`, is already
+  applied; an app-update re-registration with a resolved body applied sends no extra request. The
+  same applies to the logout rotation. Before, only a server-replaced id refetched, and the app
+  waited `configRefreshInterval` (300 s by default). Against a server that sends no resolution
+  header, every accepted registration refetches once. The refetch is one-shot: if it fails, later
+  polls stay conditional. It is dropped if the id it names is no longer the device's (a logout
+  that rotates) or the client was destroyed, so a logout racing it never applies or caches the
+  logged-out user's body for the abandoned device (a request already sent may still reach the
+  server); a `reset()` that keeps the device
+  does not drop it. An unresolved answer for the device a resolved body was recorded for (an
+  erased row) clears that record, so the next registration refetches.
+- **Consequence for the awaitable APIs:** an unresolved body never counts as a config applied, so
+  `awaitConfig(timeout:)` on a fresh install with no cache now waits for the fetch after
+  registration (a short timeout can return `false` where 0.9.0 returned `true` on a defaults
+  body), and a `lookup_error` on the fetch after `identify(userId:timeout:)` ends in `.timedOut`
+  rather than `.ready` on defaults.
+
+### Diagnostics
+
+- New: `identity.device_registered` (`outcome` `proposed` | `replaced`),
+  `identity.device_registration_budget_exhausted`, `identity.device_registration_backoff_write_failed`,
+  `identity.device_registration_backoff_unreadable`. `identity.device_registration_failed` now
+  carries `outcome` `network_error` | `server_error` | `malformed_response` | `unusable_device_id` |
+  `bad_request_unrecognized` | `auth_rejected_unrecognized` | `cap_unrecognized` |
+  `unexpected_status`. `identity.device_id_replaced_unusable` (`reason` `empty` | `too_long` |
+  `dot_segment` | `invalid_character`, never the id) when a stored id could not be sent and a fresh
+  one was minted.
+- New: `config.unresolved_body_refused` (warn; `outcome` `unknown_device` | `lookup_error` |
+  `unrecognized`, never the raw value, plus `status_code`, `unconditional` and
+  `applied_memory_only`) for every unresolved config 2xx, also logged at warn;
+  `config.refetch_on_registration` (info; `outcome` `proposed` | `replaced`) when a registration
+  answer refetches config, and `config.registration_refetch_skipped` (debug; `reason`
+  `resolved_applied` | `superseded`) when it does not; `config.resolution_header_absent`
+  (info, once per client) when a config 2xx carries no resolution header (a server older than the
+  header, or a proxy that strips it, which turns the rules above off).
+
+## [0.9.0] - 2026-11-04
 
 ### Upgrading from 0.8.0
 

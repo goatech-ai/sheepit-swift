@@ -50,7 +50,7 @@ final class DeviceRegistrationPayloadTests: XCTestCase {
         for sample in identifiers {
             let body = try encoded(DeviceManager.registrationRequest(
                 anonymousId: "anon-1",
-                existingDeviceId: nil,
+                proposedDeviceId: "dev-1",
                 appVersionOverride: nil,
                 locale: Locale(identifier: sample.identifier)
             ))
@@ -70,7 +70,7 @@ final class DeviceRegistrationPayloadTests: XCTestCase {
         for sample in identifiers {
             let body = try encoded(DeviceManager.registrationRequest(
                 anonymousId: "anon-1",
-                existingDeviceId: nil,
+                proposedDeviceId: "dev-1",
                 appVersionOverride: nil,
                 locale: Locale(identifier: sample.identifier)
             ))
@@ -93,8 +93,7 @@ final class DeviceRegistrationPayloadTests: XCTestCase {
     private func clearDeviceStorage() {
         guard let defaults = UserDefaults(suiteName: suiteName) else { return }
         for key in [StorageKeys.deviceId, StorageKeys.deviceRegistered,
-                    StorageKeys.deviceRegistrationBackoffUntil,
-                    StorageKeys.deviceRegistrationBackoffSDKVersion, StorageKeys.sessionId,
+                    StorageKeys.deviceRegistrationBackoff, StorageKeys.sessionId,
                     StorageKeys.sessionLastSeen, StorageKeys.identity] {
             SharedSDKStorage.remove(key, from: defaults)
         }
@@ -160,8 +159,9 @@ final class DeviceRegistrationPayloadTests: XCTestCase {
             client.getRecentDiagnostics().contains { $0.code == "identity.device_registration_terminal_failure" }
         }
 
-        let raw = UserDefaults(suiteName: suiteName)?.string(forKey: SharedSDKStorage.slot(StorageKeys.deviceRegistrationBackoffUntil))
-        XCTAssertNotNil(raw, "a 400 re-sends the same body forever: it must back off, not retry every launch")
+        let record = SharedSDKStorage.backoffRecord()
+        XCTAssertEqual(record?.until, fixedNow.timeIntervalSince1970 + SDKDefaults.deviceRegistrationTerminalBackoff,
+                       "a 400 re-sends the same body forever: it must back off 24 h, not retry every launch")
         XCTAssertNil(UserDefaults(suiteName: suiteName)?.string(forKey: SharedSDKStorage.slot(StorageKeys.deviceRegistered)))
 
         let diagnostic = client.getRecentDiagnostics().first {
@@ -230,16 +230,16 @@ final class DeviceRegistrationPayloadTests: XCTestCase {
     "experiment_assignments":{},"config":{"flush_interval_ms":1000,"flush_size":20}}}
     """
 
-    /// A proxy or load balancer page is not the API rejecting the body: retry next launch.
+    /// A proxy or load balancer page is not the API rejecting the body: a transient window (at most
+    /// 60 s), not the terminal 24 h.
     func testA400WithoutTheAPIsValidationEnvelopeIsTransient() async {
-        let client = startWithRegisterReply(.status(400, body: "<html><body>Bad Request</body></html>"))
+        let now = Date()
+        let client = startWithRegisterReply(.status(400, body: "<html><body>Bad Request</body></html>"), now: now)
         defer { client.destroy() }
-        await waitUntil { self.registerCount >= 1 }
-        try? await Task.sleep(for: .milliseconds(100))
+        await waitUntil { SharedSDKStorage.backoffRecord() != nil }
 
-        XCTAssertNil(
-            UserDefaults(suiteName: suiteName)?.string(forKey: SharedSDKStorage.slot(StorageKeys.deviceRegistrationBackoffUntil)),
-            "only a VALIDATION_ERROR from the API is terminal")
+        let window = (SharedSDKStorage.backoffRecord()?.until ?? .infinity) - now.timeIntervalSince1970
+        XCTAssertLessThanOrEqual(window, RegistrationPolicy.transientCeilingSeconds, "only a VALIDATION_ERROR from the API is terminal")
         XCTAssertFalse(client.getRecentDiagnostics().contains {
             $0.code == "identity.device_registration_terminal_failure"
         })
@@ -248,39 +248,38 @@ final class DeviceRegistrationPayloadTests: XCTestCase {
     /// A new build may carry the fix for whatever was rejected, so it retries at once.
     func testABackoffWrittenByAnotherSDKVersionIsIgnored() async {
         let now = Date()
-        let defaults = UserDefaults(suiteName: suiteName)
-        defaults?.set(String(now.timeIntervalSince1970 + 3600), forKey: SharedSDKStorage.slot(StorageKeys.deviceRegistrationBackoffUntil))
-        defaults?.set("0.0.1", forKey: SharedSDKStorage.slot(StorageKeys.deviceRegistrationBackoffSDKVersion))
+        SharedSDKStorage.seedBackoff(until: now.addingTimeInterval(3600), sdkVersion: "0.0.1")
         let client = startWithRegisterReply(.status(201, body: Self.registered), now: now)
         defer { client.destroy() }
         await waitUntil { self.registerCount >= 1 }
         XCTAssertEqual(registerCount, 1)
     }
 
-    /// A backoff-until further out than the backoff itself can only come from a clock that moved.
-    func testABackoffFurtherOutThanItsOwnLengthIsIgnored() async {
-        let now = Date()
-        let defaults = UserDefaults(suiteName: suiteName)
-        defaults?.set(
-            String(now.timeIntervalSince1970 + 2 * SDKDefaults.deviceRegistrationTerminalBackoff),
-            forKey: SharedSDKStorage.slot(StorageKeys.deviceRegistrationBackoffUntil))
-        defaults?.set(SDKDefaults.sdkVersion, forKey: SharedSDKStorage.slot(StorageKeys.deviceRegistrationBackoffSDKVersion))
+    /// Acceptance 6 (backward clock): a stored `until` further out than 24 h can only come from a
+    /// clock that moved back. It is clamped to now + 24 h and REWRITTEN — never dropped (0.9.x
+    /// ignored it and registered at once), and the clamp is a fixed point that converges.
+    func testBackwardClockClampsAndRewritesTheWindowRatherThanDroppingIt() async {
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        SharedSDKStorage.seedBackoff(until: now.addingTimeInterval(10 * SDKDefaults.deviceRegistrationTerminalBackoff), failuresTotal: 3)
         let client = startWithRegisterReply(.status(201, body: Self.registered), now: now)
         defer { client.destroy() }
-        await waitUntil { self.registerCount >= 1 }
-        XCTAssertEqual(registerCount, 1)
+        try? await Task.sleep(for: .milliseconds(300))
+
+        XCTAssertEqual(registerCount, 0, "the window is clamped, not dropped: nothing is sent inside it")
+        let record = SharedSDKStorage.backoffRecord()
+        XCTAssertEqual(record?.until, now.timeIntervalSince1970 + SDKDefaults.deviceRegistrationTerminalBackoff,
+                       "the stored record is rewritten to now + 24 h")
+        XCTAssertEqual(record?.failuresTotal, 3, "the clamp keeps the failure count")
     }
 
     func testASuccessfulRegistrationClearsTheBackoff() async {
         let now = Date()
         let defaults = UserDefaults(suiteName: suiteName)
-        defaults?.set(String(now.timeIntervalSince1970 - 1), forKey: SharedSDKStorage.slot(StorageKeys.deviceRegistrationBackoffUntil))
-        defaults?.set(SDKDefaults.sdkVersion, forKey: SharedSDKStorage.slot(StorageKeys.deviceRegistrationBackoffSDKVersion))
+        SharedSDKStorage.seedBackoff(until: now.addingTimeInterval(-1))
         let client = startWithRegisterReply(.status(201, body: Self.registered), now: now)
         defer { client.destroy() }
         await waitUntil { client.status().deviceId == "dev_ok" }
         try? await Task.sleep(for: .milliseconds(50))
-        XCTAssertNil(defaults?.string(forKey: SharedSDKStorage.slot(StorageKeys.deviceRegistrationBackoffUntil)))
-        XCTAssertNil(defaults?.string(forKey: SharedSDKStorage.slot(StorageKeys.deviceRegistrationBackoffSDKVersion)))
+        XCTAssertNil(defaults?.string(forKey: SharedSDKStorage.slot(StorageKeys.deviceRegistrationBackoff)))
     }
 }

@@ -39,6 +39,11 @@ final class FlagManager: @unchecked Sendable {
 
     private var changeContinuations: [UInt64: AsyncStream<Void>.Continuation] = [:]
     private var nextContinuationId: UInt64 = 0
+    /// Mirrors the effective values into the crash context (`setValuesObserver`). Guarded by
+    /// `valuesObserverLock`, which is held across snapshot AND delivery so two changes racing on
+    /// different threads cannot land their snapshots out of order.
+    private var valuesObserver: (@Sendable ([String: AnyCodable]) -> Void)?
+    private let valuesObserverLock = NSLock()
 
     private static let debugOverridesKey = "lp_debug_overrides"
 
@@ -231,6 +236,16 @@ final class FlagManager: @unchecked Sendable {
         return keys.sorted()
     }
 
+    /// Forget the exposures of `keys`, so their next read fires again. For flag exposures sent
+    /// while their experiment claims were marked (`ExperimentManager`). `stale` is kept: a value
+    /// that changed in the same config still fires as `value_changed`, not `first`.
+    func forgetExposures(_ keys: Set<String>) {
+        guard !keys.isEmpty else { return }
+        lock.lock()
+        defer { lock.unlock() }
+        for key in keys { exposed.removeValue(forKey: key) }
+    }
+
     /// Forget which values were exposed, so each next read fires again. Called when the identity changes.
     func clearExposed() {
         lock.lock()
@@ -313,6 +328,43 @@ final class FlagManager: @unchecked Sendable {
         for continuation in continuations {
             continuation.yield()
         }
+        refreshValuesObserver()
+    }
+
+    /// Re-deliver current crash state under the existing observer lock; no public change yield.
+    func refreshValuesObserver() {
+        valuesObserverLock.lock()
+        if let valuesObserver { valuesObserver(effectiveValues()) }
+        valuesObserverLock.unlock()
+    }
+
+    /// Called with `effectiveValues()` after every change that can move them — a config apply,
+    /// an override set or cleared, `clearEvaluated` — never under `lock`. Set by `SheepitClient`
+    /// to keep the crash context's active flags current; the observer must not call back in.
+    func setValuesObserver(_ observer: (@Sendable ([String: AnyCodable]) -> Void)?) {
+        valuesObserverLock.lock()
+        valuesObserver = observer
+        valuesObserverLock.unlock()
+    }
+
+    /// Whether an observer is set. Test-only: proves `destroy()` detaches it before the crash
+    /// context is unmapped.
+    var hasValuesObserverForTesting: Bool {
+        valuesObserverLock.lock()
+        defer { valuesObserverLock.unlock() }
+        return valuesObserver != nil
+    }
+
+    /// What `flag()` resolves each known key to right now: the remote value, or the debug
+    /// override when overrides are allowed. Never fires exposure.
+    func effectiveValues() -> [String: AnyCodable] {
+        lock.lock()
+        defer { lock.unlock() }
+        var values = flagValues
+        if overridesAllowed {
+            for (key, value) in debugOverrides { values[key] = AnyCodable(value.anyValue) }
+        }
+        return values
     }
 
     /// Emitted OUTSIDE the lock — `DiagnosticBus.emit` invokes subscribers

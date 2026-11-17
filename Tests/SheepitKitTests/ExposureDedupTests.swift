@@ -28,6 +28,18 @@ final class ExposureDedupTests: XCTestCase {
         XCTAssertTrue(read(manager, "a").isEmpty, "a refresh that returns the same value is not a new exposure")
     }
 
+    /// A flag exposure forgotten at a wait's end (A7b) whose value changed in the same config
+    /// still fires as `value_changed`, not as a second `first`.
+    func testAForgottenExposureWhoseValueChangedStillFiresAsValueChanged() {
+        let manager = FlagManager()
+        manager.setEvaluatedFlags(["a": AnyCodable("red")])
+        _ = read(manager, "a")
+
+        manager.setEvaluatedFlags(["a": AnyCodable("blue")])
+        manager.forgetExposures(["a"])
+        XCTAssertEqual(read(manager, "a").map(\.reason), [.valueChanged])
+    }
+
     func testAChangedValueExposesOnceMore() {
         let manager = FlagManager()
         manager.setEvaluatedFlags(["a": AnyCodable("red")])
@@ -84,7 +96,7 @@ final class ExposureDedupTests: XCTestCase {
 
     private func read(_ manager: ExperimentManager, _ key: String) -> [ArmExposure] {
         var fired: [ArmExposure] = []
-        _ = manager.resolve(experimentKey: key) { fired.append(($0, $1, $2)) }
+        _ = manager.resolve(experimentKey: key) { key, variant, reason, _ in fired.append((key, variant, reason)) }
         return fired
     }
 
@@ -117,13 +129,6 @@ final class ExposureDedupTests: XCTestCase {
         XCTAssertEqual(read(manager, "e").map(\.reason), [.first])
     }
 
-    func testAnIdentityChangeReArmsEveryArm() throws {
-        let manager = ExperimentManager(storage: InMemoryStorage())
-        manager.setAssignments(["e": try assignment("a")], appliedUnderUserId: nil)
-        _ = read(manager, "e")
-        manager.clearAssignments()
-        XCTAssertEqual(read(manager, "e").map(\.reason), [.first], "identify() keeps the arm but re-arms its exposure")
-    }
 
     func testTheLegacyStickyMapIsDroppedOnRequestAndNeverWritten() throws {
         let storage = InMemoryStorage()
@@ -205,6 +210,22 @@ final class ExposureDedupTests: XCTestCase {
         XCTAssertEqual(events.reasons(of: "$flag_exposure"), ["first", "value_changed"])
         let codes = sdk.diagnosticBus.getRecentDiagnostics().map(\.code)
         XCTAssertEqual(codes.filter { $0 == "flag.exposure_value_changed" }.count, 1)
+    }
+
+    /// Through `identify()`, not the manager call it makes: removing that call must fail this.
+    func testAnIdentityChangeReArmsEveryArm() throws {
+        let events = ExposureLog()
+        let sdk = makeClient(events: events)
+        defer { sdk.destroy() }
+
+        sdk.seedAssignmentsForTesting(["e": try assignment("a")], appliedUnderUserId: nil)
+        _ = sdk.experiment("e")
+        _ = sdk.experiment("e")
+        sdk.identify(userId: "user-rearm")
+        _ = sdk.experiment("e")
+
+        XCTAssertEqual(events.reasons(of: "$experiment_exposure"), ["first", "first"],
+                       "identify() keeps the arm but re-arms its exposure")
     }
 
     func testExperimentExposureCarriesItsReasonAndAMoveIsDiagnosed() throws {

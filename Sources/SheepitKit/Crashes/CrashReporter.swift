@@ -1,5 +1,8 @@
 import Foundation
 import SheepitCrashHandler
+#if canImport(UIKit)
+import UIKit
+#endif
 
 /// Orchestrates crash capture, persistence, and upload.
 ///
@@ -27,11 +30,21 @@ actor CrashReporter {
 
     /// Internal for a test pin; see `productionLiveDirectory()`.
     nonisolated let crashFilePath: String
+    /// The live crash supplement (`CrashSupplement`), beside `crashFilePath`.
+    nonisolated let supplementFilePath: String
+    /// The flags and experiments active right now, written into the crash context once the
+    /// handler has mapped it (anything applied before that had nowhere to land).
+    private let refreshActiveState: (@Sendable (CrashReporter) -> Bool)?
     private let pendingStore: PendingCrashStore
-    private let diagnostics: DiagnosticBus?
+    nonisolated let diagnostics: DiagnosticBus?
     private let now: @Sendable () -> Date
     private var isInstalled = false
     private var successfulLaunchTask: Task<Void, Never>?
+    private var memorySamplingTask: Task<Void, Never>?
+    private var memoryWarningObserver: NSObjectProtocol?
+    /// Every write into the mapped crash context runs inside it; `stop()` closes it before the
+    /// context is unmapped (`CrashReporter+Context.swift`).
+    nonisolated let contextWrites = CrashContextWriteGate()
     var onError: (@Sendable (Error, String) -> Void)?
 
     init(
@@ -45,6 +58,7 @@ actor CrashReporter {
         crashDirectory: URL? = nil,
         pendingDirectory: URL? = nil,
         diagnostics: DiagnosticBus? = nil,
+        refreshActiveState: (@Sendable (CrashReporter) -> Bool)? = nil,
         now: @escaping @Sendable () -> Date = { Date() }
     ) {
         self.http = http
@@ -55,8 +69,9 @@ actor CrashReporter {
         self.log = log
 
         let dir = crashDirectory ?? Self.productionLiveDirectory()
-        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         self.crashFilePath = dir.appendingPathComponent("current.crash").path
+        self.supplementFilePath = dir.appendingPathComponent("current.supplement").path
+        self.refreshActiveState = refreshActiveState
         self.pendingStore = PendingCrashStore(
             directory: pendingDirectory
                 ?? crashDirectory.map { $0.appendingPathComponent("pending", isDirectory: true) }
@@ -111,7 +126,8 @@ actor CrashReporter {
             }
 
             // Update crash context with current state
-            updateContext()
+            recordIdentityPublication(updateContext())
+            if isInstalled { startMemorySampling() }
 
             // After 10 seconds of runtime without crashing, mark a successful launch
             successfulLaunchTask = Task {
@@ -136,6 +152,7 @@ actor CrashReporter {
     /// Stop the crash reporter and uninstall handlers.
     func stop() {
         successfulLaunchTask?.cancel()
+        stopMemorySampling()
         // Before `uninstall()` unmaps the context: this waits out a transition mid-store, and
         // no later one can write to the unmapped page.
         appState.setOnChange(nil)
@@ -145,13 +162,26 @@ actor CrashReporter {
     // MARK: - Handler Installation
 
     private func install() {
-        guard !isInstalled else { return }
+        guard !isInstalled, contextWrites.canInstall else { return }
+        try? FileManager.default.createDirectory(
+            at: URL(fileURLWithPath: crashFilePath).deletingLastPathComponent(), withIntermediateDirectories: true)
 
         let result = sheepit_crash_handler_install(crashFilePath)
         if result == 0 {
+            guard contextWrites.activate() else {
+                sheepit_crash_handler_uninstall()
+                return
+            }
             sheepit_install_nsexception_handler()
             isInstalled = true
             log.debug("[Crashes] Signal and exception handlers installed")
+            // A failure here only degrades capture to the frozen report.
+            if sheepit_crash_supplement_install(supplementFilePath, SDKDefaults.sdkVersion) != 0 {
+                log.warn("[Crashes] Could not map the crash supplement file; reports will carry less detail")
+                diagnostics?.emit(.warn, .transport, code: "transport.crash_identity",
+                    message: "Crash identity supplement is unavailable.",
+                    data: ["outcome": AnyCodable("sidecar_unavailable")])
+            }
         } else {
             log.error("[Crashes] Failed to install crash handler (mmap failed)")
         }
@@ -184,7 +214,10 @@ actor CrashReporter {
 
         let live = URL(fileURLWithPath: crashFilePath)
         let (entry, evicted) = pendingStore.adopt(
-            liveFile: live, now: current, maxReports: SDKDefaults.crashPendingMaxReports
+            liveFile: live,
+            liveSupplement: URL(fileURLWithPath: supplementFilePath),
+            now: current,
+            maxReports: SDKDefaults.crashPendingMaxReports
         )
         for old in evicted {
             log.warn("[Crashes] Retry queue full — dropping oldest crash report \(old.id)")
@@ -278,13 +311,25 @@ actor CrashReporter {
         // failure is not a server error.
         let attempted = pendingStore.recordAttempt(entry)
 
-        guard var payload = CrashReportReader.read(from: attempted.url.path) else {
+        guard var payload = CrashReportReader.read(
+            from: attempted.url.path,
+            supplementPath: pendingStore.supplementURL(for: attempted).path,
+            breadcrumbLimit: config.breadcrumbCapacity
+        ) else {
             log.error("[Crashes] Failed to parse pending crash report")
             pendingStore.remove(attempted)
             emitOutcome(.droppedUnreadable, reportId: entry.id, attempts: attempted.attempts, error: nil)
             return
         }
+        diagnostics?.emit(
+            payload.captureIdentityOutcome == "unavailable" ? .warn : .debug,
+            .transport,
+            code: "transport.crash_identity",
+            message: "Read the saved crash identity cohort.",
+            data: ["outcome": AnyCodable(payload.captureIdentityOutcome ?? "legacy")]
+        )
         payload.reportId = entry.id
+        payload = payload.fittingBudget()
 
         do {
             // ONE in-process attempt: the queue retries across launches. HTTPClient's own
@@ -383,6 +428,41 @@ actor CrashReporter {
         )
     }
 
+    // MARK: - Memory
+
+    /// Keep `free_memory_mb` current: now, every `SDKDefaults.crashMemorySampleInterval`, and on
+    /// every memory warning — the moment a crash is most likely. Only where
+    /// `os_proc_available_memory()` exists (not macOS); elsewhere the field stays empty.
+    private func startMemorySampling() {
+        guard Self.availableMemoryMB() != nil else { return }
+        refreshFreeMemory()
+        memorySamplingTask = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: UInt64(SDKDefaults.crashMemorySampleInterval * 1_000_000_000))
+                guard !Task.isCancelled else { return }
+                self?.refreshFreeMemory()
+            }
+        }
+        #if canImport(UIKit) && !os(watchOS)
+        memoryWarningObserver = NotificationCenter.default.addObserver(
+            forName: UIApplication.didReceiveMemoryWarningNotification, object: nil, queue: nil
+        ) { [weak self] _ in
+            self?.refreshFreeMemory()
+        }
+        #endif
+    }
+
+    /// Before `uninstall()` unmaps the context, so no sample lands on an unmapped page.
+    private func stopMemorySampling() {
+        contextWrites.close()
+        memorySamplingTask?.cancel()
+        memorySamplingTask = nil
+        if let observer = memoryWarningObserver {
+            NotificationCenter.default.removeObserver(observer)
+            memoryWarningObserver = nil
+        }
+    }
+
     // MARK: - Context Updates
 
     /// Update the mmap'd crash context with current SDK state.
@@ -392,116 +472,23 @@ actor CrashReporter {
     /// filled in — `CrashReportReader` already read them back, so a crash always shipped
     /// `app_version: ""` and `build_number`/`os_version`/`device_model: nil`, with no signal
     /// anywhere that the fields were silently empty.
-    nonisolated func updateContext() {
-        guard let ctx = sheepit_get_crash_context() else { return }
-
-        writeString(context.userId ?? "", to: &ctx.pointee.user_id)
-        writeString(context.deviceId, to: &ctx.pointee.device_id)
-        // "" when no session is live (0.6-C); `CrashReportReader` reads "" back as nil.
-        writeString(context.sessionId ?? "", to: &ctx.pointee.session_id)
-        // The same version and build events and perf send, so a crash lands on the build its
-        // sessions did. Before 2026-10-21 this ignored `SheepitConfig.appVersion`.
-        writeString(DeviceProfile.wireAppVersion(override: appVersionOverride) ?? "", to: &ctx.pointee.app_version)
-        writeString(DeviceProfile.wireBuildNumber() ?? "", to: &ctx.pointee.build_number)
-        writeString(DeviceProfile.osVersion(), to: &ctx.pointee.os_version)
-        writeString(DeviceProfile.deviceModel(), to: &ctx.pointee.device_model)
+    @discardableResult
+    nonisolated func updateContext() -> Bool {
+        let published = refreshActiveState?(self) ?? publishIdentity(context.eventContext())
+        contextWrites.perform {
+            guard let ctx = sheepit_get_crash_context() else { return }
+            // The same version and build events and perf send, so a crash lands on the build its
+            // sessions did. Before 2026-10-21 this ignored `SheepitConfig.appVersion`.
+            writeString(DeviceProfile.wireAppVersion(override: appVersionOverride) ?? "", to: &ctx.pointee.app_version)
+            writeString(DeviceProfile.wireBuildNumber() ?? "", to: &ctx.pointee.build_number)
+            writeString(DeviceProfile.osVersion(), to: &ctx.pointee.os_version)
+            writeString(DeviceProfile.deviceModel(), to: &ctx.pointee.device_model)
+            ctx.pointee.magic = UInt32(SHEEPIT_CRASH_CONTEXT_MAGIC)
+        }
         // Under the state's lock, so a transition cannot land between the read and the store.
         // Before 2026-10-27 nothing wrote it, and every crash shipped `is_foreground: false`.
-        appState.withCurrentValue { ctx.pointee.is_foreground = $0 }
-
-        ctx.pointee.magic = UInt32(SHEEPIT_CRASH_CONTEXT_MAGIC)
-    }
-
-    /// Update the screen name in the crash context.
-    nonisolated func setScreen(_ name: String) {
-        guard let ctx = sheepit_get_crash_context() else { return }
-        writeString(name, to: &ctx.pointee.screen_name)
-    }
-
-    /// Update the foreground state in the crash context. A plain one-byte store into the mapped
-    /// struct, which the signal handler never writes and the next launch reads back. Called by
-    /// `AppForegroundState` on every transition, under its lock.
-    nonisolated func setForeground(_ isForeground: Bool) {
-        guard let ctx = sheepit_get_crash_context() else { return }
-        ctx.pointee.is_foreground = isForeground
-    }
-
-    /// Update feature flag state in the crash context.
-    nonisolated func setFlagState(_ flags: [String: Any]) {
-        guard let ctx = sheepit_get_crash_context() else { return }
-        let json = (try? JSONSerialization.data(withJSONObject: flags))
-            .flatMap { String(data: $0, encoding: .utf8) } ?? "{}"
-        writeString(json, to: &ctx.pointee.active_flags_json)
-    }
-
-    /// Update experiment state in the crash context.
-    nonisolated func setExperimentState(_ experiments: [String: Any]) {
-        guard let ctx = sheepit_get_crash_context() else { return }
-        let json = (try? JSONSerialization.data(withJSONObject: experiments))
-            .flatMap { String(data: $0, encoding: .utf8) } ?? "{}"
-        writeString(json, to: &ctx.pointee.active_experiments_json)
-    }
-
-    /// Add a breadcrumb. Thread-safe (the C layer uses atomic writes).
-    nonisolated func addBreadcrumb(category: String, message: String) {
-        sheepit_add_breadcrumb(category, message)
-    }
-
-    // MARK: - Helpers
-
-    /// Write a Swift string into a C fixed-size char array, cut on a whole character: a
-    /// byte-wise cut could split a multi-byte character and read back as U+FFFD.
-    private nonisolated func writeString<T>(_ string: String, to dest: inout T) {
-        withUnsafeMutablePointer(to: &dest) { ptr in
-            let size = MemoryLayout<T>.size
-            ptr.withMemoryRebound(to: CChar.self, capacity: size) { cstr in
-                DeviceProfile.boundedUTF8(string, size - 1).withCString { src in
-                    let len = min(strlen(src), size - 1)
-                    memcpy(cstr, src, len)
-                    cstr[len] = 0
-                }
-            }
-        }
-    }
-}
-
-/// The `outcome` of a `transport.crash_upload` diagnostic — one value per branch a queued
-/// crash report can take.
-enum CrashUploadOutcome: String, CaseIterable {
-    case uploaded
-    /// The upload failed for a retryable reason; the report stays queued for the next launch.
-    case retainedForRetry = "retained_for_retry"
-    /// The server rejected the report in a way a retry cannot change (400/413/422).
-    case droppedNonRetryable = "dropped_non_retryable"
-    /// Out of counted attempts or older than `SDKDefaults.crashUploadMaxAge`.
-    case droppedRetryExhausted = "dropped_retry_exhausted"
-    /// Evicted, oldest first, to keep the queue at `SDKDefaults.crashPendingMaxReports`.
-    case droppedQueueFull = "dropped_queue_full"
-    /// The queued file is not a readable crash report.
-    case droppedUnreadable = "dropped_unreadable"
-    /// The previous session's report could not be moved out of the live file before the
-    /// handler reused it.
-    case droppedUnretainable = "dropped_unretainable"
-
-    var severity: DiagnosticSeverity {
-        switch self {
-        case .uploaded: return .info
-        case .retainedForRetry: return .warn
-        case .droppedNonRetryable, .droppedRetryExhausted, .droppedQueueFull, .droppedUnreadable,
-             .droppedUnretainable:
-            return .error
-        }
-    }
-
-    var message: String {
-        switch self {
-        case .uploaded: return "Crash report uploaded"
-        case .retainedForRetry: return "Crash report upload failed; kept for the next launch"
-        case .droppedNonRetryable: return "Crash report rejected by the server; dropped"
-        case .droppedRetryExhausted: return "Crash report dropped after exhausting its retries"
-        case .droppedQueueFull: return "Crash retry queue full; oldest report dropped"
-        case .droppedUnreadable: return "Queued crash report is unreadable; dropped"
-        case .droppedUnretainable: return "Crash report could not be kept for upload; dropped"
-        }
+        // Outside the gate above: the lock order is the state's lock, then the gate.
+        appState.withCurrentValue { setForeground($0) }
+        return published
     }
 }

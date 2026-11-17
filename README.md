@@ -17,23 +17,52 @@ Web and backend get flags and experiments from the Sheepit SDKs, and native apps
 
 ## Install
 
-Sheepit is developed in the Sheepit monorepo (`packages/sdk-swift`) and published to the public mirror repository [`goatech-ai/sheepit-swift`](https://github.com/goatech-ai/sheepit-swift), which is what Swift Package Manager resolves against. Every release tag on the mirror is a bare semver version (`0.9.0`), mirrored from the monorepo by CI.
+Sheepit is developed in the Sheepit monorepo (`packages/sdk-swift`) and published to the public mirror repository [`goatech-ai/sheepit-swift`](https://github.com/goatech-ai/sheepit-swift), which is what Swift Package Manager resolves against. Every release tag on the mirror is a bare semver version (`0.11.0`), mirrored from the monorepo by CI.
 
 ### Xcode
 
-**File → Add Package Dependencies…** → enter `https://github.com/goatech-ai/sheepit-swift.git` → choose **Exact Version** and enter `0.9.0`.
+**File → Add Package Dependencies…** → enter `https://github.com/goatech-ai/sheepit-swift.git` → choose **Exact Version** and enter `0.11.0`.
 
-> 🔴 **Choose "Exact Version" `0.9.0`. Do not accept Xcode's default "Up to Next Major", and do not use `from:`.**
-> The mirror also carries tags `1.0.0` and `1.0.1`. They are **older** code than `0.9.0` and
+> 🔴 **Choose "Exact Version" `0.11.0`. Do not accept Xcode's default "Up to Next Major", and do not use `from:`.**
+> The mirror also carries tags `1.0.0` and `1.0.1`. They are **older** code than `0.11.0` and
 > export a different product name (`SheepitSDK`, not `SheepitKit`). Semver ranks them higher,
 > so Xcode pre-fills its default rule from `1.0.1` and resolves the wrong release. Pin
-> `exact: "0.9.0"` and upgrade deliberately. See the CHANGELOG's "Version policy".
+> `exact: "0.11.0"` and upgrade deliberately. See the CHANGELOG's "Version policy".
+
+> 🔴 **Set `apiUrl` (or `SheepitAPIURL`) and the publishable key once, and never edit them.**
+> Device ids are stored per `[apiUrl, environment, apiKey]`, hashed over the raw strings
+> (`StorageScope`). Any edit (a trailing slash, `http` to `https`, a new hostname, a key rotation)
+> moves the whole installed fleet to new device ids at once, so device counts double. Daily active
+> users survive, because the anonymous id is not scoped. If a rotation is unavoidable, do it in a
+> planned release, expect the one-time device-count step, and annotate it on your dashboards.
+
+> 🔴 **`SheepitAPIURL` in Info.plist is required for self-hosted installs.** Without it every event
+> goes to the hosted API (`api.sheepit.ai`). The client logs a `.fault` line in the unified log
+> (subsystem `ai.goatech.sdk`) at `create(config:)` (also when `SheepitConfig(apiKey:)` is created without `apiUrl`), and `config.isUsingDefaultHost` is `true`.
+> (An app that names the hosted API itself, in code or in the plist, chose it and gets no fault;
+> `isUsingDefaultHost` is still `true` for it.)
+
+### Pre-submission smoke test
+
+A bad key or URL is otherwise silent: the client goes inert and sends nothing. Before every App Store
+submission, run this with the release configuration (production key and URL). Creating a client
+registers a device and queues `$app_install` and `$session_start` in that project, so run it from a
+throwaway simulator or device, not from every CI run:
+
+```swift
+let config = SheepitConfig(bundle: .main)           // or SheepitConfig(apiKey: …, apiUrl: …)
+let client = SheepitClient.create(config: config)
+let status = client.status()
+XCTAssertTrue(status.initialized)
+XCTAssertNil(status.rejectionReason)
+XCTAssertFalse(config.isUsingDefaultHost)           // self-hosted installs only
+```
 
 ### Package.swift
 
 ```swift
 dependencies: [
-  .package(url: "https://github.com/goatech-ai/sheepit-swift.git", exact: "0.9.0"),
+  .package(url: "https://github.com/goatech-ai/sheepit-swift.git", exact: "0.11.0"),
 ]
 ```
 
@@ -111,7 +140,8 @@ func example(sheepit: SheepitClient) async {
     if outcome != .ready { /* flags still answer anonymously (or with defaults) */ }
 
     // from 0.9.0: on a fresh install, wait for the first config before reading a flag
-    await sheepit.awaitConfig(timeout: .seconds(1))
+    // (from 0.10.0 that is the one fetched after the device registers: allow ~3 s)
+    await sheepit.awaitConfig(timeout: .seconds(3))
 
     // evaluate a flag (synchronous; returns the default until config has loaded)
     let showBeta = sheepit.flag("show_beta_ui", default: .bool(false))
@@ -137,8 +167,8 @@ func example(sheepit: SheepitClient) async {
 SheepitKit evaluates nothing locally. It fetches `GET /v1/config`, which returns values the API has already evaluated for this device, and caches them. `flag(_:default:)` and `experiment(_:)` read that cache synchronously.
 
 - Configuration is polled every `configRefreshInterval`, **300 seconds by default**. A flag change or kill switch can therefore take up to about five minutes to reach a running app; lower `configRefreshInterval` if you need faster propagation.
-- The last config fetched is kept on the device, so a launch that cannot reach the server (airplane mode, no signal) keeps the flags and experiment arms the device last had. A cache up to `configOfflineMaxAge` old (**7 days** by default, counted from when the server last sent or confirmed it, and checked at launch) is applied; past `configStaleAfter` (**24 hours**) it is reported stale. An older cache is deleted at launch and flags read their defaults until a fetch lands. A failed fetch never deletes the cache, a successful one replaces it, and `reset()` deletes it. `status().configFreshness` reports where the applied config came from (`.server` or `.cache`), when it was fetched, its `age` and `isStale`, so you can show "cached, 30 h old". Set `configOfflineMaxAge: 86_400` for the behaviour of 0.8.0 and earlier, which deleted a cache older than 24 hours.
-- The first `flag` read per flag and the first `experiment` read per experiment emit `$flag_exposure` / `$experiment_exposure`, each with `config_source` (`server` or `cache`) and `config_age_ms`, so an analysis can separate evaluations made from an old cache. `inspect(_:default:)` never emits exposure.
+- The last config fetched is kept on the device, so a launch that cannot reach the server (airplane mode, no signal, off a VPN) keeps the flags and experiment arms the device last had, **whatever their age**, and they are in memory before `create(config:)` / `initialize(config:)` return: a flag read on the next line answers with the cached value. Past `configStaleAfter` (**24 hours**, counted from when the server last sent or confirmed the config) it is reported stale, and still applied (`.infinity` turns that off). A failed fetch never deletes the cache; a successful one replaces it; `reset()` deletes it; `identify()` to a different user deletes the copy on disk (memory keeps answering until that user's config lands). `status().configFreshness` reports where the applied config came from (`.server` or `.cache`), when it was fetched, its `age` and `isStale`, so you can show "cached, 30 h old". To bound how long a device that stops fetching serves old targeting, set a finite `configOfflineMaxAge`: checked at launch, an older cache is deleted and flags read their defaults until a fetch lands. `604_800` (7 days) is the behaviour of 0.9.0 to 0.10.1; `86_400` that of 0.8.0 and earlier. The default reads `.infinity`, so check `isFinite` before converting it with `Int(...)`, which traps on it. The diagnostics `config.launch_cache_applied` (with `config_age_ms`) and `config.launch_cache_dropped` (with `reason`) report each launch.
+- The first `flag` read per flag and the first `experiment` read per experiment emit `$flag_exposure` / `$experiment_exposure`, each with `config_source` (`server` or `cache`) and `config_age_ms` (absent when the cache's stamp is later than the device clock), so an analysis can separate evaluations made from an old cache. `inspect(_:default:)` never emits exposure.
 - Every payload reports the device the app runs on as `platform`: `ios` (iPhone), `ipados` (iPad, and Vision Pro), `macos` (a Mac app, a Catalyst app, or an iPhone/iPad app running on an Apple-silicon Mac), `tvos` or `watchos`. A flag targeted at `ios` also reaches `ipados` devices; `macos`, `tvos` and `watchos` receive only flags targeted at them or at every platform.
 
 ## Configuration
@@ -154,7 +184,7 @@ SheepitKit evaluates nothing locally. It fetches `GET /v1/config`, which returns
 | `flushSize`              | `Int`                                           | `20`                                  |
 | `configRefreshInterval`  | `TimeInterval` (s)                              | `300`                                 |
 | `configStaleAfter`       | `TimeInterval` (s)                              | `86_400` (24 hours)                   |
-| `configOfflineMaxAge`    | `TimeInterval` (s)                              | `604_800` (7 days)                    |
+| `configOfflineMaxAge`    | `TimeInterval` (s)                              | `.infinity` (no limit)                |
 | `maxQueueSize`           | `Int`                                           | `1000`                                |
 | `retryAttempts`          | `Int`                                           | `3`                                   |
 | `debug`                  | `Bool`                                          | `false`                               |
@@ -244,38 +274,42 @@ TestFlight and the App Store ship the same binary, so the URL compiled into the 
 
 ## API reference
 
-| Symbol                                                              | Purpose                                                                              |
-| ------------------------------------------------------------------- | ------------------------------------------------------------------------------------ |
-| `SheepitClient.create(config:)`                                     | Create an instance (preferred for SwiftUI)                                           |
-| `SheepitClient.initialize(config:)` / `SheepitClient.shared`        | Singleton create and accessor                                                        |
-| `track(_:properties:)`                                              | Send an event                                                                        |
-| `flag(_:default:)`                                                  | Evaluate a flag; returns a `FlagValue`                                               |
-| `experiment(_:)`                                                    | Get a `SheepitExperimentResult` (with `.variant`)                                    |
-| `identify(userId:)` / `reset()`                                     | Set or clear user identity (no traits — see below)                                   |
-| `identify(userId:timeout:) async`                                   | Identify, then wait until flags answer for the user (0.9.0)                          |
-| `awaitConfig(timeout:) async`                                       | Wait until a config is applied, e.g. on a fresh install (0.9.0)                      |
-| `flush() async` / `destroy()`                                       | Send queued events / tear down                                                       |
-| `screen(_:properties:)`                                             | Track a `$screen` event and set the crash context's screen                           |
-| `captureError(_:error:attributes:)`                                 | Report a handled (non-fatal) error as a `$error` event                               |
-| `recordRequest(method:url:status:durationMs:responseBytes:error:)`  | Report a failed first-party HTTP request as a `$http_error` event                    |
-| `addBreadcrumb(category:message:)` / `setScreen(_:)`                | Context attached to crash reports                                                    |
-| `submitFeedback(message:type:email:attributes:screenshots:) async`  | Send in-app feedback with up to 3 screenshots (see below)                            |
-| `startSpan(_:attributes:)` / `endSpan(_:)` / `markFirstFrame()`     | Performance spans (when `performance.enabled`)                                       |
-| `FlagValue`                                                         | Enum: `.bool`, `.string`, `.int`, `.double`, `.json`                                 |
-| `overrideFlag(_:value:)` / `clearOverride(_:)` / `clearOverrides()` | Set/clear debug flag overrides                                                       |
-| `getOverrides()`                                                    | Read the debug flag overrides currently set                                          |
-| `inspect(_:default:)`                                               | Non-exposing diagnostic read — `SheepitFlagInspection` (dev menu)                    |
-| `knownFlagKeys()`                                                   | Sorted union of remote-valued + overridden flag keys                                 |
-| `flagChanges()`                                                     | `AsyncStream<Void>` — fires on config apply / override set / clear                   |
-| `status()`                                                          | Queues, `lastFlushAt`, device / user id, `identity` (server side), `configFreshness` |
-| `diagnostics()` / `getRecentDiagnostics()`                          | Live and buffered internal SDK events                                                |
-| `SheepitConfig`                                                     | Configuration, including optional `crashes` and `performance`                        |
+| Symbol                                                              | Purpose                                                                                                                               |
+| ------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------- |
+| `SheepitClient.create(config:)`                                     | Create an instance (preferred for SwiftUI)                                                                                            |
+| `SheepitClient.initialize(config:)` / `SheepitClient.shared`        | Singleton create and accessor                                                                                                         |
+| `track(_:properties:)`                                              | Send an event                                                                                                                         |
+| `flag(_:default:)`                                                  | Evaluate a flag; returns a `FlagValue`                                                                                                |
+| `experiment(_:)`                                                    | Get a `SheepitExperimentResult` (with `.variant`)                                                                                     |
+| `identify(userId:)` / `reset()`                                     | Set or clear user identity (no traits — see below)                                                                                    |
+| `identify(userId:timeout:) async`                                   | Identify, then wait until flags answer for the user (0.9.0)                                                                           |
+| `awaitConfig(timeout:) async`                                       | Wait until a real config is applied: the launch cache, or a server body resolved for this device or with no resolution header (0.9.0) |
+| `flush() async` / `destroy()`                                       | Send queued events / tear down                                                                                                        |
+| `screen(_:properties:)`                                             | Track a `$screen` event and set the crash context's screen                                                                            |
+| `captureError(_:error:attributes:)`                                 | Report a handled (non-fatal) error as a `$error` event                                                                                |
+| `recordRequest(method:url:status:durationMs:responseBytes:error:)`  | Report a failed first-party HTTP request as a `$http_error` event                                                                     |
+| `addBreadcrumb(category:message:)` / `setScreen(_:)`                | Context attached to crash reports                                                                                                     |
+| `submitFeedback(message:type:email:attributes:screenshots:) async`  | Send in-app feedback with up to 3 screenshots (see below)                                                                             |
+| `startSpan(_:attributes:)` / `endSpan(_:)` / `markFirstFrame()`     | Performance spans (when `performance.enabled`)                                                                                        |
+| `FlagValue`                                                         | Enum: `.bool`, `.string`, `.int`, `.double`, `.json`                                                                                  |
+| `overrideFlag(_:value:)` / `clearOverride(_:)` / `clearOverrides()` | Set/clear debug flag overrides                                                                                                        |
+| `getOverrides()`                                                    | Read the debug flag overrides currently set                                                                                           |
+| `inspect(_:default:)`                                               | Non-exposing diagnostic read — `SheepitFlagInspection` (dev menu)                                                                     |
+| `knownFlagKeys()`                                                   | Sorted union of remote-valued + overridden flag keys                                                                                  |
+| `flagChanges()`                                                     | `AsyncStream<Void>` — fires on config apply / override set / clear                                                                    |
+| `status()`                                                          | Queues, `lastFlushAt`, device / user id, `identity` (server side), `configFreshness`                                                  |
+| `diagnostics()` / `getRecentDiagnostics()`                          | Live and buffered internal SDK events                                                                                                 |
+| `SheepitConfig`                                                     | Configuration, including optional `crashes` and `performance`                                                                         |
 
 **`identify()` takes no traits.** 🔴 The `traits` parameter was **removed in 0.7.0** — `identify(userId:traits:)` no longer exists, so a call site passing them is a compile error. It is a deliberate break rather than a silent no-op: the values used to be merged into a server-side column that survived both `reset()` and a GDPR erase, and they could never be targeted on again. Send what you need as event properties for dashboards and experiment/release metrics instead: `track("plan_selected", properties: ["plan": "pro"])` — event properties are not evaluable by flag/experiment rules, so this does not restore targeting. To keep targeting the value, add the user to a group (`POST /v1/groups/:id/members`, target `user_group`) or call `POST /v1/devices/:deviceId/identify` directly with `attributes` (same retention trade-off: survives `reset()`, not cleared by GDPR end-user erase). The web SDK has always behaved this way. ⚠️ **Upgrading from 0.6.0? This is about new traits only** — whatever 0.6.0 already uploaded stays on the device row and keeps matching targeting rules. See the [CHANGELOG](CHANGELOG.md).
 
 **Crash capture is ON by default**; performance monitoring is OFF by default. Both are configured through `SheepitConfig` (`crashes:` / `performance:`).
 
 A crash is uploaded on the next launch. If that upload fails for a reason a retry can fix, the report is kept and retried on each later launch. Only a 5xx counts as an attempt, and 5 counted attempts drop it; offline, timeouts, the daily cap's 402, a 429 and a 401/403/404 from a key, proxy or firewall do not count and are bounded by age alone (7 days), so a crash waits out a misconfigured proxy. Each launch makes one HTTP attempt per report. A 400, 413 or 422 drops it at once. At most 5 reports wait at a time. When XCTest is loaded in the process — your unit tests, including ones hosted in your app — the retry queue lives in a temporary directory unique to that run, so a test run never uploads or clears a real queue. The live crash file is not moved, so an app-hosted test run adopts a crash left over from before it into that temporary queue, and the report is lost if the run cannot upload it. To see a crash reported, reproduce it outside a test run. Every decision emits a `transport.crash_upload` diagnostic whose `data["outcome"]` is `uploaded`, `retained_for_retry`, `dropped_non_retryable`, `dropped_retry_exhausted`, `dropped_queue_full`, `dropped_unreadable` or `dropped_unretainable`.
+
+A crash report carries, besides the stack: the flag values your app was running with (remote values with any allowed debug override), the variant of each experiment the device was in, and the crash's own message text — for a Swift runtime failure, the runtime's `Fatal error: …` line (which interpolates whatever your `fatalError`, `precondition` or `assert` message contains), and for `abort()`, the reason libsystem recorded. That text is read only from your app's executable and from Apple's own copies (in the system's shared cache) of the Swift runtime, Swift concurrency, `libsystem`, `libc++abi`, `libobjc` and `libdispatch` — never from another library, including a bundled library with one of those names. Treat what you put in those messages and flag values as crash content: it is uploaded with the report. Breadcrumbs (`CrashConfig.breadcrumbCapacity`, at most 32), available memory and the screen name ride along as well.
+
+**Upload your dSYMs so crashes are readable.** Without them a crash report shows addresses instead of function names, file and line. Upload the dSYMs of every build you ship with `sheepit symbols upload`: from CI, an Xcode Run Script phase, fastlane or Xcode Cloud, as the CLI README describes ([Upload dSYMs so crashes symbolicate](https://www.npmjs.com/package/@sheepit-ai/cli#upload-dsyms-so-crashes-symbolicate)). On a self-hosted install, Docker Compose stores symbol files from 0.7.0 on; on ECS, the operator sets the symbol storage bucket first.
 
 Because crash capture is on by default, the package ships a privacy manifest (`Sources/SheepitKit/PrivacyInfo.xcprivacy`) declaring the data it collects and the required-reason APIs it calls. Xcode aggregates it into your app's privacy report automatically — you do not need to copy anything into your target.
 
@@ -389,6 +423,7 @@ On UIKit platforms the SDK observes `UIApplication.didEnterBackgroundNotificatio
 The SDK maintains a session automatically. You do not need to call `track()` at launch to be counted — **an app that launches and does nothing still registers a session.**
 
 - A session ends after **30 minutes of inactivity**, where activity means an event. This matches the JS SDK.
+- **`$session_end`** (0.10.2) is emitted once per finished session, with `duration_ms`: the time from the session's start to its last activity (its last event, or the moment the app left the foreground). It carries the ended session's own `session_id` and is timestamped at that last activity. It is queued when the idle window is found to have elapsed: on the next event or foreground, or at the next launch if the process died first. It is _not_ sent when the app merely goes to the background, because coming back within 30 minutes continues the same session (as Amplitude and Mixpanel do); nothing waits on a background task, and an app that is never opened again reports its last session at its next launch. The event is stamped with the app version and build the session began under, not the running build. A session with no event reports the time to its last backgrounding; on macOS and watchOS (no background signal) it reports the time to its last event. `reset()` ends the outgoing session the same way; the session `reset()` opens has no `$session_start` and so no `$session_end`. An end older than the ingest retention window is rejected by the server.
 - `$session_start` is emitted automatically when a launch opens a new session, and again when the app returns to the foreground after the idle window elapsed while it was suspended. It carries one property, `is_first_session` — `true` only for the device's very first session ever, so the install cohort is queryable without joining back to `$app_install`. Everything else (session id, device context) already rides on every event.
 - The session id is persisted, so relaunching within the window continues the same session rather than starting a new one.
 - `reset()` rotates the session id (as on web) but does **not** emit `$session_start` — a logout is not a new session.
@@ -397,7 +432,17 @@ The SDK maintains a session automatically. You do not need to call `track()` at 
 
 Nothing to configure, and nothing to call.
 
+The cached `/v1/config` body is capped at 512 KiB, on write and at launch. A larger body is applied for the running process but not cached (a `config.cache_too_large` diagnostic), and a larger one already on disk is deleted at launch, so an offline launch then reads the compiled-in defaults.
+
 ### Screens
+
+In SwiftUI, add the modifier. It tracks `$screen` once per appearance (a repeated `onAppear` from a re-render does not count twice; leaving and returning does) and uses `SheepitClient.shared`, or the `client:` you pass:
+
+```swift
+CheckoutView().sheepitScreen("Checkout", properties: ["cart_items": 3])
+```
+
+There is no automatic UIKit `UIViewController` tracking: swizzling `viewDidAppear` is not shipped, so UIKit apps call `screen(_:properties:)` from `viewDidAppear`. The rest of this section applies to both.
 
 Call `screen(_:properties:)` when the user arrives on a screen. It tracks a `$screen` event with a `screen` property and sets the screen that a crash report carries — one call for both:
 
@@ -412,7 +457,7 @@ struct CheckoutView: View {
 }
 ```
 
-- **Nothing is automatic.** The SDK does not swizzle UIKit or observe SwiftUI navigation; you decide what a "screen" is and when it counts.
+- **Nothing is automatic.** The SDK does not swizzle UIKit or observe SwiftUI navigation (the modifier is explicit); you decide what a "screen" is and when it counts.
 - The name is trimmed, stripped of U+0000 and capped at 255 UTF-8 bytes (the crash context's buffer), cut on a character boundary. A name that ends up empty is dropped with a `transport.invalid_screen_name` diagnostic.
 - `screen` is always the name you passed: a `screen` key in `properties` is overwritten.
 - `setScreen(_:)` still exists and sets only the crash context, with no event.
@@ -523,7 +568,7 @@ It sends a `$http_error` event — the same event the web SDK's `autoCaptureHttp
 
 **Privacy.** The SDK never sends the query string, the fragment, userinfo (`user:password@`), headers or bodies. **It sends the path verbatim** — if your paths carry tokens, emails or other personal data (`/reset/<token>`, `/users/jane@example.com`), do not record those requests, or call `recordRequest` with a URL you have already rewritten (`/reset/:token`). Path parameters after `;` (e.g. `;jsessionid=…`) are part of the path and are sent verbatim too. **`error_message` is the error's own description** — if your error type puts a URL, token or user data in its message, that is sent; redact it in your error type, or pass a sanitized error. Unlike the web SDK, there is no `request_id`, `response_headers` or `cookie_names`: those come from headers.
 
-**Allowlist.** Each entry in `requestTelemetryHosts` is a bare host name, matched exactly and case-insensitively: `api.example.com` does not cover `v2.api.example.com`. `*.example.com` covers every subdomain of `example.com`, but not `example.com` itself — list that separately. A wildcard over a single label (`*.com`, and also `*.localhost` or `*.test` for local development) is refused — list the exact host instead (`api.localhost`); there is no public-suffix list, so a broad entry such as `*.co.uk` is still accepted — don't write one. An entry with a scheme, port or path (`https://api.example.com`, `api.example.com:8443`) matches nothing, nor does one that is only valid before percent-decoding (`exa%2Fmple.com`), has a leading dot or an empty label (`.example.com`, `example..com`), or carries a control character; all unusable entries are reported together, once, as a `request_telemetry.invalid_host` diagnostic. The list is read when the client is created.
+**Allowlist.** Each entry in `requestTelemetryHosts` is a bare host name, matched exactly and case-insensitively: `api.example.com` does not cover `v2.api.example.com`. `*.example.com` covers every subdomain of `example.com`, but not `example.com` itself — list that separately. A wildcard over a single label (`*.com`, and also `*.localhost` or `*.test` for local development) is refused — list the exact host instead (`api.localhost`); there is no public-suffix list, so a broad entry such as `*.co.uk` is still accepted — don't write one. An entry with a scheme, port or path (`https://api.example.com`, `api.example.com:8443`) matches nothing, nor does one that is only valid before percent-decoding (`exa%2Fmple.com`), has a leading dot or an empty label (`.example.com`, `example..com`), carries a control character, or still carries a `%` after percent-decoding (`exa%2541mple.com`); all unusable entries are reported together, once, as a `request_telemetry.invalid_host` diagnostic. The list is read when the client is created.
 
 International domain names: hosts are compared as Foundation's `URLComponents` returns them, and the SDK passes each entry through the same API, so the two are canonicalized alike on the same OS. Measured on macOS 27, an `xn--` (punycode) host is decoded — `https://xn--bcher-kva.example/` is recorded with `host` `bücher.example` — and an entry written in either form (`xn--bcher-kva.example` or `bücher.example`) matches it. The `xn--` form of an entry is the safer choice; other OS releases were not measured.
 
@@ -650,7 +695,7 @@ Nothing to configure, and nothing to call.
 
 ## FAQ
 
-**Which key type should I use?** A publishable key (`lp_pub_*`) — it is the only type this SDK accepts. Secret keys (`lp_sec_*`) grant full project write access and must never ship in an app binary, where anyone can extract them from the IPA; developer keys (`lp_dev_*`) are read-only for schemas and definitions and cannot post events. Both are refused.
+**Which key type should I use?** A publishable key (`lp_pub_*`, or `si_pub_*` once the server mints that prefix) — it is the only type this SDK accepts. From 0.10.0 the key must have the exact minted shape: `{vendor}_pub_{3 lowercase letters or digits}_{64 lowercase hex}`, where the vendor prefix is checked for shape only, so a renamed prefix keeps working. Secret keys (`lp_sec_*`) grant full project write access and must never ship in an app binary, where anyone can extract them from the IPA; developer keys (`lp_dev_*`) are read-only for schemas and definitions and cannot post events. Both are refused.
 
 **Nothing is happening — no events, and every flag returns my default.** Most often the API key was refused. The SDK does not crash your app over a bad key; it returns an inert client and tells you three ways:
 
@@ -661,7 +706,11 @@ if let reason = sheepit.status().rejectionReason {
 }
 ```
 
-An error is also logged to `os_log`, and a `lifecycle.api_key_rejected` diagnostic is emitted — subscribe with `SheepitConfig.onDiagnostic` or read `getRecentDiagnostics()`. If the key is fine, check that the device has network and that events are being flushed (`status().queueDepth`).
+An error is also logged to `os_log`, and a `lifecycle.api_key_rejected` diagnostic is emitted — subscribe with `SheepitConfig.onDiagnostic` or read `getRecentDiagnostics()`. If the key is fine, check that the device has network and that events are being flushed (`status().queueDepth`). Three config diagnostics also explain defaults: `config.unresolved_body_refused` means the server could not resolve this device (`outcome` `unknown_device` until it registers, `lookup_error` on a server-side failure), so the answer was refused or kept in memory only; `config.resolution_header_absent` means config responses carry no `X-Sheepit-Device-Resolution` header (an older server, or a proxy that strips it); `config.device_replaced_unknown` means a device the server had resolved before is now unknown to it (its row was erased or purged), so the SDK replaced it with a fresh device id (`reason` `resolved_then_unknown`, or `joined` when an identify was already replacing it) or kept it because one was already replaced since launch or the last `reset()` (`capped`, with the server's defaults applied). So `status().deviceId` can change mid-session without a logout when the server has forgotten the device.
+
+**Which `apiUrl` values are accepted?** An absolute `http` or `https` URL with a host: `localhost`, IP literals, Compose-style names (`sheepit_api:3000`) and a path prefix (`https://app.example.com/_sheepit`) are fine. From 0.10.0 credentials (`user:pass@`), a query string, a fragment or an out-of-range port make the client inert with a `rejectionReason`; it never falls back to the default host. The rules are the same in every Sheepit SDK: [`Docs/Technical/SDK_DEVICE_REGISTRATION_CONTRACT.md`](../../Docs/Technical/SDK_DEVICE_REGISTRATION_CONTRACT.md) § 4.
+
+**How does device registration retry?** The device id is minted on the device at first launch and used at once; registration proposes it, and the server keeps it. A failed registration is retried until it has failed 6 times in a row in one launch, with jittered backoff (the first after 1–2 s; up to 60 s for network errors and 5xx, up to 1 hour for 402/422/429; a longer `Retry-After` always wins, up to 1 hour; 24 hours after our API's own 400/401/403, while a bare 401/403 from a proxy or WAF is retried like a network error). The wait is saved, so a relaunch inside it sends nothing, and it grows from launch to launch until a registration succeeds. `retryAttempts` does not apply to registration. Each failure emits an `identity.device_registration_*` diagnostic with an `outcome`. The device registers again after an app update so its row carries the current app version. Each `apiUrl`, environment and key keeps its own device id; an install upgraded from 0.9.x keeps its id in the first one it launches. Contract: [`Docs/Technical/SDK_DEVICE_REGISTRATION_CONTRACT.md`](../../Docs/Technical/SDK_DEVICE_REGISTRATION_CONTRACT.md).
 
 **I called `identify()` but flags still come back at their defaults, or the user looks anonymous.** `status().userId` is only the app's own label. What flags are evaluated for is `status().identity?.serverUser`: `.user(id)` once the server bound the user, `.unknown` while the SDK cannot say (a POST in flight or failed), `.anonymous` for a row known to hold nobody. `identity?.lastIdentifyRejection` names a user the server refused and its HTTP status, and `identity?.deviceRegistered` says whether this key and environment registered the current device. Each key, environment and `apiUrl` keeps its own registration, so a Debug and a release build on different keys do not share it.
 

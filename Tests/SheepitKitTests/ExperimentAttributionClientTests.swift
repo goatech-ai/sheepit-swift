@@ -36,13 +36,13 @@ final class ExperimentAttributionClientTests: XCTestCase {
     }
 
     private static let configBody = #"""
-    {"data":{"config_version":"7","etag":"\"v7\"","flags":{},"experiments":{
+    {"data":{"assignment_token":"receipt-fixture","config_version":"7","etag":"\"v7\"","flags":{},"experiments":{
       "pricing_test":{"variant_key":"treatment","payload":{},"experiment_id":"11111111-1111-4111-8111-111111111111","subject_kind":"user","bucketing_version":1,"assignment_revision":"7"},
       "onboarding_test":{"variant_key":"b","payload":{},"experiment_id":"22222222-2222-4222-8222-222222222222","subject_kind":"device","bucketing_version":1,"assignment_revision":"7"}}}}
     """#
 
     private static func configBody(variant: String) -> String {
-        #"{"data":{"config_version":"7","etag":"\"v7\"","flags":{},"experiments":{"pricing_test":"#
+        #"{"data":{"assignment_token":"receipt-fixture","config_version":"7","etag":"\"v7\"","flags":{},"experiments":{"pricing_test":"#
             + #"{"variant_key":"\#(variant)","payload":{}}}}}"#
     }
 
@@ -89,7 +89,7 @@ final class ExperimentAttributionClientTests: XCTestCase {
             refreshInterval: 3600,
             log: Logger(debug: false),
             identityProvider: identity,
-            onConfig: { response, identity in
+            onConfig: { response, identity, _ in
                 recorded.mutate { $0.append(identity) }
                 if let variant = response.experiments["pricing_test"]?.variantKey {
                     variants?.mutate { $0.append(variant) }
@@ -123,22 +123,17 @@ final class ExperimentAttributionClientTests: XCTestCase {
         return try XCTUnwrap(event["context"] as? [String: Any])
     }
 
-    private func entries(_ context: [String: Any]) -> [String: [String: Any]] {
-        context["experiment_assignments"] as? [String: [String: Any]] ?? [:]
-    }
-
-    private func experiments(_ context: [String: Any]) -> [String: Any] {
-        context["experiments"] as? [String: Any] ?? [:]
-    }
-
-    /// The user-bucketed `pricing_test` went out unattributed, and device bucketing did not.
-    private func assertUserEntryMarked(_ name: String, file: StaticString = #filePath, line: UInt = #line) throws {
+    /// A token attests the whole captured identity; it cannot partially credit a device arm
+    /// while the event's user changed. Both old per-entry helpers now assert this invariant.
+    private func assertEveryEntryMarked(_ name: String, file: StaticString = #filePath, line: UInt = #line) throws {
         let sent = try context(of: name)
-        XCTAssertNil(experiments(sent)["pricing_test"], "\(name): must not be credited to an arm", file: file, line: line)
-        XCTAssertEqual(entries(sent)["pricing_test"]?["subject_status"] as? String, "identity_changed",
-                       name, file: file, line: line)
-        XCTAssertEqual(experiments(sent)["onboarding_test"] as? String, "b",
-                       "\(name): device bucketing is unaffected", file: file, line: line)
+        XCTAssertEqual(sent["assignment_status"] as? String, "identity_changed", file: file, line: line)
+        XCTAssertNil(sent["experiments"], file: file, line: line)
+        XCTAssertNil(sent["experiment_assignments"], file: file, line: line)
+    }
+
+    private func assertOnlyUserEntryMarked(_ name: String, file: StaticString = #filePath, line: UInt = #line) throws {
+        try assertEveryEntryMarked(name, file: file, line: line)
     }
 
     private func persistedLabel(_ storage: StorageProvider) -> ServerHeldUser? {
@@ -278,7 +273,7 @@ final class ExperimentAttributionClientTests: XCTestCase {
             log: Logger(debug: false),
             resetGate: gate,
             identityProvider: { (.fetchedUnder("user-a"), 0) },
-            onConfig: { _, identity in applied.set(identity) }
+            onConfig: { _, identity, _ in applied.set(identity) }
         )
 
         await sync.start(deviceIdGetter: { "device-1" })
@@ -332,19 +327,19 @@ final class ExperimentAttributionClientTests: XCTestCase {
         await client.awaitIdentityPostForTesting()
         let name = uniqueName("s3d_frozen")
 
-        client.seedAssignmentsForTesting(["pricing_test": try sdkAssignment("treatment", kind: "device")])
+        client.seedAssignmentsForTesting(["pricing_test": try sdkAssignment("treatment", kind: "device")], assignmentToken: "receipt-fixture")
         client.track(name)
-        client.seedAssignmentsForTesting(["pricing_test": try sdkAssignment("control", kind: "device")])
+        client.seedAssignmentsForTesting(["pricing_test": try sdkAssignment("control", kind: "device")], assignmentToken: "receipt-after")
         await client.flush()
 
         let sent = try context(of: name)
-        XCTAssertEqual(experiments(sent)["pricing_test"] as? String, "treatment")
-        XCTAssertEqual(entries(sent)["pricing_test"]?["variant_key"] as? String, "treatment")
+        XCTAssertEqual(sent["assignment_token"] as? String, "receipt-fixture")
+        XCTAssertEqual(sent["assignment_token"] as? String, "receipt-fixture")
     }
 
     /// The identify 304 latch: the ETag carries no user, so a conditional fetch after identify
     /// answers 304 forever. The mark must clear once the POST succeeds, and not before.
-    func testIdentifyMarksUserEntriesUntilItsPostSucceedsThenRefetchesPastThe304() async throws {
+    func testIdentifyMarksEveryEntryUntilItsPostSucceedsThenRefetchesPastThe304() async throws {
         let client = makeClient()
         defer { client.destroy() }
         await waitForStartupFetch()
@@ -368,21 +363,21 @@ final class ExperimentAttributionClientTests: XCTestCase {
         client.track(afterAnswer)
         await client.flush()
 
-        XCTAssertEqual(experiments(try context(of: before))["pricing_test"] as? String, "treatment",
+        XCTAssertEqual(try context(of: before)["assignment_token"] as? String, "receipt-fixture",
                        "precondition: the config fetched for user A attributes A's event")
         XCTAssertEqual(AttributionCaptureProtocol.configIfNoneMatch.dropLast().last ?? nil, "\"v7\"",
                        "precondition: the periodic refresh was conditional and answered 304")
-        try assertUserEntryMarked(whileUnanswered)
-        try assertUserEntryMarked(afterPeriodicRefresh)
+        try assertEveryEntryMarked(whileUnanswered)
+        try assertEveryEntryMarked(afterPeriodicRefresh)
 
         XCTAssertEqual(client.context.serverHeldUser.user, .known(userB))
         XCTAssertEqual(AttributionCaptureProtocol.configIfNoneMatch.last ?? "unset", nil,
                        "the refetch after a successful identify POST must be unconditional")
         let answered = try context(of: afterAnswer)
-        XCTAssertEqual(experiments(answered)["pricing_test"] as? String, "treatment")
-        XCTAssertNil(entries(answered)["pricing_test"]?["subject_status"])
-        XCTAssertEqual(
-            client.getRecentDiagnostics().filter { $0.code == "experiment.identity_changed" }.count, 1)
+        XCTAssertEqual(answered["assignment_token"] as? String, "receipt-fixture")
+        XCTAssertNil(answered["assignment_status"])
+        XCTAssertFalse(client.getRecentDiagnostics().contains { $0.message.contains("receipt-fixture") },
+                       "opaque aliases never enter diagnostics")
     }
 
     /// Identify POST 2xx, then its unconditional refetch fails. The next periodic poll must not
@@ -412,8 +407,8 @@ final class ExperimentAttributionClientTests: XCTestCase {
         XCTAssertEqual(AttributionCaptureProtocol.configIfNoneMatch.last ?? "unset", nil,
                        "a conditional poll 304s against the previous row's ETag and keeps its config")
         let sent = try context(of: name)
-        XCTAssertEqual(experiments(sent)["pricing_test"] as? String, "treatment")
-        XCTAssertNil(entries(sent)["pricing_test"]?["subject_status"])
+        XCTAssertEqual(sent["assignment_token"] as? String, "receipt-fixture")
+        XCTAssertNil(sent["assignment_status"])
     }
 
     /// identify(B); identify(C); POST B answers; POST C goes out. From the moment C is sent the server
@@ -444,7 +439,7 @@ final class ExperimentAttributionClientTests: XCTestCase {
         await client.awaitIdentityPostForTesting()
         await client.flush()
 
-        try assertUserEntryMarked(name)
+        try assertEveryEntryMarked(name)
     }
 
     /// A destroyed client's identify POST must not retry later and move the server's row after a
@@ -465,14 +460,14 @@ final class ExperimentAttributionClientTests: XCTestCase {
         XCTAssertEqual(attempts(), 1, "no attempt may be sent after destroy()")
     }
 
-    /// DESIGN GUARD: the previous model marked these entries too (it kept the last confirmed
-    /// user); this pins that a failed POST keeps doing so under the server-held label.
+    /// DESIGN GUARD: a failed POST keeps the user-kind entry marked under the server-held label.
+    /// The device-kind entry is credited again after the next config: the stuck-on rule (A7b).
     func testFailedIdentifyPostLeavesTheLabelUnknownAndEntriesMarked() async throws {
         let client = makeClient()
         defer { client.destroy() }
         await waitForStartupFetch()
         AttributionCaptureProtocol.serveConfig(Self.configBody)
-        AttributionCaptureProtocol.honorIfNoneMatch = false
+        // The real route's behaviour: the periodic poll 304s. The settle's own refetch ends the switch.
         let userB = "user-b-\(UUID().uuidString)"
         let name = uniqueName("s3d_failed_post")
 
@@ -486,7 +481,8 @@ final class ExperimentAttributionClientTests: XCTestCase {
         await client.flush()
 
         XCTAssertEqual(client.context.serverHeldUser.user, .unknown)
-        try assertUserEntryMarked(name)
+        // The failed bind settled the switch, and the refresh after it ended it (stuck-on guard).
+        try assertOnlyUserEntryMarked(name)
     }
 
     /// The reviewer's hole: A confirmed; identify(B); identify(A); POST B stored; POST A fails.
@@ -497,7 +493,7 @@ final class ExperimentAttributionClientTests: XCTestCase {
         defer { client.destroy() }
         await waitForStartupFetch()
         AttributionCaptureProtocol.serveConfig(Self.configBody)
-        AttributionCaptureProtocol.honorIfNoneMatch = false
+        // The real route's behaviour: the periodic poll 304s. The settle's own refetch ends the switch.
         let (userA, userB) = ("user-a-\(UUID().uuidString)", "user-b-\(UUID().uuidString)")
         let (beforeRefetch, bounced) = (uniqueName("s3d_before_refetch"), uniqueName("s3d_bounced"))
 
@@ -516,9 +512,9 @@ final class ExperimentAttributionClientTests: XCTestCase {
 
         XCTAssertEqual(Array(AttributionCaptureProtocol.identifyUserIds.suffix(2)), [userB, userA],
                        "precondition: POST B was stored before POST A was attempted")
-        try assertUserEntryMarked(beforeRefetch)
+        try assertEveryEntryMarked(beforeRefetch)
         XCTAssertEqual(client.context.serverHeldUser.user, .unknown)
-        try assertUserEntryMarked(bounced)
+        try assertOnlyUserEntryMarked(bounced)
     }
 
     /// POST B's response is lost (the server may hold B), then the app identifies A again.
@@ -545,11 +541,11 @@ final class ExperimentAttributionClientTests: XCTestCase {
         client.track(answered)
         await client.flush()
 
-        try assertUserEntryMarked(whileHeld)
+        try assertEveryEntryMarked(whileHeld)
         XCTAssertEqual(client.context.serverHeldUser.user, .known(userA))
         let sent = try context(of: answered)
-        XCTAssertEqual(experiments(sent)["pricing_test"] as? String, "treatment")
-        XCTAssertNil(entries(sent)["pricing_test"]?["subject_status"])
+        XCTAssertEqual(sent["assignment_token"] as? String, "receipt-fixture")
+        XCTAssertNil(sent["assignment_status"])
     }
 
     /// Logout on a device bound to a user switches to a fresh device (`DeviceRotation`), whose row
@@ -561,7 +557,7 @@ final class ExperimentAttributionClientTests: XCTestCase {
         SharedSDKStorage.markRegistered()
         defer {
             SharedSDKStorage.remove(StorageKeys.deviceRegistered, from: defaults)
-            defaults.removeObject(forKey: StorageKeys.deviceId)
+            SharedSDKStorage.remove(StorageKeys.deviceId, from: defaults)
         }
         let minted = "dev_\(UUID().uuidString)"
         AttributionCaptureProtocol.registerDeviceId = minted
@@ -590,14 +586,14 @@ final class ExperimentAttributionClientTests: XCTestCase {
         XCTAssertNil(loggedOut["experiments"])
         XCTAssertNil(loggedOut["experiment_assignments"])
         let sent = try context(of: afterRefetch)
-        XCTAssertEqual(experiments(sent)["pricing_test"] as? String, "treatment")
-        XCTAssertNil(entries(sent)["pricing_test"]?["subject_status"])
+        XCTAssertEqual(sent["assignment_token"] as? String, "receipt-fixture")
+        XCTAssertNil(sent["assignment_status"])
     }
 
     func testAdoptingANewlyMintedDeviceIdRecordsThatTheRowHoldsNoUser() async throws {
         let defaults = try XCTUnwrap(UserDefaults(suiteName: Self.suite))
         for key in [StorageKeys.deviceId, StorageKeys.deviceRegistered,
-                    StorageKeys.deviceRegistrationBackoffUntil, StorageKeys.identity] {
+                    StorageKeys.deviceRegistrationBackoff, StorageKeys.identity] {
             SharedSDKStorage.remove(key, from: defaults)
         }
         defaults.set(try JSONEncoder().encode(ServerHeldUser.known("previous-row-user")), forKey: SharedSDKStorage.slot(StorageKeys.serverHeldUser))
@@ -686,7 +682,8 @@ final class ExperimentAttributionClientTests: XCTestCase {
         relaunched.track(name)
         await relaunched.flush()
 
-        try assertUserEntryMarked(name)
+        // A returning user's launch re-sends the same user: no switch, so device bucketing is kept.
+        try assertOnlyUserEntryMarked(name)
     }
 
     /// A launch identify POST that fails (offline at launch) is re-sent on a later refresh tick, and
@@ -719,8 +716,8 @@ final class ExperimentAttributionClientTests: XCTestCase {
                        "one launch POST and one retry")
         XCTAssertEqual(relaunched.context.serverHeldUser.user, .known(userB))
         let sent = try context(of: name)
-        XCTAssertEqual(experiments(sent)["pricing_test"] as? String, "treatment")
-        XCTAssertNil(entries(sent)["pricing_test"]?["subject_status"])
+        XCTAssertEqual(sent["assignment_token"] as? String, "receipt-fixture")
+        XCTAssertNil(sent["assignment_status"])
     }
 
     /// Never identified: the server resolves the subject and records the missing identity itself.
@@ -733,18 +730,185 @@ final class ExperimentAttributionClientTests: XCTestCase {
         let name = uniqueName("s3d_anonymous")
 
         client.seedAssignmentsForTesting(["pricing_test": try sdkAssignment("treatment", kind: "user")],
-                                         appliedUnderUserId: nil)
+                                         appliedUnderUserId: nil, assignmentToken: "receipt-fixture")
         client.track(name)
         await client.flush()
 
         let sent = try context(of: name)
-        let entry = try XCTUnwrap(entries(sent)["pricing_test"])
-        XCTAssertEqual(entry["subject_kind"] as? String, "user")
-        XCTAssertNil(entry["subject_status"])
-        XCTAssertNil(entry["subject"])
-        for value in entry.values.compactMap({ $0 as? String }) {
-            XCTAssertFalse(value.hasPrefix("d:") || value.hasPrefix("u:"), "no subject value, never a d: fallback")
+        XCTAssertEqual(sent["assignment_token"] as? String, "receipt-fixture")
+        XCTAssertNil(sent["assignment_status"])
+        XCTAssertNil(sent["experiments"])
+        XCTAssertNil(sent["experiment_assignments"])
+
+    }
+
+    /// A7b — the measured 2026-10-28 run, through the real client and `Transport`. An anonymous
+    /// device's config vends a user-unit experiment as `subject_kind: "device"`; between
+    /// `identify()` and the config refetched for the user, an event must NOT be credited to the
+    /// device's arm, or the refetch's user arm puts one person in both. Fails against the pre-A7b
+    /// SDK, which marked only user-kind entries.
+    func testADeviceKindEntryTrackedBetweenIdentifyAndItsRefetchIsMarkedIdentityChanged() async throws {
+        UserDefaults(suiteName: Self.suite)?.removeObject(forKey: StorageKeys.identity)
+        let client = makeClient()
+        defer {
+            AttributionCaptureProtocol.releaseHeldIdentify()
+            client.destroy()
         }
-        XCTAssertEqual(experiments(sent)["pricing_test"] as? String, "treatment")
+        await waitForStartupFetch()
+        XCTAssertNil(client.context.userId, "precondition: never identified")
+        let (anonymous, betweenIdentifyAndRefetch) = (uniqueName("a7b_anonymous"), uniqueName("a7b_identifying"))
+        client.seedAssignmentsForTesting(["checkout_test": try sdkAssignment("treatment", kind: "device")],
+                                         appliedUnderUserId: nil, assignmentToken: "receipt-fixture")
+        client.track(anonymous)
+
+        let user = "user-a7b-\(UUID().uuidString)"
+        AttributionCaptureProtocol.setIdentifyReply(.hold, for: user)
+        client.identify(userId: user)
+        client.track(betweenIdentifyAndRefetch)
+        await client.flush()
+
+        let before = try context(of: anonymous)
+        XCTAssertEqual(before["assignment_token"] as? String, "receipt-fixture",
+                       "precondition: the anonymous event is credited to the device's arm")
+        XCTAssertNil(before["assignment_status"])
+        let sent = try context(of: betweenIdentifyAndRefetch)
+        XCTAssertEqual(sent["assignment_status"] as? String, "identity_changed", "context.experiments must omit the key")
+        XCTAssertEqual(sent["assignment_status"] as? String, "identity_changed")
+        XCTAssertNil(sent["experiments"])
+        XCTAssertNil(sent["experiment_assignments"])
+
+    }
+
+    /// A7b review of the sdk-js twin, (2) and (3) through the real client. An unbound refetch while
+    /// the identify POST is unanswered must not end the switch (early clear), and the exposure sent
+    /// marked then must not spend the dedup (exposure loss): once the POST binds and the user's
+    /// config lands, the same arm is exposed again, attributed.
+    func testAMarkedExposureReEmitsAttributedOnceTheSwitchedUsersConfigLands() async throws {
+        UserDefaults(suiteName: Self.suite)?.removeObject(forKey: StorageKeys.identity)
+        let client = makeClient()
+        defer {
+            AttributionCaptureProtocol.releaseHeldIdentify()
+            client.destroy()
+        }
+        await waitForStartupFetch()
+        client.seedAssignmentsForTesting(["onboarding_test": try sdkAssignment("b", kind: "device")],
+                                         appliedUnderUserId: nil, assignmentToken: "receipt-fixture")
+        AttributionCaptureProtocol.serveConfig(Self.configBody)
+        AttributionCaptureProtocol.honorIfNoneMatch = false
+        let user = "user-a7b-\(UUID().uuidString)"
+        AttributionCaptureProtocol.setIdentifyReply(.hold, for: user)
+
+        client.identify(userId: user)
+        await client.refreshConfigForTesting() // a 200 fetched before the bind answered: `.unknown`
+        XCTAssertEqual(client.experiment("onboarding_test").variant, "b")
+        await client.flush()
+        let marked = try XCTUnwrap(AttributionCaptureProtocol.event(named: "$experiment_exposure", userId: user))
+        let markedContext = try XCTUnwrap(marked["context"] as? [String: Any])
+        XCTAssertEqual(markedContext["assignment_status"] as? String, "identity_changed",
+                       "an unbound config must not end the switch")
+
+        AttributionCaptureProtocol.releaseHeldIdentify()
+        await client.awaitIdentityPostForTesting() // binds, then refetches under the user
+        XCTAssertEqual(client.experiment("onboarding_test").variant, "b")
+        await client.flush()
+
+        let last = try XCTUnwrap(AttributionCaptureProtocol.event(named: "$experiment_exposure", userId: user))
+        let lastContext = try XCTUnwrap(last["context"] as? [String: Any])
+        XCTAssertNil(lastContext["assignment_status"],
+                     "the arm is exposed again, attributed, after the switch ends")
+        XCTAssertEqual(lastContext["assignment_token"] as? String, "receipt-fixture")
+    }
+
+    /// Must-fix 3: the switch is armed BEFORE the user is stored. An event tracked at the moment
+    /// `identify()` stores the new user (another thread, here the hook on the calling thread) must
+    /// not credit a device-kind arm to them.
+    func testAnEventTrackedAsIdentifyStoresTheUserIsAlreadyMarked() async throws {
+        UserDefaults(suiteName: Self.suite)?.removeObject(forKey: StorageKeys.identity)
+        let client = makeClient()
+        defer {
+            client.identifyUserIdSetHookForTesting.value = nil
+            AttributionCaptureProtocol.releaseHeldIdentify()
+            client.destroy()
+        }
+        await waitForStartupFetch()
+        client.seedAssignmentsForTesting(["onboarding_test": try sdkAssignment("b", kind: "device")],
+                                         appliedUnderUserId: nil, assignmentToken: "receipt-fixture")
+        let user = "user-a7b-\(UUID().uuidString)"
+        let name = uniqueName("a7b_as_user_set")
+        AttributionCaptureProtocol.setIdentifyReply(.hold, for: user)
+        client.identifyUserIdSetHookForTesting.value = { _ in client.track(name) }
+
+        client.identify(userId: user)
+        client.identifyUserIdSetHookForTesting.value = nil
+        await client.flush()
+
+        let event = try XCTUnwrap(AttributionCaptureProtocol.event(named: name, userId: user), "precondition: tracked as the new user")
+        let sent = try XCTUnwrap(event["context"] as? [String: Any])
+        XCTAssertEqual(sent["assignment_status"] as? String, "identity_changed")
+        XCTAssertEqual(sent["assignment_status"] as? String, "identity_changed")
+    }
+
+    /// Must-fix 2: a `$flag_exposure` sent while its experiment claims are marked does not spend
+    /// the flag's dedup past the wait: once the switched-to user's config lands, the next read
+    /// exposes the flag again, attributed.
+    func testAMarkedFlagExposureReEmitsAttributedOnceTheSwitchedUsersConfigLands() async throws {
+        UserDefaults(suiteName: Self.suite)?.removeObject(forKey: StorageKeys.identity)
+        let flagKey = "a7b_flag_\(UUID().uuidString.prefix(8))"
+        let body = #"{"data":{"assignment_token":"receipt-fixture","config_version":"7","etag":"\"v7\"","flags":{"\#(flagKey)":true},"experiments":{"#
+            + #""onboarding_test":{"variant_key":"b","payload":{},"experiment_id":"22222222-2222-4222-8222-222222222222","subject_kind":"device","bucketing_version":1,"assignment_revision":"7"}}}}"#
+        let client = makeClient()
+        defer {
+            AttributionCaptureProtocol.releaseHeldIdentify()
+            client.destroy()
+        }
+        await waitForStartupFetch()
+        AttributionCaptureProtocol.serveConfig(body)
+        AttributionCaptureProtocol.honorIfNoneMatch = false
+        await client.refreshConfigForTesting()
+        let user = "user-a7b-\(UUID().uuidString)"
+        AttributionCaptureProtocol.setIdentifyReply(.hold, for: user)
+
+        client.identify(userId: user)
+        XCTAssertEqual(client.flag(flagKey), .bool(true))
+        XCTAssertEqual(client.flag(flagKey), .bool(true), "a second read while marked is deduped")
+        AttributionCaptureProtocol.releaseHeldIdentify()
+        await client.awaitIdentityPostForTesting() // binds, then refetches under the user
+        XCTAssertEqual(client.flag(flagKey), .bool(true))
+        await client.flush()
+
+        let sent = AttributionCaptureProtocol.events(named: "$flag_exposure", userId: user)
+        XCTAssertEqual(sent.count, 2, "one marked exposure during the switch, one attributed after it")
+        let first = try XCTUnwrap(sent.first?["context"] as? [String: Any])
+        XCTAssertEqual(first["assignment_status"] as? String, "identity_changed")
+        let last = try XCTUnwrap(sent.last?["context"] as? [String: Any])
+        XCTAssertNil(last["assignment_status"])
+    }
+
+    /// A stale capture: a config applied between `experiment()`'s decision and its track. The marked
+    /// exposure must not be stranded in the dedup: the next read exposes the arm again at once.
+    func testAMarkedExposureFromAStaleCaptureIsNotStranded() async throws {
+        UserDefaults(suiteName: Self.suite)?.removeObject(forKey: StorageKeys.identity)
+        let client = makeClient()
+        defer {
+            client.exposureDecisionHookForTesting.value = nil
+            AttributionCaptureProtocol.releaseHeldIdentify()
+            client.destroy()
+        }
+        await waitForStartupFetch()
+        let device = try sdkAssignment("b", kind: "device")
+        client.seedAssignmentsForTesting(["onboarding_test": device], appliedUnderUserId: nil, assignmentToken: "receipt-fixture")
+        let user = "user-a7b-\(UUID().uuidString)"
+        AttributionCaptureProtocol.setIdentifyReply(.hold, for: user)
+        client.identify(userId: user)
+        client.exposureDecisionHookForTesting.value = { _ in
+            client.applyConfigForTesting(flags: [:], assignments: ["onboarding_test": device], appliedUnder: .unknown)
+        }
+
+        _ = client.experiment("onboarding_test")
+        client.exposureDecisionHookForTesting.value = nil
+        _ = client.experiment("onboarding_test")
+        await client.flush()
+
+        XCTAssertEqual(AttributionCaptureProtocol.events(named: "$experiment_exposure", userId: user).count, 2)
     }
 }

@@ -14,6 +14,11 @@ import Foundation
 /// `id` is a UUID minted when the report is first adopted and stable across every retry — it is
 /// sent as `report_id`. At most `SDKDefaults.crashPendingMaxReports` files are kept: `adopt`
 /// evicts the oldest to make room.
+///
+/// A report may have a crash supplement beside it, `<id>.supplement` (0.10.1+, see
+/// `CrashSupplement`): named by the stable id so the renames that record attempts never touch
+/// it, removed with its report, and deleted when its report is gone. An older build lists the
+/// sidecar as a name it did not write and deletes it, which only degrades that report.
 struct PendingCrashStore: Sendable {
     struct Entry: Sendable, Equatable {
         let url: URL
@@ -64,8 +69,14 @@ struct PendingCrashStore: Sendable {
     /// `maxReports` remain (ties on first-seen — e.g. several re-stamped to the same `now` —
     /// fall back to `id` order). `entry` is `nil` if the move failed — the report is still at
     /// `liveFile` and the next install will destroy it — and then nothing is evicted, since
-    /// nothing was added. `evicted` were deleted.
-    func adopt(liveFile: URL, now: Date, maxReports: Int) -> (entry: Entry?, evicted: [Entry]) {
+    /// nothing was added. `evicted` were deleted. `liveSupplement`, when it exists, moves with
+    /// the report; failing to move it only costs the report its supplement.
+    func adopt(
+        liveFile: URL,
+        liveSupplement: URL? = nil,
+        now: Date,
+        maxReports: Int
+    ) -> (entry: Entry?, evicted: [Entry]) {
         let fm = FileManager.default
         try? fm.createDirectory(at: directory, withIntermediateDirectories: true)
         var values = URLResourceValues()
@@ -79,6 +90,11 @@ struct PendingCrashStore: Sendable {
         } catch {
             return (nil, [])
         }
+        if let liveSupplement, fm.fileExists(atPath: liveSupplement.path) {
+            let sidecar = supplementURL(for: entry)
+            try? fm.removeItem(at: sidecar)
+            try? fm.moveItem(at: liveSupplement, to: sidecar)
+        }
 
         let others = entries().filter { $0.id != entry.id }
         let evicted = Array(others.prefix(max(0, others.count - (max(1, maxReports) - 1))))
@@ -87,21 +103,36 @@ struct PendingCrashStore: Sendable {
     }
 
     /// Every queued report, oldest first. A file whose name does not parse is not a report
-    /// this code wrote; it is deleted so it cannot sit on disk forever.
+    /// this code wrote; it is deleted so it cannot sit on disk forever. So is a supplement whose
+    /// report is gone.
     func entries() -> [Entry] {
         let fm = FileManager.default
         guard let names = try? fm.contentsOfDirectory(atPath: directory.path) else { return [] }
         var result: [Entry] = []
+        var sidecarIds: [String] = []
         for name in names {
             let url = directory.appendingPathComponent(name)
             if let entry = parse(name: name) {
                 result.append(entry)
+            } else if name.hasSuffix(Self.supplementSuffix), name.count > Self.supplementSuffix.count {
+                sidecarIds.append(String(name.dropLast(Self.supplementSuffix.count)))
             } else {
                 try? fm.removeItem(at: url)
             }
         }
+        let reportIds = Set(result.map(\.id))
+        for id in sidecarIds where !reportIds.contains(id) {
+            try? fm.removeItem(at: directory.appendingPathComponent(id + Self.supplementSuffix))
+        }
         return result.sorted { ($0.firstSeen, $0.id) < ($1.firstSeen, $1.id) }
     }
+
+    /// Where `entry`'s crash supplement lives (it may not exist).
+    func supplementURL(for entry: Entry) -> URL {
+        directory.appendingPathComponent(entry.id + Self.supplementSuffix)
+    }
+
+    private static let supplementSuffix = ".supplement"
 
     /// Record one more attempt, before it is made — so a kill or crash mid-upload still spends
     /// it. If the rename fails the attempt is not counted, and `crashUploadMaxAge` is what
@@ -142,6 +173,7 @@ struct PendingCrashStore: Sendable {
 
     func remove(_ entry: Entry) {
         try? FileManager.default.removeItem(at: entry.url)
+        try? FileManager.default.removeItem(at: supplementURL(for: entry))
     }
 
     // MARK: - Naming

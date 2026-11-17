@@ -162,4 +162,9 @@ void sheepit_uninstall_nsexception_handler(void);
 }
 #endif
 
+// This is the module's umbrella header, so SwiftPM requires it to include every public header.
+// Neither adds to nor changes anything above.
+#include "SheepitCrashSupplement.h"
+#include "SheepitCrashCapture.h"
+
 #endif /* SHEEPIT_CRASH_HANDLER_H */

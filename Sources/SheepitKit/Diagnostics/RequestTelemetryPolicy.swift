@@ -135,15 +135,18 @@ struct RequestTelemetryPolicy: Sendable {
     /// canonicalized by `URLComponents`, as `target(for:)`'s hosts are (see the type doc), and
     /// checked AGAIN in that form: `URLComponents` percent-decodes, so `exa%2Fmple.com` only
     /// shows its `/` after canonicalization. A name `URLComponents` cannot parse, one with a
-    /// leading dot or an empty label (`a..b`), or one with a control character is refused —
-    /// it could never match a request host.
+    /// leading dot or an empty label (`a..b`), one with a control character, or one still
+    /// carrying a `%` after canonicalization is refused — it could never match a request host.
+    /// The `%` check is not redundant with the control-character one: from macOS/iOS 27.2,
+    /// `URLComponents.host` leaves `%00` encoded instead of decoding it to NUL, so
+    /// `exa%00mple.com` would otherwise survive as a literal entry.
     private static func normalizedEntry(_ entry: String) -> String? {
         let host = normalizedHost(entry.trimmingCharacters(in: .whitespacesAndNewlines))
         guard isUsable(host) else { return nil }
         if host.contains(":") { return host }
         guard let parsed = URLComponents(string: "http://" + host)?.host else { return nil }
         let canonical = normalizedHost(parsed)
-        guard isUsable(canonical), !canonical.contains(":"),
+        guard isUsable(canonical), !canonical.contains(":"), !canonical.contains("%"),
               !canonical.split(separator: ".", omittingEmptySubsequences: false).contains(where: \.isEmpty)
         else { return nil }
         return canonical

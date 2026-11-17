@@ -9,7 +9,7 @@ import Foundation
 public enum SDKEndpoints {
     public static let deviceRegister = "/v1/devices/register"
     public static func deviceIdentify(deviceId: String) -> String {
-        "/v1/devices/:deviceId/identify".replacingOccurrences(of: ":deviceId", with: deviceId)
+        "/v1/devices/:deviceId/identify".replacingOccurrences(of: ":deviceId", with: pathSegment(deviceId))
     }
     public static let config = "/v1/config"
     public static let ingest = "/v1/ingest"
@@ -17,4 +17,13 @@ public enum SDKEndpoints {
     public static let crashReport = "/v1/crashes/report"
     public static let perfIngest = "/v1/performance/ingest"
     public static let feedbackSubmit = "/v1/feedback/sdk"
+
+    /// One path segment, percent-encoded: only ASCII letters, digits and `-_~` pass through.
+    static func pathSegment(_ value: String) -> String {
+        value.addingPercentEncoding(withAllowedCharacters: pathSegmentAllowed) ?? ""
+    }
+
+    private static let pathSegmentAllowed = CharacterSet(
+        charactersIn: "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_~"
+    )
 }

@@ -378,7 +378,7 @@ actor Transport {
     /// country it was never tracked under.
     static func context(for event: EnrichedEvent) -> IngestContext {
         let snapshot = event.snapshot
-        return IngestContext(
+        var wire = IngestContext(
             app: snapshot.map {
                 // Re-bounded although `TrackSnapshot.capture` bounds them: a queue written
                 // before that bound existed can hold a longer value, and one over-long
@@ -422,66 +422,15 @@ actor Transport {
             ),
             session: IngestSession(id: event.sessionId),
             flags: nil,
-            experiments: wireExperiments(event.assignments),
-            experimentAssignments: wireExperimentAssignments(event.assignments),
+            experiments: nil,
+            experimentAssignments: nil,
             account: nil,
             revenue: nil,
             releaseId: nil
         )
+        wire.assignmentToken = event.assignmentReceipt?.token
+        wire.assignmentStatus = event.assignmentReceipt?.status
+        return wire
     }
 
-    /// `context.experiments`: experiment key → variant key, from the event's OWN track-time
-    /// assignments only.
-    ///
-    /// 🔴 `identity_changed` entries are left out. This map is persisted as `active_experiments`,
-    /// which the legacy readout (`compute-experiment-results.ts`) counts with no status column, so
-    /// sending one would credit the new user to the previous user's arm. Leaving the key absent is
-    /// consistent with `experiment_assignments`: the server compares variants only where both
-    /// maps carry the key.
-    static func wireExperiments(_ assignments: [String: EventAssignment]?) -> [String: AnyCodable]? {
-        guard let assignments else { return nil }
-        var variants: [String: AnyCodable] = [:]
-        for (key, assignment) in assignments where assignment.subjectStatus != EventAssignment.identityChanged {
-            guard let variantKey = assignment.variantKey else { continue }
-            variants[key] = AnyCodable(variantKey)
-        }
-        return variants.isEmpty ? nil : variants
-    }
-
-    /// `context.experiment_assignments`: only entries carrying ALL the metadata. An entry from a
-    /// config cached before `/v1/config` vended it is omitted, which leaves that experiment
-    /// unattributed on this event rather than guessed.
-    ///
-    /// No subject value is ever sent: the server resolves it from this event's own user or device.
-    /// Nothing is truncated to fit a bound. An event over the server's per-event size or entry
-    /// limit is rejected visibly (`transport.events_rejected`), as the design requires.
-    static func wireExperimentAssignments(
-        _ assignments: [String: EventAssignment]?
-    ) -> [String: IngestExperimentAssignment]? {
-        guard let assignments else { return nil }
-        var complete: [String: IngestExperimentAssignment] = [:]
-        for (key, assignment) in assignments {
-            guard let experimentId = assignment.experimentId,
-                  let variantKey = assignment.variantKey,
-                  let subjectKind = assignment.subjectKind,
-                  // The API accepts exactly these two; any other kind costs the whole event.
-                  subjectKind == "user" || subjectKind == "device",
-                  let bucketingVersion = assignment.bucketingVersion,
-                  let assignmentRevision = assignment.assignmentRevision
-            else { continue }
-            complete[key] = IngestExperimentAssignment(
-                experimentId: experimentId,
-                variantKey: variantKey,
-                subjectKind: subjectKind,
-                // The only status a client may send; the API rejects the whole event for any
-                // other, so nothing else read back from disk is passed through.
-                subjectStatus: assignment.subjectStatus == EventAssignment.identityChanged
-                    ? EventAssignment.identityChanged
-                    : nil,
-                bucketingVersion: bucketingVersion,
-                assignmentRevision: assignmentRevision
-            )
-        }
-        return complete.isEmpty ? nil : complete
-    }
 }

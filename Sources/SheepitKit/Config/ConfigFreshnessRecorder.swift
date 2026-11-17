@@ -9,6 +9,15 @@ final class ConfigFreshnessRecorder: @unchecked Sendable {
         let source: SDKStatus.ConfigFreshness.Source
         /// When the server last sent this body or answered 304 for it.
         let fetchedAt: Date
+        /// A launch cache whose stamp was later than the device clock (clock skew): how old it is
+        /// cannot be known, so it is reported stale until a fetch replaces the entry. (A launch cache
+        /// holds no ETag, so no 304 can confirm it first.)
+        var ageUnknown = false
+        /// The server answered this device unresolved (contract § 7) and the applied body was kept:
+        /// it can no longer be evaluated for this device, so it is reported stale until a body is
+        /// applied again (`record`). A 304 cannot clear it either: `ConfigSync` does not confirm
+        /// while the device is unresolved.
+        var deviceUnresolved = false
     }
 
     private let lock = NSLock()
@@ -20,10 +29,26 @@ final class ConfigFreshnessRecorder: @unchecked Sendable {
         return entry
     }
 
-    func record(_ source: SDKStatus.ConfigFreshness.Source, fetchedAt: Date) {
+    func record(_ source: SDKStatus.ConfigFreshness.Source, fetchedAt: Date, ageUnknown: Bool = false) {
         lock.lock()
         defer { lock.unlock() }
-        entry = Entry(source: source, fetchedAt: fetchedAt)
+        entry = Entry(source: source, fetchedAt: fetchedAt, ageUnknown: ageUnknown)
+    }
+
+    /// An unresolved answer refused over the applied body (`Entry.deviceUnresolved`).
+    func markDeviceUnresolved() {
+        lock.lock()
+        defer { lock.unlock() }
+        entry?.deviceUnresolved = true
+    }
+
+    /// What an exposure event carries: the source and, only when the age is known, the age in ms.
+    /// A launch cache stamped later than the device clock has no age to report, so it sends none
+    /// rather than the 0 its clamped age reads. Saturates instead of trapping on an absurd clock.
+    func exposureStamp(now: Date) -> (source: SDKStatus.ConfigFreshness.Source, ageMs: Int?)? {
+        guard let entry = current else { return nil }
+        guard !entry.ageUnknown else { return (entry.source, nil) }
+        return (entry.source, Int(saturating: max(0, now.timeIntervalSince(entry.fetchedAt)) * 1000))
     }
 
     /// A 304: the server confirmed the applied body, which keeps its source.
@@ -39,7 +64,10 @@ final class ConfigFreshnessRecorder: @unchecked Sendable {
         entry = nil
     }
 
-    /// What `status()` reports, measured at `now`. A clock that went backwards reads as age 0.
+    /// What `status()` reports, measured at `now`. A clock that went backwards reads as age 0; an
+    /// entry whose age is unknown (`Entry.ageUnknown`), or kept over an unresolved answer
+    /// (`Entry.deviceUnresolved`), is stale whatever its age reads. `staleAfter` may be `.infinity`
+    /// (never stale by age).
     func snapshot(now: Date, staleAfter: TimeInterval) -> SDKStatus.ConfigFreshness? {
         guard let entry = current else { return nil }
         let age = max(0, now.timeIntervalSince(entry.fetchedAt))
@@ -47,7 +75,25 @@ final class ConfigFreshnessRecorder: @unchecked Sendable {
             source: entry.source,
             fetchedAt: entry.fetchedAt,
             age: age,
-            isStale: age > staleAfter
+            isStale: entry.ageUnknown || entry.deviceUnresolved || age > staleAfter
         )
+    }
+}
+
+extension Int {
+    /// `Int(value)` that saturates instead of trapping. 🔴 For every age, limit or millisecond value
+    /// converted from a `TimeInterval`: watchOS runs arm64_32, where `Int` is 32-bit, so a plain
+    /// `Int(age * 1000)` traps for anything older than ~24.8 days, and since 0.10.2 a cache that old
+    /// is applied (and reported) inside `create(config:)`. NaN reads as 0.
+    init(saturating value: Double) {
+        if value.isNaN {
+            self = 0
+        } else if value >= Double(Int.max) {
+            self = .max
+        } else if value <= Double(Int.min) {
+            self = .min
+        } else {
+            self = Int(value)
+        }
     }
 }
